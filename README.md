@@ -2,6 +2,9 @@
 
 A modern, professional PDF reader and annotator for Windows, built with Tkinter and PyMuPDF. Inspired by Adobe Photoshop, with a dark theme, responsive UI, annotation tools, and form fill support.
 
+# Screenshots
+<img width="1365" height="729" alt="Image" src="https://github.com/user-attachments/assets/92e45227-0c51-4629-ae5e-db811356574f" />
+
 ## Features
 - Dark, modern UI (Photoshop-inspired)
 - Sidebar with page thumbnails (active page highlighted)
