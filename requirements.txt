@@ -1,0 +1,6 @@
+# Requirements for Advanced PDF Reader
+PyMuPDF
+Pillow
+pywin32
+pystray
+# tkinter is included with standard Python on Windows 
