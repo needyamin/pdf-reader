@@ -36,8 +36,5 @@ A modern, professional PDF reader and annotator for Windows, built with Tkinter 
 - Open a PDF, use the toolbar and sidebar to navigate and annotate
 - Use keyboard shortcuts for fast workflow (see Help > Shortcuts)
 
-## Screenshot
-![Screenshot](screenshot.png)
-
 ## License
 MIT License 
