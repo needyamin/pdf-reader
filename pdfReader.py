@@ -116,6 +116,8 @@ class PDFReaderApp(tk.Tk):
         self.bind_all('<R>', lambda e: self.rotate_page())
         # Open
         self.bind_all('<Control-o>', lambda e: self.open_pdf())
+        # Export as Image
+        self.bind_all('<Control-s>', lambda e: self.export_image())
         # Fit to Window
         self.bind_all('<f>', lambda e: self.toggle_fit())
         self.bind_all('<F>', lambda e: self.toggle_fit())
@@ -127,9 +129,10 @@ class PDFReaderApp(tk.Tk):
         self.bind_all('<s>', lambda e: self.toggle_sidebar())
         self.bind_all('<S>', lambda e: self.toggle_sidebar())
         self.bind_all('<Control-b>', lambda e: self.toggle_sidebar())
+        self.bind_all('<Escape>', lambda e: self.toggle_sidebar())
         # Close
         self.bind_all('<Control-q>', lambda e: self.quit())
-        self.bind_all('<Escape>', lambda e: self.quit())
+        # self.bind_all('<Escape>', lambda e: self.quit())  # ESC now toggles sidebar
         self.bind_all('<Return>', lambda e: self._goto_page_from_entry())
         self.focus_set()
         self.undo_stack = []
@@ -186,16 +189,16 @@ class PDFReaderApp(tk.Tk):
         view_menu.add_separator()
         view_menu.add_command(label='Toggle Sidebar', command=self.toggle_sidebar, accelerator='S')
         self.menu.add_cascade(label='View', menu=view_menu)
-        # Annotate menu
-        annotate_menu = tk.Menu(self.menu, tearoff=0)
-        annotate_menu.add_command(label='Highlight', command=lambda: self.set_annotation_mode('highlight'))
-        annotate_menu.add_command(label='Draw', command=lambda: self.set_annotation_mode('draw'))
-        annotate_menu.add_command(label='Text Note', command=lambda: self.set_annotation_mode('text'))
-        annotate_menu.add_command(label='Add Image', command=lambda: self.set_annotation_mode('image'))
-        annotate_menu.add_command(label='Fill Form', command=lambda: self.set_annotation_mode('form'))
-        annotate_menu.add_separator()
-        annotate_menu.add_command(label='Eraser 🧹', command=lambda: self.set_annotation_mode('eraser'))
-        self.menu.add_cascade(label='Annotate', menu=annotate_menu)
+        # Annotate menu (hidden for now)
+        # annotate_menu = tk.Menu(self.menu, tearoff=0)
+        # annotate_menu.add_command(label='Highlight', command=lambda: self.set_annotation_mode('highlight'))
+        # annotate_menu.add_command(label='Draw', command=lambda: self.set_annotation_mode('draw'))
+        # annotate_menu.add_command(label='Text Note', command=lambda: self.set_annotation_mode('text'))
+        # annotate_menu.add_command(label='Add Image', command=lambda: self.set_annotation_mode('image'))
+        # annotate_menu.add_command(label='Fill Form', command=lambda: self.set_annotation_mode('form'))
+        # annotate_menu.add_separator()
+        # annotate_menu.add_command(label='Eraser 🧹', command=lambda: self.set_annotation_mode('eraser'))
+        # self.menu.add_cascade(label='Annotate', menu=annotate_menu)
         # Help menu
         help_menu = tk.Menu(self.menu, tearoff=0)
         help_menu.add_command(label='About', command=self.show_about)
@@ -295,7 +298,7 @@ class PDFReaderApp(tk.Tk):
         # Annotation color/width pickers
         self.annot_options = tk.Frame(self.toolbar, bg=TOOLBAR_COLOR)
         self.annot_options.pack(side='right', padx=8)
-        self.color_var = tk.StringVar(value='#ffff00')
+        self.color_var = tk.StringVar(value='#ff0000')  # Default annotation color is red
         self.width_var = tk.IntVar(value=2)
         tk.Label(self.annot_options, text='Color:', bg=TOOLBAR_COLOR, fg=FG_COLOR).pack(side='left')
         self.color_btn = tk.Button(self.annot_options, bg=self.color_var.get(), width=2, command=self._pick_color)
@@ -1210,12 +1213,83 @@ class PDFReaderApp(tk.Tk):
             del self._text_drag_offset
 
     def show_about(self):
-        messagebox.showinfo('About', 'Advanced PDF Reader\nPowered by Tkinter, PyMuPDF, Pillow')
+        about_win = tk.Toplevel(self)
+        about_win.title("About")
+        about_win.configure(bg=BG_COLOR)
+        about_win.resizable(False, False)
+        try:
+            about_win.iconbitmap(ICON_PATH)
+        except Exception:
+            pass
+        # Load photo
+        try:
+            img_path = os.path.join(ASSET_DIR, 'images', 'YAMiN_HOSSAIN.png')
+            img = Image.open(img_path)
+            img = img.resize((120, 120), Image.LANCZOS)
+            photo = ImageTk.PhotoImage(img)
+        except Exception as e:
+            photo = None
+
+        frame = tk.Frame(about_win, bg=BG_COLOR)
+        frame.pack(padx=24, pady=24)
+
+        if photo:
+            img_label = tk.Label(frame, image=photo, bg=BG_COLOR)
+            img_label.image = photo  # Keep reference
+            img_label.grid(row=0, column=0, rowspan=6, padx=(0, 20), sticky='n')
+
+        # Your info
+        software_name = "Advanced PDF Reader"
+        name = "Yamin Hossain"
+        title = "Software Engineer, Python Developer"
+        email = "needyamin@gmail.com"
+        github = "github.com/needyamin"
+        # linkedin = "linkedin.com/in/yaminhossain"  # Removed
+        about_text = (
+            "Advanced PDF Reader is a modern, professional PDF reader and annotator for Windows. "
+            "It was created to provide a fast, beautiful, and feature-rich alternative to basic PDF viewers, "
+            "with a focus on annotation, form filling, and a Photoshop-inspired dark UI."
+        )
+        why_text = (
+            "I created this software to help students, professionals, and anyone who needs to read, annotate, "
+            "and fill forms in PDFs with ease. My goal was to combine a modern user experience with powerful features, "
+            "all in a free and open source package."
+        )
+
+        tk.Label(frame, text=software_name, font=('Segoe UI', 15, 'bold'), bg=BG_COLOR, fg=ACCENT_COLOR).grid(row=0, column=1, sticky='w', pady=(0, 2))
+        tk.Label(frame, text=f"by {name}", font=FONT, bg=BG_COLOR, fg=FG_COLOR).grid(row=1, column=1, sticky='w')
+        tk.Label(frame, text=title, font=FONT, bg=BG_COLOR, fg=FG_COLOR).grid(row=2, column=1, sticky='w')
+        tk.Label(frame, text=f"Email: {email}", font=FONT, bg=BG_COLOR, fg=FG_COLOR).grid(row=3, column=1, sticky='w')
+        tk.Label(frame, text=f"GitHub: {github}", font=FONT, bg=BG_COLOR, fg=FG_COLOR, cursor='hand2').grid(row=4, column=1, sticky='w')
+        # Removed LinkedIn row
+
+        # About this software
+        about_frame = tk.Frame(about_win, bg=BG_COLOR)
+        about_frame.pack(padx=24, pady=(0, 12), fill='x')
+        tk.Label(about_frame, text="About this software:", font=('Segoe UI', 12, 'bold'), bg=BG_COLOR, fg=ACCENT_COLOR).pack(anchor='w')
+        tk.Label(about_frame, text=about_text, font=FONT, bg=BG_COLOR, fg=FG_COLOR, wraplength=400, justify='left').pack(anchor='w', pady=(0, 8))
+        tk.Label(about_frame, text="Why I created this:", font=('Segoe UI', 12, 'bold'), bg=BG_COLOR, fg=ACCENT_COLOR).pack(anchor='w')
+        tk.Label(about_frame, text=why_text, font=FONT, bg=BG_COLOR, fg=FG_COLOR, wraplength=400, justify='left').pack(anchor='w')
+
+        # Optionally, add clickable links
+        def open_url(url):
+            import webbrowser
+            webbrowser.open(url)
+
+        frame.grid_slaves(row=4, column=1)[0].bind("<Button-1>", lambda e: open_url("https://github.com/needyamin"))
+        # Removed LinkedIn link
+
+        tk.Button(about_win, text="Close", command=about_win.destroy, bg=TOOLBAR_COLOR, fg=FG_COLOR, font=FONT, relief='flat').pack(pady=(8, 0))
+
+        about_win.grab_set()
+        about_win.transient(self)
+        about_win.focus_set()
+
     def show_shortcuts(self):
         shortcuts = [
             ('Open PDF', 'Ctrl+O'),
             ('Save As', 'Ctrl+S'),
-            ('Export as Image', ''),
+            ('Export as Image', 'Ctrl+S'),
             ('Exit', 'Ctrl+Q, Esc'),
             ('Undo', 'Ctrl+Z'),
             ('Redo', 'Ctrl+Y'),
@@ -1230,7 +1304,7 @@ class PDFReaderApp(tk.Tk):
             ('Rotate', 'R'),
             ('Fit to Window', 'F, Ctrl+F'),
             ('Go to Page', 'G, Enter'),
-            ('Toggle Sidebar', 'S, Ctrl+B'),
+            ('Toggle Sidebar', 'S, Ctrl+B, Esc'),
             # ('Highlight', 'Annotate > Highlight'),
             ('Draw', 'Annotate > Draw'),
             # ('Text Note', 'Annotate > Text Note'),
@@ -1242,6 +1316,10 @@ class PDFReaderApp(tk.Tk):
         top.title('Keyboard Shortcuts')
         top.configure(bg=BG_COLOR)
         top.geometry('480x520')
+        try:
+            top.iconbitmap(ICON_PATH)
+        except Exception:
+            pass
         frame = tk.Frame(top, bg=BG_COLOR)
         frame.pack(fill='both', expand=True, padx=16, pady=16)
         canvas = tk.Canvas(frame, bg=BG_COLOR, highlightthickness=0)
