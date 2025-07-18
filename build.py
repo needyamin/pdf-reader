@@ -2,12 +2,12 @@ import os
 import sys
 import subprocess
 import re
-import tkinter as tk
-from tkinter import ttk
+import shutil
 
 REQUIREMENTS_TXT = 'requirements.txt'
 MAIN_SCRIPT = 'pdfReader.py'
 ICON = os.path.join('assets', 'icons', 'icon.ico')
+PUBLIC_DIR = 'public'
 
 # Define colors (assuming these are defined elsewhere or will be added)
 BG_COLOR = "#2D3436"
@@ -49,29 +49,89 @@ def install_requirements():
     subprocess.check_call([sys.executable, '-m', 'pip', 'install', '-r', REQUIREMENTS_TXT])
     print('All requirements installed.')
 
+def get_add_data_arg(src, dest):
+    # On Windows, use ';' as separator
+    return f'{src};{dest}'
+
 def build_exe():
     version = get_version()
     exe_name = f'PDFReader-v{version}.exe'
     print(f'Building .exe with PyInstaller for version {version}...')
+    # --add-data assets;assets bundles all assets, images, icons, and json files
     cmd = [
         sys.executable, '-m', 'PyInstaller',
         '--onefile', '--windowed',
         f'--icon={ICON}' if os.path.exists(ICON) else '',
         '--name', exe_name.replace('.exe',''),
+        '--distpath', os.path.join(PUBLIC_DIR, 'dist'),
+        '--workpath', os.path.join(PUBLIC_DIR, 'build'),
+        '--add-data', 'assets;assets',
         MAIN_SCRIPT
     ]
     cmd = [arg for arg in cmd if arg]
     subprocess.check_call(cmd)
-    print(f'Build complete! Find your .exe in dist/{exe_name}')
-    # Optionally copy to release/
-    release_dir = 'release'
-    os.makedirs(release_dir, exist_ok=True)
-    src = os.path.join('dist', exe_name)
-    dst = os.path.join(release_dir, exe_name)
+    print(f'Build complete! Find your .exe in public/dist/{exe_name}')
+    # Copy to public/
+    os.makedirs(PUBLIC_DIR, exist_ok=True)
+    src = os.path.join(PUBLIC_DIR, 'dist', exe_name)
+    dst = os.path.join(PUBLIC_DIR, exe_name)
     if os.path.exists(src):
-        import shutil
         shutil.copy2(src, dst)
         print(f'Copied to {dst}')
+    # Ensure assets are in public/assets for Inno Setup
+    public_assets = os.path.join(PUBLIC_DIR, 'assets')
+    if not os.path.exists(public_assets):
+        shutil.copytree('assets', public_assets)
+        print(f'Copied assets/ to {public_assets}')
+    return dst
+
+def create_inno_setup_script(exe_path, version):
+    iss_content = f'''
+[Setup]
+AppName=Advanced PDF Reader
+AppVersion={version}
+DefaultDirName={{{{pf}}}}\\AdvancedPDFReader
+DefaultGroupName=Advanced PDF Reader
+OutputDir=public
+OutputBaseFilename=AdvancedPDFReader-Setup-v{version}
+SetupIconFile={ICON}
+Compression=lzma
+SolidCompression=yes
+
+[Files]
+Source: \"{exe_path}\"; DestDir: \"{{app}}\"; Flags: ignoreversion
+
+[Icons]
+Name: \"{{group}}\\Advanced PDF Reader\"; Filename: \"{{app}}\\{os.path.basename(exe_path)}\"
+Name: \"{{userdesktop}}\\Advanced PDF Reader\"; Filename: \"{{app}}\\{os.path.basename(exe_path)}\"; Tasks: desktopicon
+
+[Tasks]
+Name: \"desktopicon\"; Description: \"Create a &desktop icon\"; GroupDescription: \"Additional icons:\"
+'''
+    iss_path = os.path.join(PUBLIC_DIR, f'installer.iss')
+    with open(iss_path, 'w', encoding='utf-8') as f:
+        f.write(iss_content)
+    print(f'Inno Setup script written to {iss_path}')
+    return iss_path
+
+def run_inno_setup(iss_path):
+    # Try to run ISCC.exe if available
+    try:
+        print('Running Inno Setup Compiler...')
+        subprocess.check_call(['ISCC', iss_path])
+        print('Inno Setup installer created.')
+        # Check for installer .exe
+        version = get_version()
+        installer_name = f'AdvancedPDFReader-Setup-v{version}.exe'
+        installer_path = os.path.join(PUBLIC_DIR, installer_name)
+        if os.path.exists(installer_path):
+            print(f'Installer created at {installer_path}')
+        else:
+            print(f'Installer .exe not found in {PUBLIC_DIR}. Please check Inno Setup output.')
+    except Exception as e:
+        print(f'Could not run Inno Setup Compiler automatically: {e}')
+        print('You can manually compile the installer with Inno Setup using the script:', iss_path)
+        print('Open installer.iss in Inno Setup and click "Compile". The output will be in /public.')
 
 def show_about(self):
     about_win = tk.Toplevel(self)
@@ -80,6 +140,9 @@ def show_about(self):
     about_win.resizable(False, False)
     # Load photo
     try:
+        import tkinter as tk
+        from tkinter import ttk
+        from tkinter import PhotoImage
         from PIL import Image, ImageTk
         img_path = os.path.join(ASSET_DIR, 'images', 'YAMiN_HOSSAIN.png')
         img = Image.open(img_path)
@@ -124,7 +187,10 @@ def show_about(self):
 def main():
     ensure_requirements_txt()
     install_requirements()
-    build_exe()
+    exe_path = build_exe()
+    version = get_version()
+    iss_path = create_inno_setup_script(exe_path, version)
+    run_inno_setup(iss_path)
 
 if __name__ == '__main__':
     main() 

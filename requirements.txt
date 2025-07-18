@@ -3,4 +3,5 @@ PyMuPDF
 Pillow
 pywin32
 pystray
+requests
 # tkinter is included with standard Python on Windows 
