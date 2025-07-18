@@ -5,6 +5,16 @@ import fitz  # PyMuPDF
 import os
 import sys
 import threading
+import json
+import requests
+
+# Asset folder structure
+ASSET_DIR = os.path.join(os.path.dirname(__file__), 'assets')
+ICON_PATH = os.path.join(ASSET_DIR, 'icons', 'icon.ico')
+LOADING_IMG_PATH = os.path.join(ASSET_DIR, 'images', 'loading.png')
+SESSION_FILE = os.path.join(ASSET_DIR, 'json', 'last_session.json')
+TOKEN_FILE = os.path.join(ASSET_DIR, 'json', 'github_token.json')
+
 try:
     import pystray
     from PIL import Image as PILImage
@@ -29,6 +39,9 @@ BUTTON_ACTIVE = '#3a3f4b'
 HIGHLIGHT_COLOR = '#98c379'
 FONT = ('Segoe UI', 11)
 FONT_BOLD = ('Segoe UI', 11, 'bold')
+
+__version__ = "1.0.0"
+GITHUB_REPO = "needyamin/pdf-reader"
 
 class Tooltip:
     def __init__(self, widget, text):
@@ -61,11 +74,12 @@ class PDFReaderApp(tk.Tk):
         self.configure(bg=BG_COLOR)
         # Set application icon (window, taskbar, startbar)
         try:
-            self.iconbitmap('icon.ico')
+            self.iconbitmap(ICON_PATH)
         except Exception:
             pass
         # Ensure app fully exits on close (no background/system tray)
         self.protocol('WM_DELETE_WINDOW', self._on_close)
+        self.bind('<<ReallyExit>>', lambda e: self._really_exit())
         self.pdf_doc = None
         self.current_page = 0
         self.zoom = 1.0
@@ -126,6 +140,11 @@ class PDFReaderApp(tk.Tk):
         self.bind_all('<Control-c>', lambda e: self._copy_annot(e))
         self.bind_all('<Control-v>', lambda e: self._paste_annot(e))
         self._copied_annot_data = None
+        self._loading_label = None  # For sidebar loading indicator
+        self._session_loaded = False
+        self.after(200, self._load_last_session)
+        # Auto-update check on startup
+        self.after(1000, self.auto_update)
 
     def _setup_style(self):
         style = ttk.Style(self)
@@ -147,7 +166,9 @@ class PDFReaderApp(tk.Tk):
         file_menu.add_separator()
         file_menu.add_command(label='Export as Image...', command=self.export_image)
         file_menu.add_separator()
-        file_menu.add_command(label='Exit', command=self.quit, accelerator='Ctrl+Q')
+        file_menu.add_command(label='Check for Updates', command=lambda: self.auto_update(manual=True))
+        file_menu.add_separator()
+        file_menu.add_command(label='Exit', command=self.exit_app, accelerator='Ctrl+Q')
         self.menu.add_cascade(label='File', menu=file_menu)
         # Startup menu
         startup_menu = tk.Menu(self.menu, tearoff=0)
@@ -208,9 +229,14 @@ class PDFReaderApp(tk.Tk):
         self.thumbnail_canvas.create_window((0, 0), window=self.thumbnail_frame, anchor='nw')
         self.thumbnail_frame.bind('<Configure>', lambda e: self.thumbnail_canvas.configure(scrollregion=self.thumbnail_canvas.bbox('all')))
         # Sidebar scrolling and keyboard navigation
-        self.thumbnail_canvas.bind_all('<MouseWheel>', self._on_sidebar_mousewheel)
-        self.thumbnail_canvas.bind_all('<Button-4>', self._on_sidebar_mousewheel)  # Linux scroll up
-        self.thumbnail_canvas.bind_all('<Button-5>', self._on_sidebar_mousewheel)  # Linux scroll down
+        # Bind mouse wheel to both canvas and frame for reliable sidebar scrolling
+        self.thumbnail_canvas.bind('<MouseWheel>', self._on_sidebar_mousewheel)
+        self.thumbnail_canvas.bind('<Button-4>', self._on_sidebar_mousewheel)  # Linux scroll up
+        self.thumbnail_canvas.bind('<Button-5>', self._on_sidebar_mousewheel)  # Linux scroll down
+        self.thumbnail_frame.bind('<MouseWheel>', self._on_sidebar_mousewheel)
+        self.thumbnail_frame.bind('<Button-4>', self._on_sidebar_mousewheel)
+        self.thumbnail_frame.bind('<Button-5>', self._on_sidebar_mousewheel)
+        self._propagate_mousewheel_to_canvas(self.thumbnail_frame, self.thumbnail_canvas)
         self.thumbnail_canvas.bind_all('<Up>', lambda e: self._sidebar_select_relative(-1))
         self.thumbnail_canvas.bind_all('<Down>', lambda e: self._sidebar_select_relative(1))
         self.thumbnail_canvas.bind_all('<Prior>', lambda e: self._sidebar_select_relative(-5))  # PageUp
@@ -282,6 +308,11 @@ class PDFReaderApp(tk.Tk):
         Tooltip(self.color_btn, 'Pick annotation color')
         Tooltip(self.width_spin, 'Set pen width')
 
+        # Mouse wheel scroll for main PDF canvas
+        self.canvas.bind('<MouseWheel>', self._on_canvas_mousewheel)         # Windows
+        self.canvas.bind('<Button-4>', self._on_canvas_mousewheel)           # Linux scroll up
+        self.canvas.bind('<Button-5>', self._on_canvas_mousewheel)           # Linux scroll down
+
     def _add_toolbar_buttons(self):
         btns = []
         def make_btn(text, cmd, icon, tooltip):
@@ -321,12 +352,29 @@ class PDFReaderApp(tk.Tk):
         Tooltip(self.form_done_btn, 'Exit form mode (Esc or Done)')
         self.form_done_btn.pack_forget()
 
-    def open_pdf(self):
-        file_path = filedialog.askopenfilename(filetypes=[('PDF Files', '*.pdf')])
+    def _show_sidebar_loading(self, show=True):
+        if show:
+            if not self._loading_label:
+                self._loading_label = tk.Label(self.thumbnail_frame, text='Loading...', bg=SIDEBAR_COLOR, fg=ACCENT_COLOR, font=FONT_BOLD)
+                self._loading_label.pack(pady=20)
+        else:
+            if self._loading_label:
+                self._loading_label.destroy()
+                self._loading_label = None
+
+    def open_pdf(self, file_path=None):
+        print(f"[LOG] open_pdf called with file_path={file_path}")
         if not file_path:
+            file_path = filedialog.askopenfilename(filetypes=[('PDF Files', '*.pdf')])
+            print(f"[LOG] File dialog returned: {file_path}")
+        if not file_path:
+            print("[LOG] No file selected or dialog cancelled.")
             return
+        self._show_sidebar_loading(True)
+        self.update_idletasks()
         try:
             self.pdf_doc = fitz.open(file_path)
+            print(f"[LOG] PDF loaded: {file_path}")
             self.current_page = 0
             self.zoom = 1.0
             self.rotation = 0
@@ -335,8 +383,11 @@ class PDFReaderApp(tk.Tk):
             self.fit_to_window.set(True)  # Always fit to window on open
             self.show_page()
             self.after(100, self.show_page)  # Ensure fit after canvas is ready
+            self._save_last_session(file_path, self.current_page)
         except Exception as e:
+            print(f"[LOG] Failed to open PDF: {e}")
             messagebox.showerror('Error', f'Failed to open PDF: {e}')
+        self._show_sidebar_loading(False)
 
     def _render_thumbnails(self):
         for widget in self.thumbnail_frame.winfo_children():
@@ -355,6 +406,7 @@ class PDFReaderApp(tk.Tk):
             btn.bind('<Leave>', lambda e, b=btn, idx=i: self._update_thumbnail_highlight(b, idx))
             # Highlight current page
             self._update_thumbnail_highlight(btn, i)
+            self._propagate_mousewheel_to_canvas(btn, self.thumbnail_canvas)
 
     def _update_thumbnail_highlight(self, btn, idx):
         if idx == self.current_page:
@@ -458,6 +510,7 @@ class PDFReaderApp(tk.Tk):
         if self.pdf_doc and 0 <= page_num < len(self.pdf_doc):
             self.current_page = page_num
             self.show_page()
+            self._save_last_session(self.pdf_doc.name, self.current_page)
 
     def _goto_page_from_entry(self):
         if not self.pdf_doc:
@@ -467,6 +520,7 @@ class PDFReaderApp(tk.Tk):
             if 0 <= page < len(self.pdf_doc):
                 self.current_page = page
                 self.show_page()
+                self._save_last_session(self.pdf_doc.name, self.current_page)
         except Exception:
             pass
 
@@ -522,21 +576,17 @@ class PDFReaderApp(tk.Tk):
         self.show_page()
 
     def _on_sidebar_mousewheel(self, event):
-        # Windows/Mac: event.delta, Linux: event.num
-        if event.num == 4 or event.delta > 0:
-            self.thumbnail_canvas.yview_scroll(-3, 'units')
-        elif event.num == 5 or event.delta < 0:
-            self.thumbnail_canvas.yview_scroll(3, 'units')
-
-    def _sidebar_select_relative(self, offset):
-        if not self.pdf_doc:
-            return
-        new_page = min(max(self.current_page + offset, 0), len(self.pdf_doc)-1)
-        if new_page != self.current_page:
-            self.go_to_page(new_page)
-            # Scroll sidebar to keep selected thumbnail visible
-            widget = self.thumbnail_frame.winfo_children()[new_page]
-            self.thumbnail_canvas.yview_moveto(widget.winfo_y() / max(1, self.thumbnail_frame.winfo_height()))
+        # Sidebar scroll: more responsive (8 units)
+        if hasattr(event, 'delta'):
+            if event.delta > 0:
+                self.thumbnail_canvas.yview_scroll(-8, 'units')
+            elif event.delta < 0:
+                self.thumbnail_canvas.yview_scroll(8, 'units')
+        else:
+            if event.num == 4:
+                self.thumbnail_canvas.yview_scroll(-8, 'units')
+            elif event.num == 5:
+                self.thumbnail_canvas.yview_scroll(8, 'units')
 
     def _on_canvas_ctrl_mousewheel(self, event):
         if event.num == 4 or event.delta > 0:
@@ -1161,7 +1211,7 @@ class PDFReaderApp(tk.Tk):
             shortcut = shell.CreateShortCut(shortcut_path)
             shortcut.Targetpath = exe_path
             shortcut.WorkingDirectory = os.path.dirname(exe_path)
-            shortcut.IconLocation = os.path.abspath('icon.ico')
+            shortcut.IconLocation = os.path.abspath(ICON_PATH)
             shortcut.save()
             messagebox.showinfo('Auto Startup', 'PDF Reader will now start automatically with Windows.')
         except Exception as e:
@@ -1178,10 +1228,15 @@ class PDFReaderApp(tk.Tk):
                 self.after(0, self._show_from_tray)
             def quit_app(icon, item):
                 icon.stop()
-                self.after(0, self._really_exit)
-            image_path = 'icon.ico'
+                try:
+                    # Only generate event if the window is still running
+                    if self.winfo_exists():
+                        self.event_generate('<<ReallyExit>>', when='tail')
+                except Exception as e:
+                    # Optionally log or ignore
+                    pass
             try:
-                icon_img = PILImage.open(image_path)
+                icon_img = PILImage.open(ICON_PATH)
             except Exception:
                 icon_img = PILImage.new('RGB', (64, 64), color='gray')
             menu = pystray.Menu(
@@ -1261,10 +1316,158 @@ class PDFReaderApp(tk.Tk):
             self._push_undo('add_annot', {'page': self.current_page, 'annots': [annot.xref]})
             self.pdf_doc.saveIncr()
             self.show_page()
+            
             self.status.config(text='Text annotation pasted.')
         else:
             self.status.config(text='Only text annotation copy/paste supported.')
 
+    def _save_last_session(self, file_path, page_num):
+        try:
+            with open(SESSION_FILE, 'w') as f:
+                json.dump({'file': file_path, 'page': page_num}, f)
+        except Exception:
+            pass
+
+    def _load_last_session(self):
+        if self._session_loaded:
+            return
+        self._session_loaded = True
+        try:
+            with open(SESSION_FILE, 'r') as f:
+                data = json.load(f)
+            file_path = data.get('file')
+            page_num = data.get('page', 0)
+            if file_path and os.path.exists(file_path):
+                self.open_pdf(file_path)
+                self.after(500, lambda: self.go_to_page(page_num))
+        except Exception:
+            pass
+
+    def exit_app(self):
+        # If you want to always fully exit:
+        self.destroy()
+        import sys
+        sys.exit(0)
+
+    def get_github_token(self):
+        token = os.environ.get('GITHUB_TOKEN')
+        if token:
+            return token
+        try:
+            with open(TOKEN_FILE, 'r') as f:
+                data = json.load(f)
+                return data.get('token')
+        except Exception:
+            return None
+
+    def check_for_update(self):
+        token = self.get_github_token()
+        headers = {'Accept': 'application/vnd.github.v3+json'}
+        if token:
+            headers['Authorization'] = f'token {token}'
+        url = f'https://api.github.com/repos/{GITHUB_REPO}/releases/latest'
+        try:
+            resp = requests.get(url, headers=headers, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                latest_version = data['tag_name'].lstrip('v')
+                if latest_version > __version__:
+                    asset = next((a for a in data['assets'] if a['name'].endswith('.exe')), None)
+                    if asset:
+                        download_url = asset['browser_download_url']
+                        return latest_version, download_url
+            return None, None
+        except Exception as e:
+            print(f"Update check failed: {e}")
+            return None, None
+
+    def download_and_replace(self, download_url):
+        exe_path = sys.argv[0]
+        tmp_path = exe_path + ".new"
+        try:
+            with requests.get(download_url, stream=True) as r:
+                with open(tmp_path, 'wb') as f:
+                    for chunk in r.iter_content(chunk_size=8192):
+                        if chunk:
+                            f.write(chunk)
+            # On Windows, can't overwrite running exe; so schedule replace on next start
+            messagebox.showinfo("Update", f"Update downloaded to {tmp_path}. Please close the app and replace the old .exe with the new one.")
+        except Exception as e:
+            messagebox.showerror("Update Failed", f"Failed to download update: {e}")
+
+    def auto_update(self, manual=False):
+        latest_version, download_url = self.check_for_update()
+        if latest_version and download_url:
+            if messagebox.askyesno("Update Available", f"A new version ({latest_version}) is available. Download and update now?"):
+                self.download_and_replace(download_url)
+        else:
+            if manual and threading.current_thread() is threading.main_thread():
+                messagebox.showinfo("No Update", "You are using the latest version.")
+
+    def _on_canvas_mousewheel(self, event):
+        # Main PDF scroll: much more responsive (20 units)
+        if event.state & 0x1:  # Shift is held
+            if hasattr(event, 'delta'):
+                if event.delta > 0:
+                    self.canvas.xview_scroll(-20, 'units')
+                elif event.delta < 0:
+                    self.canvas.xview_scroll(20, 'units')
+            else:
+                if event.num == 4:
+                    self.canvas.xview_scroll(-20, 'units')
+                elif event.num == 5:
+                    self.canvas.xview_scroll(20, 'units')
+        else:
+            if hasattr(event, 'delta'):
+                if event.delta > 0:
+                    self.canvas.yview_scroll(-20, 'units')
+                elif event.delta < 0:
+                    self.canvas.yview_scroll(20, 'units')
+            else:
+                if event.num == 4:
+                    self.canvas.yview_scroll(-20, 'units')
+                elif event.num == 5:
+                    self.canvas.yview_scroll(20, 'units')
+
+    def _propagate_mousewheel_to_canvas(self, widget, canvas):
+        # Ensure mouse wheel events on widget are handled by canvas
+        tags = list(widget.bindtags())
+        if str(canvas) not in tags:
+            tags.insert(1, str(canvas))
+            widget.bindtags(tuple(tags))
+
 if __name__ == '__main__':
-    app = PDFReaderApp()
-    app.mainloop()
+    # Splash is the root window
+    splash = tk.Tk()
+    splash.overrideredirect(True)
+    splash.configure(bg='#23272e')
+    try:
+        splash_img = Image.open(LOADING_IMG_PATH)
+        img_w, img_h = splash_img.size
+        splash_photo = ImageTk.PhotoImage(splash_img)
+    except Exception:
+        splash_photo = None
+        img_w, img_h = 200, 200
+    screen_w = splash.winfo_screenwidth()
+    screen_h = splash.winfo_screenheight()
+    x = (screen_w - img_w) // 2
+    y = (screen_h - img_h) // 2
+    splash.geometry(f'{img_w}x{img_h}+{x}+{y}')
+    if splash_photo:
+        label = tk.Label(splash, image=splash_photo, bg='#23272e', borderwidth=0, highlightthickness=0)
+        label.pack(expand=True, fill='both')
+    else:
+        label = tk.Label(splash, text='Loading...', font=('Segoe UI', 24), bg='#23272e', fg='white')
+        label.pack(expand=True, fill='both')
+    splash.update()
+
+    def show_main():
+        splash.destroy()
+        app = PDFReaderApp()
+        app.lift()
+        app.focus_force()
+        app.mainloop()
+
+    splash.after(1000, show_main)
+    splash.mainloop()
+
