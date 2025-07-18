@@ -99,7 +99,7 @@ Compression=lzma
 SolidCompression=yes
 
 [Files]
-Source: \"{exe_path}\"; DestDir: \"{{app}}\"; Flags: ignoreversion
+Source: \"{os.path.basename(exe_path)}\"; DestDir: \"{{app}}\"; Flags: ignoreversion
 
 [Icons]
 Name: \"{{group}}\\Advanced PDF Reader\"; Filename: \"{{app}}\\{os.path.basename(exe_path)}\"
@@ -117,26 +117,41 @@ Name: \"desktopicon\"; Description: \"Create a &desktop icon\"; GroupDescription
 def run_inno_setup(iss_path):
     # Common paths where ISCC.exe might be installeds
     iscc_paths = [
+        r'C:\Program Files (x86)\Inno Setup 6\ISCC.exe',  # User's confirmed path
         'ISCC',  # If in PATH
-        r'C:\Program Files (x86)\Inno Setup 6\ISCC.exe',
         r'C:\Program Files\Inno Setup 6\ISCC.exe',
-        r'C:\Program Files (x86)\Inno Setup 5\ISCC.exe',
-        r'C:\Program Files\Inno Setup 5\ISCC.exe'
+        r'C:\Program Files (x86)\Inno Setup 6\ISCC.exe',
+        r'C:\Program Files\Inno Setup 6\ISCC.exe'
     ]
     
+    print('Searching for Inno Setup Compiler (ISCC.exe)...')
     iscc_found = None
     for path in iscc_paths:
+        print(f'  Checking: {path}')
         try:
             if path == 'ISCC':
-                subprocess.run([path, '--help'], capture_output=True, check=True)
+                # Check if ISCC is in PATH
+                result = subprocess.run([path, '/?'], capture_output=True, text=True, timeout=5)
+                if result.returncode in [0, 1]:  # Both 0 and 1 are valid for help
+                    iscc_found = path
+                    print(f'    Found ISCC in PATH')
+                    break
             else:
+                # Check if file exists and is executable
                 if os.path.exists(path):
-                    subprocess.run([path, '--help'], capture_output=True, check=True)
+                    print(f'    File exists, testing...')
+                    # Try /? instead of --help, and accept return codes 0 or 1
+                    result = subprocess.run([path, '/?'], capture_output=True, text=True, timeout=5)
+                    if result.returncode in [0, 1]:  # Both are valid for help
+                        iscc_found = path
+                        print(f'    Found ISCC at: {path}')
+                        break
+                    else:
+                        print(f'    File exists but test failed (return code: {result.returncode})')
                 else:
-                    continue
-            iscc_found = path
-            break
-        except (subprocess.CalledProcessError, FileNotFoundError):
+                    print(f'    File does not exist')
+        except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired) as e:
+            print(f'    Error: {type(e).__name__}')
             continue
     
     if iscc_found:
