@@ -170,10 +170,6 @@ class PDFReaderApp(tk.Tk):
         file_menu.add_separator()
         file_menu.add_command(label='Exit', command=self.exit_app, accelerator='Ctrl+Q')
         self.menu.add_cascade(label='File', menu=file_menu)
-        # Startup menu
-        startup_menu = tk.Menu(self.menu, tearoff=0)
-        startup_menu.add_command(label='Add to Auto Startup', command=self.add_to_startup)
-        self.menu.add_cascade(label='Startup', menu=startup_menu)
         # Edit menu
         edit_menu = tk.Menu(self.menu, tearoff=0)
         edit_menu.add_command(label='Undo', command=self.undo, accelerator='Ctrl+Z')
@@ -204,6 +200,8 @@ class PDFReaderApp(tk.Tk):
         help_menu = tk.Menu(self.menu, tearoff=0)
         help_menu.add_command(label='About', command=self.show_about)
         help_menu.add_command(label='Shortcuts', command=self.show_shortcuts)
+        help_menu.add_separator()
+        help_menu.add_command(label='Add to Auto Startup', command=self.add_to_startup)
         self.menu.add_cascade(label='Help', menu=help_menu)
 
         # Toolbar
@@ -435,6 +433,7 @@ class PDFReaderApp(tk.Tk):
                     print('[DEBUG] Destroying form widget:', type(entry).__name__)
                     entry.destroy()
             self._form_entries.clear()
+        # Always reload the page from the PDF
         page = self.pdf_doc.load_page(self.current_page)
         if canvas_width < 10 or canvas_height < 10:
             return
@@ -571,7 +570,12 @@ class PDFReaderApp(tk.Tk):
             self.paned.forget(self.sidebar)
             self.sidebar_visible = False
         else:
-            self.paned.insert(0, self.sidebar)
+            # Remove all panes
+            for child in self.paned.panes():
+                self.paned.forget(child)
+            # Add sidebar first (left), then main display area (right)
+            self.paned.add(self.sidebar, minsize=80)
+            self.paned.add(self.display_outer, minsize=200)
             self.sidebar_visible = True
         self.show_page()
 
@@ -834,11 +838,24 @@ class PDFReaderApp(tk.Tk):
             # Convert all points to PDF coordinates
             pdf_points = [self.canvas_to_pdf(x, y) for x, y in self._draw_points]
             annot = page.add_ink_annot([pdf_points])
-            annot.set_colors(stroke=self.color_var.get())
+            rgb = self._hex_to_rgb01(self.color_var.get())
+            annot.set_colors(stroke=rgb)
             annot.set_border(width=self.width_var.get())
             annot.update()
             self._push_undo('add_annot', {'page': self.current_page, 'annots': [annot.xref]})
-            self.pdf_doc.saveIncr()
+            try:
+                self.pdf_doc.saveIncr()
+            except Exception as e:
+                # Suppress the repaired file error during drawing
+                if "Can't do incremental writes on a repaired file" not in str(e):
+                    print(f"[LOG] saveIncr failed: {e}, trying full save.")
+                try:
+                    self.pdf_doc.save(self.pdf_doc.name)
+                except Exception as e2:
+                    # Only show error if user tries to save and cancels
+                    if "save to original must be incremental" not in str(e2):
+                        print(f"[LOG] Full save also failed: {e2}")
+                        messagebox.showerror('Error', f'Failed to save PDF: {e2}')
             self.show_page()
             self._draw_history.append(self._draw_line)
             del self._draw_line
@@ -980,27 +997,76 @@ class PDFReaderApp(tk.Tk):
                 found.x0, found.y0, found.x1, found.y1,
                 outline='red', width=2, dash=(3,2))
 
+    def _hex_to_rgb01(self, hex_color):
+        hex_color = hex_color.lstrip('#')
+        lv = len(hex_color)
+        if lv == 6:
+            return tuple(int(hex_color[i:i+2], 16)/255.0 for i in (0, 2, 4))
+        elif lv == 3:
+            return tuple(int(hex_color[i]*2, 16)/255.0 for i in range(3))
+        else:
+            raise ValueError("Invalid hex color")
+
     def _erase_annot(self, event):
-        # Find and delete annotation under cursor
+        # Find and delete annotation under cursor (improved hit-test for ink)
         page = self.pdf_doc.load_page(self.current_page)
         x = self.canvas.canvasx(self.winfo_pointerx() - self.canvas.winfo_rootx())
         y = self.canvas.canvasy(self.winfo_pointery() - self.canvas.winfo_rooty())
+        px, py = self.canvas_to_pdf(x, y)
         found = False
         for annot in page.annots():
             rect = annot.rect
-            if rect.contains(fitz.Point(*self.canvas_to_pdf(x, y))):
+            if rect.contains(fitz.Point(px, py)):
+                found = True
+            elif annot.type[0] == fitz.PDF_ANNOT_INK and self._is_point_near_ink(annot, px, py, tolerance=14):
+                found = True
+            if found:
                 self._push_undo('remove_annot', {'page': self.current_page, 'annots': [annot.xref]})
                 page.delete_annot(annot)
-                found = True
                 break
         if hasattr(self, '_eraser_hover_rect'):
             self.canvas.delete(self._eraser_hover_rect)
             del self._eraser_hover_rect
         if found:
-            self.pdf_doc.saveIncr()
+            print("[LOG] Annotation erased, refreshing page.")
+            try:
+                self.pdf_doc.saveIncr()
+            except Exception as e:
+                # Suppress the repaired file error during erasing
+                if "Can't do incremental writes on a repaired file" not in str(e):
+                    print(f"[LOG] saveIncr failed: {e}, trying full save.")
+                try:
+                    self.pdf_doc.save(self.pdf_doc.name)
+                except Exception as e2:
+                    if "save to original must be incremental" not in str(e2):
+                        print(f"[LOG] Full save also failed: {e2}")
+                        messagebox.showerror('Error', f'Failed to save PDF: {e2}')
             self.show_page()
         else:
             messagebox.showinfo('Eraser', 'No annotation found at this location.')
+
+    def _is_point_near_ink(self, annot, px, py, tolerance=8):
+        # px, py are in PDF coordinates
+        # Check if (px, py) is within 'tolerance' points of any segment in the ink annotation
+        if annot.type[0] == fitz.PDF_ANNOT_INK:
+            for path in annot.vertices:
+                for i in range(len(path) - 1):
+                    x0, y0 = path[i]
+                    x1, y1 = path[i+1]
+                    if self._point_to_segment_dist(px, py, x0, y0, x1, y1) <= tolerance:
+                        return True
+        return False
+
+    def _point_to_segment_dist(self, px, py, x0, y0, x1, y1):
+        # Return the distance from (px, py) to the segment (x0, y0)-(x1, y1)
+        from math import hypot
+        dx, dy = x1 - x0, y1 - y0
+        if dx == dy == 0:
+            return hypot(px - x0, py - y0)
+        t = max(0, min(1, ((px - x0) * dx + (py - y0) * dy) / (dx*dx + dy*dy)))
+        proj_x = x0 + t * dx
+        proj_y = y0 + t * dy
+        return hypot(px - proj_x, py - proj_y)
 
     # --- Professional Image Tool: Preview, Resize, Move Before Finalize ---
     def _start_image_annot(self, event):
