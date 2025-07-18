@@ -115,21 +115,51 @@ Name: \"desktopicon\"; Description: \"Create a &desktop icon\"; GroupDescription
     return iss_path
 
 def run_inno_setup(iss_path):
-    # Try to run ISCC.exe if available
-    try:
-        print('Running Inno Setup Compiler...')
-        subprocess.check_call(['ISCC', iss_path])
-        print('Inno Setup installer created.')
-        # Check for installer .exe
-        version = get_version()
-        installer_name = f'AdvancedPDFReader-Setup-v{version}.exe'
-        installer_path = os.path.join(PUBLIC_DIR, installer_name)
-        if os.path.exists(installer_path):
-            print(f'Installer created at {installer_path}')
-        else:
-            print(f'Installer .exe not found in {PUBLIC_DIR}. Please check Inno Setup output.')
-    except Exception as e:
-        print(f'Could not run Inno Setup Compiler automatically: {e}')
+    # Common paths where ISCC.exe might be installeds
+    iscc_paths = [
+        'ISCC',  # If in PATH
+        r'C:\Program Files (x86)\Inno Setup 6\ISCC.exe',
+        r'C:\Program Files\Inno Setup 6\ISCC.exe',
+        r'C:\Program Files (x86)\Inno Setup 5\ISCC.exe',
+        r'C:\Program Files\Inno Setup 5\ISCC.exe'
+    ]
+    
+    iscc_found = None
+    for path in iscc_paths:
+        try:
+            if path == 'ISCC':
+                subprocess.run([path, '--help'], capture_output=True, check=True)
+            else:
+                if os.path.exists(path):
+                    subprocess.run([path, '--help'], capture_output=True, check=True)
+                else:
+                    continue
+            iscc_found = path
+            break
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            continue
+    
+    if iscc_found:
+        try:
+            print('Running Inno Setup Compiler...')
+            subprocess.check_call([iscc_found, iss_path])
+            print('Inno Setup installer created.')
+            # Check for installer .exe
+            version = get_version()
+            installer_name = f'AdvancedPDFReader-Setup-v{version}.exe'
+            installer_path = os.path.join(PUBLIC_DIR, installer_name)
+            if os.path.exists(installer_path):
+                print(f'Installer created at {installer_path}')
+            else:
+                print(f'Installer .exe not found in {PUBLIC_DIR}. Please check Inno Setup output.')
+        except Exception as e:
+            print(f'Error running Inno Setup Compiler: {e}')
+            print('You can manually compile the installer with Inno Setup using the script:', iss_path)
+            print('Open installer.iss in Inno Setup and click "Compile". The output will be in /public.')
+    else:
+        print('Inno Setup Compiler (ISCC.exe) not found.')
+        print('Please install Inno Setup from: https://jrsoftware.org/isinfo.php')
+        print('Or add ISCC.exe to your PATH environment variable.')
         print('You can manually compile the installer with Inno Setup using the script:', iss_path)
         print('Open installer.iss in Inno Setup and click "Compile". The output will be in /public.')
 
