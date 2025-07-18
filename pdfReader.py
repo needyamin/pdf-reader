@@ -145,7 +145,11 @@ class PDFReaderApp(tk.Tk):
         self._copied_annot_data = None
         self._loading_label = None  # For sidebar loading indicator
         self._session_loaded = False
-        self.after(200, self._load_last_session)
+        # Check if a PDF was passed as command-line argument
+        self._pdf_from_cmdline = len(sys.argv) > 1 and sys.argv[1].lower().endswith('.pdf') and os.path.exists(sys.argv[1])
+        # Only load session if no PDF was passed as command-line argument
+        if not self._pdf_from_cmdline:
+            self.after(200, self._load_last_session)
         # Auto-update check on startup
         self.after(1000, self.auto_update)
 
@@ -238,14 +242,14 @@ class PDFReaderApp(tk.Tk):
         self.thumbnail_frame.bind('<Button-4>', self._on_sidebar_mousewheel)
         self.thumbnail_frame.bind('<Button-5>', self._on_sidebar_mousewheel)
         self._propagate_mousewheel_to_canvas(self.thumbnail_frame, self.thumbnail_canvas)
-        self.thumbnail_canvas.bind_all('<Up>', lambda e: self._sidebar_select_relative(-1))
-        self.thumbnail_canvas.bind_all('<Down>', lambda e: self._sidebar_select_relative(1))
-        self.thumbnail_canvas.bind_all('<Prior>', lambda e: self._sidebar_select_relative(-5))  # PageUp
-        self.thumbnail_canvas.bind_all('<Next>', lambda e: self._sidebar_select_relative(5))   # PageDown
-        self.thumbnail_canvas.bind_all('<Home>', lambda e: self.go_to_page(0))
-        self.thumbnail_canvas.bind_all('<End>', lambda e: self.go_to_page(len(self.pdf_doc)-1 if self.pdf_doc else 0))
-        self.thumbnail_canvas.bind_all('<Return>', lambda e: self.go_to_page(self.current_page))
-        self.thumbnail_canvas.focus_set()
+        # Sidebar keyboard navigation (only when sidebar has focus)
+        self.thumbnail_canvas.bind('<Up>', lambda e: self._sidebar_select_relative(-1))
+        self.thumbnail_canvas.bind('<Down>', lambda e: self._sidebar_select_relative(1))
+        self.thumbnail_canvas.bind('<Prior>', lambda e: self._sidebar_select_relative(-5))  # PageUp
+        self.thumbnail_canvas.bind('<Next>', lambda e: self._sidebar_select_relative(5))   # PageDown
+        self.thumbnail_canvas.bind('<Home>', lambda e: self.go_to_page(0))
+        self.thumbnail_canvas.bind('<End>', lambda e: self.go_to_page(len(self.pdf_doc)-1 if self.pdf_doc else 0))
+        self.thumbnail_canvas.bind('<Return>', lambda e: self.go_to_page(self.current_page))
 
         # Main PDF display area with scrollbars
         self.display_outer = tk.Frame(self.paned, bg=BG_COLOR)
@@ -313,6 +317,41 @@ class PDFReaderApp(tk.Tk):
         self.canvas.bind('<MouseWheel>', self._on_canvas_mousewheel)         # Windows
         self.canvas.bind('<Button-4>', self._on_canvas_mousewheel)           # Linux scroll up
         self.canvas.bind('<Button-5>', self._on_canvas_mousewheel)           # Linux scroll down
+        
+        # Keyboard scrolling for main PDF canvas
+        # Up/Down arrows for vertical scrolling
+        self.canvas.bind('<Up>', lambda e: self._on_canvas_key_scroll('up'))
+        self.canvas.bind('<Down>', lambda e: self._on_canvas_key_scroll('down'))
+        # Ctrl+Left/Right for horizontal scrolling (to avoid conflict with page navigation)
+        self.canvas.bind('<Control-Left>', lambda e: self._on_canvas_key_scroll('left'))
+        self.canvas.bind('<Control-Right>', lambda e: self._on_canvas_key_scroll('right'))
+        # Shift + arrow keys for faster scrolling
+        self.canvas.bind('<Shift-Up>', lambda e: self._on_canvas_key_scroll('up', 50))
+        self.canvas.bind('<Shift-Down>', lambda e: self._on_canvas_key_scroll('down', 50))
+        self.canvas.bind('<Shift-Control-Left>', lambda e: self._on_canvas_key_scroll('left', 50))
+        self.canvas.bind('<Shift-Control-Right>', lambda e: self._on_canvas_key_scroll('right', 50))
+        # Also bind to display frame for better coverage
+        self.display_frame.bind('<Up>', lambda e: self._on_canvas_key_scroll('up'))
+        self.display_frame.bind('<Down>', lambda e: self._on_canvas_key_scroll('down'))
+        self.display_frame.bind('<Control-Left>', lambda e: self._on_canvas_key_scroll('left'))
+        self.display_frame.bind('<Control-Right>', lambda e: self._on_canvas_key_scroll('right'))
+        self.display_frame.bind('<Shift-Up>', lambda e: self._on_canvas_key_scroll('up', 50))
+        self.display_frame.bind('<Shift-Down>', lambda e: self._on_canvas_key_scroll('down', 50))
+        self.display_frame.bind('<Shift-Control-Left>', lambda e: self._on_canvas_key_scroll('left', 50))
+        self.display_frame.bind('<Shift-Control-Right>', lambda e: self._on_canvas_key_scroll('right', 50))
+        
+        # Set focus to main canvas by default so arrow keys work for scrolling
+        self.canvas.focus_set()
+        
+        # Add a method to ensure canvas focus and bind it to various events
+        def ensure_canvas_focus(event=None):
+            if self.canvas.winfo_exists():
+                self.canvas.focus_set()
+        
+        # Bind focus events to ensure canvas gets focus
+        self.canvas.bind('<FocusOut>', lambda e: self.after(10, ensure_canvas_focus))
+        self.bind('<Button-1>', lambda e: ensure_canvas_focus())
+        self.display_frame.bind('<Button-1>', lambda e: ensure_canvas_focus())
 
     def _add_toolbar_buttons(self):
         btns = []
@@ -400,20 +439,59 @@ class PDFReaderApp(tk.Tk):
             img = Image.frombytes('RGB', [pix.width, pix.height], pix.samples)
             thumb = ImageTk.PhotoImage(img)
             self.thumbnails.append(thumb)
-            btn = tk.Label(self.thumbnail_frame, image=thumb, bg=SIDEBAR_COLOR, bd=2, relief='solid', highlightthickness=2)
-            btn.pack(pady=4, padx=6)
+            
+            # Create a frame to hold thumbnail with relative positioning
+            thumb_frame = tk.Frame(self.thumbnail_frame, bg=SIDEBAR_COLOR, bd=2, relief='solid', highlightthickness=2)
+            thumb_frame.pack(pady=4, padx=6)
+            
+            # Set frame size based on thumbnail image size
+            thumb_width = thumb.width()
+            thumb_height = thumb.height()
+            thumb_frame.configure(width=thumb_width, height=thumb_height)
+            thumb_frame.pack_propagate(False)  # Prevent frame from shrinking
+            
+            # Thumbnail image
+            btn = tk.Label(thumb_frame, image=thumb, bg=SIDEBAR_COLOR, bd=0, highlightthickness=0)
+            btn.place(relx=0, rely=0, relwidth=1, relheight=1)
+            
+            # Page number badge (positioned on top-right corner)
+            page_num_label = tk.Label(thumb_frame, text=str(i+1), bg=ACCENT_COLOR, fg=FG_COLOR, 
+                                    font=('Segoe UI', 7, 'bold'), anchor='center',
+                                    relief='raised', bd=1)
+            # Position the badge in the top-right corner
+            page_num_label.place(relx=0.85, rely=0.05, width=20, height=16)
+            
+            # Bind events to the frame
+            thumb_frame.bind('<Button-1>', lambda e, i=i: self.go_to_page(i))
+            thumb_frame.bind('<Enter>', lambda e, f=thumb_frame: f.configure(bg=BUTTON_ACTIVE))
+            thumb_frame.bind('<Leave>', lambda e, f=thumb_frame, idx=i: self._update_thumbnail_highlight(f, idx))
+            
+            # Also bind to the image and label for better UX
             btn.bind('<Button-1>', lambda e, i=i: self.go_to_page(i))
-            btn.bind('<Enter>', lambda e, b=btn: b.configure(bg=BUTTON_ACTIVE))
-            btn.bind('<Leave>', lambda e, b=btn, idx=i: self._update_thumbnail_highlight(b, idx))
+            btn.bind('<Enter>', lambda e, f=thumb_frame: f.configure(bg=BUTTON_ACTIVE))
+            btn.bind('<Leave>', lambda e, f=thumb_frame, idx=i: self._update_thumbnail_highlight(f, idx))
+            
+            page_num_label.bind('<Button-1>', lambda e, i=i: self.go_to_page(i))
+            page_num_label.bind('<Enter>', lambda e, f=thumb_frame: f.configure(bg=BUTTON_ACTIVE))
+            page_num_label.bind('<Leave>', lambda e, f=thumb_frame, idx=i: self._update_thumbnail_highlight(f, idx))
+            
             # Highlight current page
-            self._update_thumbnail_highlight(btn, i)
-            self._propagate_mousewheel_to_canvas(btn, self.thumbnail_canvas)
+            self._update_thumbnail_highlight(thumb_frame, i)
+            self._propagate_mousewheel_to_canvas(thumb_frame, self.thumbnail_canvas)
 
     def _update_thumbnail_highlight(self, btn, idx):
         if idx == self.current_page:
             btn.configure(bg=HIGHLIGHT_COLOR, bd=3, relief='solid', highlightbackground=ACCENT_COLOR, highlightcolor=ACCENT_COLOR)
+            # Update page number badge color for current page
+            for child in btn.winfo_children():
+                if isinstance(child, tk.Label) and child.cget('text').isdigit():
+                    child.configure(bg=FG_COLOR, fg=HIGHLIGHT_COLOR)
         else:
             btn.configure(bg=SIDEBAR_COLOR, bd=2, relief='solid', highlightbackground=SIDEBAR_COLOR, highlightcolor=SIDEBAR_COLOR)
+            # Update page number badge color for other pages
+            for child in btn.winfo_children():
+                if isinstance(child, tk.Label) and child.cget('text').isdigit():
+                    child.configure(bg=ACCENT_COLOR, fg=FG_COLOR)
 
     def show_page(self):
         print(f'[DEBUG] show_page called: page={self.current_page}, zoom={self.zoom}, fit={self.fit_to_window.get()}, size=({self.canvas.winfo_width()}x{self.canvas.winfo_height()})')
@@ -489,7 +567,10 @@ class PDFReaderApp(tk.Tk):
         self.page_entry_var.set(str(self.current_page+1))
         self.page_total_label.config(text=f'/ {len(self.pdf_doc)}')
         fname = self.pdf_doc.name if hasattr(self.pdf_doc, 'name') else ''
-        self.status.config(text=f'{os.path.basename(fname)} | Page {self.current_page+1}/{len(self.pdf_doc)} | Zoom: {int(self.zoom*100)}% | Rotation: {self.rotation}° | Fit: {"ON" if self.fit_to_window.get() else "OFF"}')
+        # Get current focus widget for debugging
+        focused_widget = self.focus_get()
+        focus_info = f"Focus: {type(focused_widget).__name__}" if focused_widget else "Focus: None"
+        self.status.config(text=f'{os.path.basename(fname)} | Page {self.current_page+1}/{len(self.pdf_doc)} | Zoom: {int(self.zoom*100)}% | Rotation: {self.rotation}° | Fit: {"ON" if self.fit_to_window.get() else "OFF"} | {focus_info}')
         for idx, widget in enumerate(self.thumbnail_frame.winfo_children()):
             self._update_thumbnail_highlight(widget, idx)
         # --- Only enable form fields if in form mode and not already active for this state ---
@@ -581,6 +662,36 @@ class PDFReaderApp(tk.Tk):
             self.paned.add(self.display_outer, minsize=200)
             self.sidebar_visible = True
         self.show_page()
+
+    def _sidebar_select_relative(self, direction):
+        """Navigate through thumbnails using arrow keys"""
+        if not self.pdf_doc:
+            return
+        new_page = self.current_page + direction
+        if 0 <= new_page < len(self.pdf_doc):
+            self.go_to_page(new_page)
+            # Scroll to make the selected thumbnail visible
+            self.after(100, lambda: self._scroll_to_thumbnail(new_page))
+    
+    def _scroll_to_thumbnail(self, page_num):
+        """Scroll sidebar to make the specified thumbnail visible"""
+        try:
+            # Get the thumbnail widget for the specified page
+            thumbnails = [w for w in self.thumbnail_frame.winfo_children() if isinstance(w, tk.Frame)]
+            if 0 <= page_num < len(thumbnails):
+                thumb = thumbnails[page_num]
+                # Calculate position and scroll
+                thumb_y = thumb.winfo_y()
+                canvas_height = self.thumbnail_canvas.winfo_height()
+                frame_height = self.thumbnail_frame.winfo_height()
+                
+                # Calculate scroll position to center the thumbnail
+                scroll_pos = (thumb_y - canvas_height/2) / max(1, frame_height - canvas_height)
+                scroll_pos = max(0, min(1, scroll_pos))  # Clamp between 0 and 1
+                
+                self.thumbnail_canvas.yview_moveto(scroll_pos)
+        except Exception:
+            pass
 
     def _on_sidebar_mousewheel(self, event):
         # Sidebar scroll: more responsive (8 units)
@@ -1299,6 +1410,11 @@ class PDFReaderApp(tk.Tk):
             ('Previous Page', 'Left, PageUp, Shift+Space'),
             ('First Page', 'Home'),
             ('Last Page', 'End'),
+            ('Scroll Up', 'Up Arrow'),
+            ('Scroll Down', 'Down Arrow'),
+            ('Scroll Left', 'Ctrl + Left Arrow'),
+            ('Scroll Right', 'Ctrl + Right Arrow'),
+            ('Fast Scroll', 'Shift + Arrow Keys'),
             ('Zoom In', 'Ctrl++, +, ='),
             ('Zoom Out', 'Ctrl+-, -'),
             ('Rotate', 'R'),
@@ -1573,6 +1689,18 @@ class PDFReaderApp(tk.Tk):
                 elif event.num == 5:
                     self.canvas.yview_scroll(20, 'units')
 
+    def _on_canvas_key_scroll(self, direction, amount=20):
+        """Handle keyboard scrolling of the main PDF canvas"""
+        print(f"[DEBUG] Key scroll: {direction}, amount: {amount}")
+        if direction == 'up':
+            self.canvas.yview_scroll(-amount, 'units')
+        elif direction == 'down':
+            self.canvas.yview_scroll(amount, 'units')
+        elif direction == 'left':
+            self.canvas.xview_scroll(-amount, 'units')
+        elif direction == 'right':
+            self.canvas.xview_scroll(amount, 'units')
+
     def _propagate_mousewheel_to_canvas(self, widget, canvas):
         # Ensure mouse wheel events on widget are handled by canvas
         tags = list(widget.bindtags())
@@ -1581,6 +1709,14 @@ class PDFReaderApp(tk.Tk):
             widget.bindtags(tuple(tags))
 
 if __name__ == '__main__':
+    # Check for command-line arguments (PDF file to open)
+    pdf_file_to_open = None
+    if len(sys.argv) > 1:
+        pdf_file_to_open = sys.argv[1]
+        # Validate that it's a PDF file
+        if not pdf_file_to_open.lower().endswith('.pdf'):
+            pdf_file_to_open = None
+    
     # Splash is the root window
     splash = tk.Tk()
     splash.overrideredirect(True)
@@ -1608,6 +1744,9 @@ if __name__ == '__main__':
     def show_main():
         splash.destroy()
         app = PDFReaderApp()
+        # If a PDF file was passed as argument, open it instead of loading session
+        if pdf_file_to_open and os.path.exists(pdf_file_to_open):
+            app.after(100, lambda: app.open_pdf(pdf_file_to_open))
         app.lift()
         app.focus_force()
         app.mainloop()
