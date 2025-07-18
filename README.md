@@ -36,14 +36,15 @@ A modern, professional PDF reader and annotator for Windows, built with Tkinter 
    ```sh
    python build.py
    ```
-   The standalone `.exe` and all build artifacts will be in the `/public/dist/` folder.
-   The `/public` folder will contain the built `.exe`, an Inno Setup script, and (optionally) the installer. All build and dist folders are now inside `/public`.
+   The standalone `.exe` will be in the `/public/` folder.
+   The `/public` folder will contain the built `.exe`, an Inno Setup script, and (optionally) the installer. All build and dist folders are inside `/public`.
 
 ## Creating a Windows Installer (Inno Setup)
 
 1. **Install Inno Setup** ([Download here](https://jrsoftware.org/isinfo.php))
-2. After running `python build.py`, open `/public/installer.iss` in Inno Setup and click "Compile".
-3. The installer (e.g., `AdvancedPDFReader-Setup-v1.0.0.exe`) will be created in `/public`.
+2. After running `python build.py`, the installer will be created automatically if Inno Setup is installed.
+3. If Inno Setup is not found, open `/public/installer.iss` in Inno Setup and click "Compile".
+4. The installer (e.g., `AdvancedPDFReader-Setup-v1.0.0.exe`) will be created in `/public`.
 
 ## Usage
 - Run `pdfReader.py` (or `PDFReader.exe` after build)
@@ -78,10 +79,12 @@ MIT License
 ## /public Folder Structure
 
 - After building, the `/public` folder contains:
-  - `/public/dist/` — The standalone `.exe` and all distributable files
+  - `PDFReader-vX.Y.Z.exe` — The standalone portable executable
+  - `/public/dist/` — PyInstaller distribution files
   - `/public/build/` — PyInstaller build files (can be deleted after distribution)
-  - `/public/installer.iss` — Inno Setup script
-  - `/public/AdvancedPDFReader-Setup-vX.Y.Z.exe` — Windows installer (if compiled)
+  - `/public/assets/` — Copied assets for the installer
+  - `installer.iss` — Inno Setup script
+  - `AdvancedPDFReader-Setup-vX.Y.Z.exe` — Windows installer (if Inno Setup is installed)
 - Use the `/public` folder to distribute your app or upload to GitHub Releases.
 
 ---
