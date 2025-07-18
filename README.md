@@ -4,8 +4,11 @@ A modern, professional PDF reader and annotator for Windows, built with Tkinter 
 
 ## Features
 - Dark, modern UI (Photoshop-inspired)
-- Sidebar with page thumbnails (active page highlighted)
+- Sidebar with page thumbnails (active page highlighted with page number badges)
 - Main PDF display with zoom, fit, and rotation
+- **Keyboard scrolling**: Up/Down arrows for vertical scrolling, Ctrl+Left/Right for horizontal scrolling
+- **Session restore**: Automatically remembers last opened PDF and page position
+- **Default PDF association**: Can be set as default PDF reader for Windows
 - Toolbar with annotation tools:
   - Highlight, Draw, Text Note, Image, Form Fill, Eraser
 - Undo/Redo for all annotation actions (Ctrl+Z, Ctrl+Y)
@@ -49,6 +52,9 @@ A modern, professional PDF reader and annotator for Windows, built with Tkinter 
 ## Usage
 - Run `pdfReader.py` (or `PDFReader.exe` after build)
 - Open a PDF, use the toolbar and sidebar to navigate and annotate
+- **Keyboard scrolling**: Use Up/Down arrows to scroll vertically, Ctrl+Left/Right for horizontal scrolling
+- **Session restore**: App automatically opens your last PDF and page when launched
+- **Default PDF reader**: Set as default to open PDFs directly by double-clicking
 - Use keyboard shortcuts for fast workflow (see Help > Shortcuts)
 
 ## Screenshot
@@ -88,6 +94,20 @@ MIT License
 - Use the `/public` folder to distribute your app or upload to GitHub Releases.
 
 ---
+
+## Setting as Default PDF Reader
+
+### Method 1: Windows Settings
+1. Right-click any PDF file
+2. Select "Open with" → "Choose another app"
+3. Select "Advanced PDF Reader"
+4. Check "Always use this app to open .pdf files"
+
+### Method 2: Windows Settings App
+1. Open Windows Settings (`Windows + I`)
+2. Go to "Apps" → "Default apps"
+3. Scroll down and click "Choose default apps by file type"
+4. Find ".pdf" and select "Advanced PDF Reader"
 
 ## Support
 For questions or contributions, contact [needyamin@gmail.com](mailto:needyamin@gmail.com) or visit [github.com/needyamin](https://github.com/needyamin). 
