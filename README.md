@@ -58,7 +58,7 @@ A modern, professional PDF reader and annotator for Windows, built with Tkinter 
 - Use keyboard shortcuts for fast workflow (see Help > Shortcuts)
 
 ## Screenshot
-![Screenshot](screenshot.png)
+<img width="1365" height="730" alt="Image" src="https://github.com/user-attachments/assets/da490f19-de4c-4814-b9f3-bf8f8c6f8e2b" />
 
 ## License
 MIT License
