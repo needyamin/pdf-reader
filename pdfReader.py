@@ -7,6 +7,7 @@ import sys
 import threading
 import json
 import requests
+import datetime
 
 # Asset folder structure
 ASSET_DIR = os.path.join(os.path.dirname(__file__), 'assets')
@@ -14,6 +15,7 @@ ICON_PATH = os.path.join(ASSET_DIR, 'icons', 'icon.ico')
 LOADING_IMG_PATH = os.path.join(ASSET_DIR, 'images', 'loading.png')
 SESSION_FILE = os.path.join(ASSET_DIR, 'json', 'last_session.json')
 TOKEN_FILE = os.path.join(ASSET_DIR, 'json', 'github_token.json')
+LICENSE_FILE = os.path.join(ASSET_DIR, 'json', 'license_info.json')
 
 try:
     import pystray
@@ -157,6 +159,7 @@ class PDFReaderApp(tk.Tk):
         # Add F11 for fullscreen toggle
         self.bind_all('<F11>', lambda e: self.toggle_fullscreen())
         self.bind_all('<Escape>', lambda e: self.exit_fullscreen())
+        self._check_license()  # <-- moved here, after window is created
 
     def _setup_style(self):
         style = ttk.Style(self)
@@ -1747,6 +1750,103 @@ class PDFReaderApp(tk.Tk):
             messagebox.showinfo('Saved', f'Saved: {self._current_pdf_path}')
         except Exception as e:
             messagebox.showerror('Save Error', f'Could not save PDF: {e}')
+
+    def _check_license(self):
+        # Check license file for start date and license key
+        now = datetime.datetime.now()
+        try:
+            with open(LICENSE_FILE, 'r') as f:
+                data = json.load(f)
+        except Exception:
+            data = {}
+        start_str = data.get('start_date')
+        license_key = data.get('license_key')
+        if not start_str:
+            # First run: store start date
+            data['start_date'] = now.strftime('%Y-%m-%d')
+            with open(LICENSE_FILE, 'w') as f:
+                json.dump(data, f)
+            return
+        start_date = datetime.datetime.strptime(start_str, '%Y-%m-%d')
+        days_used = (now - start_date).days
+        if days_used < 7:
+            return
+        # After 7 days, require license
+        if not license_key or not self._validate_license(license_key):
+            self._prompt_license()
+
+    def _validate_license(self, key):
+        # Simple example: valid key is 'NEEDYAMIN-2025'
+        return key == 'NEEDYAMIN-2025'
+
+    def _prompt_license(self):
+        import tkinter.messagebox as mb
+        # Custom modal dialog for license entry with app icon
+        for _ in range(3):
+            key = self._show_license_dialog()
+            if key and self._validate_license(key):
+                # Save license
+                try:
+                    with open(LICENSE_FILE, 'r') as f:
+                        data = json.load(f)
+                except Exception:
+                    data = {}
+                data['license_key'] = key
+                with open(LICENSE_FILE, 'w') as f:
+                    json.dump(data, f)
+                mb.showinfo('License Activated', 'Thank you! License activated.', parent=self)
+                return
+            else:
+                mb.showerror('Invalid License', 'The license key is invalid.', parent=self)
+        mb.showerror('License Required', 'No valid license entered. The app will now exit.', parent=self)
+        import sys
+        self.destroy()
+        sys.exit(1)
+
+    def _show_license_dialog(self):
+        # Create a modal dialog with app icon for license entry
+        dialog = tk.Toplevel(self)
+        dialog.title('License Required')
+        dialog.configure(bg=BG_COLOR)
+        dialog.resizable(False, False)
+        try:
+            dialog.iconbitmap(ICON_PATH)
+        except Exception:
+            pass
+        dialog.transient(self)
+        dialog.grab_set()
+        dialog.lift()
+        dialog.attributes('-topmost', True)
+        # Center dialog
+        dialog.update_idletasks()
+        w, h = 340, 160
+        x = self.winfo_rootx() + (self.winfo_width() - w) // 2
+        y = self.winfo_rooty() + (self.winfo_height() - h) // 2
+        dialog.geometry(f'{w}x{h}+{x}+{y}')
+        # Widgets
+        label = tk.Label(dialog, text='Your trial has expired.\nPlease enter your license key:', bg=BG_COLOR, fg=FG_COLOR, font=FONT, justify='center')
+        label.pack(pady=(18, 8), padx=16)
+        entry_var = tk.StringVar()
+        entry = tk.Entry(dialog, textvariable=entry_var, font=FONT, width=28, justify='center')
+        entry.pack(pady=(0, 12))
+        entry.focus_set()
+        result = {'key': None}
+        def submit():
+            result['key'] = entry_var.get().strip()
+            dialog.destroy()
+        def cancel():
+            result['key'] = None
+            dialog.destroy()
+        btn_frame = tk.Frame(dialog, bg=BG_COLOR)
+        btn_frame.pack(pady=(0, 10))
+        ok_btn = tk.Button(btn_frame, text='OK', command=submit, font=FONT, bg=TOOLBAR_COLOR, fg=FG_COLOR, relief='flat', width=8)
+        ok_btn.pack(side='left', padx=8)
+        cancel_btn = tk.Button(btn_frame, text='Cancel', command=cancel, font=FONT, bg=TOOLBAR_COLOR, fg=FG_COLOR, relief='flat', width=8)
+        cancel_btn.pack(side='left', padx=8)
+        dialog.bind('<Return>', lambda e: submit())
+        dialog.bind('<Escape>', lambda e: cancel())
+        self.wait_window(dialog)
+        return result['key']
 
 if __name__ == '__main__':
     # Check for command-line arguments (PDF file to open)
