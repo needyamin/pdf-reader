@@ -72,6 +72,8 @@ class PDFReaderApp(tk.Tk):
         self.title('Advanced PDF Reader')
         self.geometry('1200x800')
         self.configure(bg=BG_COLOR)
+        self._fullscreen = False  # Track fullscreen state
+        self._current_pdf_path = None  # Track current file path for Save
         # Set application icon (window, taskbar, startbar)
         try:
             self.iconbitmap(ICON_PATH)
@@ -152,6 +154,9 @@ class PDFReaderApp(tk.Tk):
             self.after(200, self._load_last_session)
         # Auto-update check on startup
         self.after(1000, self.auto_update)
+        # Add F11 for fullscreen toggle
+        self.bind_all('<F11>', lambda e: self.toggle_fullscreen())
+        self.bind_all('<Escape>', lambda e: self.exit_fullscreen())
 
     def _setup_style(self):
         style = ttk.Style(self)
@@ -169,7 +174,8 @@ class PDFReaderApp(tk.Tk):
         # File menu
         file_menu = tk.Menu(self.menu, tearoff=0)
         file_menu.add_command(label='Open...', command=self.open_pdf, accelerator='Ctrl+O')
-        file_menu.add_command(label='Save As...', command=self.save_as, accelerator='Ctrl+S')
+        file_menu.add_command(label='Save', command=self.save_pdf, accelerator='Ctrl+S')
+        file_menu.add_command(label='Save As...', command=self.save_as, accelerator='Ctrl+Shift+S')
         file_menu.add_separator()
         file_menu.add_command(label='Export as Image...', command=self.export_image)
         file_menu.add_separator()
@@ -190,6 +196,8 @@ class PDFReaderApp(tk.Tk):
         view_menu.add_command(label='Zoom In', command=lambda: self.change_zoom(1.25), accelerator='Ctrl++')
         view_menu.add_command(label='Zoom Out', command=lambda: self.change_zoom(0.8), accelerator='Ctrl+-')
         view_menu.add_command(label='Fit to Window', command=self.toggle_fit, accelerator='F')
+        view_menu.add_separator()
+        view_menu.add_command(label='Full Screen', command=self.toggle_fullscreen, accelerator='F11')
         view_menu.add_separator()
         view_menu.add_command(label='Toggle Sidebar', command=self.toggle_sidebar, accelerator='S')
         self.menu.add_cascade(label='View', menu=view_menu)
@@ -364,6 +372,7 @@ class PDFReaderApp(tk.Tk):
             btns.append(btn)
             return btn
         make_btn('Open', self.open_pdf, '📂', 'Open PDF (Ctrl+O)')
+        make_btn('Save', self.save_pdf, '💾', 'Save PDF (Ctrl+S)')
         make_btn('Prev', self.prev_page, '⬅️', 'Previous Page (Left, PageUp, Shift+Space)')
         make_btn('Next', self.next_page, '➡️', 'Next Page (Right, PageDown, Space)')
         make_btn('Zoom +', lambda: self.change_zoom(1.25), '➕', 'Zoom In (Ctrl +, +, =)')
@@ -414,6 +423,7 @@ class PDFReaderApp(tk.Tk):
         self.update_idletasks()
         try:
             self.pdf_doc = fitz.open(file_path)
+            self._current_pdf_path = file_path  # Track current file path
             print(f"[LOG] PDF loaded: {file_path}")
             self.current_page = 0
             self.zoom = 1.0
@@ -719,6 +729,7 @@ class PDFReaderApp(tk.Tk):
         file_path = filedialog.asksaveasfilename(defaultextension='.pdf', filetypes=[('PDF Files', '*.pdf')])
         if file_path:
             self.pdf_doc.save(file_path)
+            self._current_pdf_path = file_path  # Update current file path
             messagebox.showinfo('Saved', f'Saved as {file_path}')
 
     def export_image(self):
@@ -1702,11 +1713,40 @@ class PDFReaderApp(tk.Tk):
             self.canvas.xview_scroll(amount, 'units')
 
     def _propagate_mousewheel_to_canvas(self, widget, canvas):
-        # Ensure mouse wheel events on widget are handled by canvas
-        tags = list(widget.bindtags())
-        if str(canvas) not in tags:
-            tags.insert(1, str(canvas))
-            widget.bindtags(tuple(tags))
+        # Ensure mouse wheel events on widget and all children are handled by canvas
+        def add_bindings(w):
+            tags = list(w.bindtags())
+            if str(canvas) not in tags:
+                tags.insert(1, str(canvas))
+                w.bindtags(tuple(tags))
+            # Recursively add to children
+            for child in getattr(w, 'winfo_children', lambda:[])():
+                add_bindings(child)
+        add_bindings(widget)
+
+    def toggle_fullscreen(self):
+        self._fullscreen = not self._fullscreen
+        self.attributes('-fullscreen', self._fullscreen)
+        if self._fullscreen:
+            self.status.config(text='Full Screen Mode (Press Esc to exit)')
+        else:
+            self.status.config(text='Exited Full Screen')
+
+    def exit_fullscreen(self):
+        if self._fullscreen:
+            self._fullscreen = False
+            self.attributes('-fullscreen', False)
+            self.status.config(text='Exited Full Screen')
+
+    def save_pdf(self):
+        if not self.pdf_doc or not self._current_pdf_path:
+            messagebox.showwarning('No PDF', 'No PDF loaded.')
+            return
+        try:
+            self.pdf_doc.save(self._current_pdf_path)
+            messagebox.showinfo('Saved', f'Saved: {self._current_pdf_path}')
+        except Exception as e:
+            messagebox.showerror('Save Error', f'Could not save PDF: {e}')
 
 if __name__ == '__main__':
     # Check for command-line arguments (PDF file to open)
