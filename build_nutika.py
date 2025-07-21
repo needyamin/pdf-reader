@@ -5,11 +5,22 @@ from pathlib import Path
 import subprocess
 import json
 
+# ---
+# To access bundled assets in your app, use this function:
+# (Copy this to your main app, e.g., pdfReader.py)
+def resource_path(relative_path):
+    import sys, os
+    if hasattr(sys, '_MEIPASS'):
+        return os.path.join(sys._MEIPASS, relative_path)
+    return os.path.join(os.path.abspath('.'), relative_path)
+# Example: resource_path('assets/icons/icon.ico')
+# ---
+
 # Configuration
 APP_NAME = "Advanced PDF Reader"
 VERSION = "1.0.0"
 MAIN_SCRIPT = "pdfReader.py"
-ICON_PATH = "assets/icons/icon.ico"
+ICON_PATH = resource_path("assets/icons/icon.ico")
 AUTHOR = "Yamin Hossain"
 DESCRIPTION = "Modern PDF Reader and Annotator"
 
@@ -130,12 +141,14 @@ def build_executable():
         "--windows-product-version=" + VERSION,
         "--windows-file-description=" + DESCRIPTION,
         "--windows-icon-from-ico=" + ICON_PATH,
+        # This flag ensures the app does not show a terminal window
         "--disable-console",
         "--follow-imports",
         "--plugin-enable=tk-inter",
         "--include-package=PIL",
         "--include-package=fitz",
         "--include-package=requests",
+        # This bundles ALL assets (icons, images, json, etc.)
         "--include-data-dir=assets=assets",
         "--output-dir=" + DIST_DIR,
         "--verbose",
@@ -227,7 +240,19 @@ def main():
     
     # Build executable
     build_executable()
-    
+
+    # Move dist folder to public folder after build
+    public_dir = "public"
+    dist_dir = DIST_DIR
+    public_dist = os.path.join(public_dir, dist_dir)
+    if not os.path.exists(public_dir):
+        os.makedirs(public_dir)
+    if os.path.exists(public_dist):
+        shutil.rmtree(public_dist)
+    if os.path.exists(dist_dir):
+        shutil.move(dist_dir, public_dist)
+        print(f"Moved {dist_dir}/ to {public_dist}/")
+
     # Copy and optimize assets
     copy_assets()
     optimize_images()
@@ -236,7 +261,7 @@ def main():
     create_installer()
     
     print("\nBuild process completed!")
-    print(f"Executable location: {DIST_DIR}/{APP_NAME}.exe")
+    print(f"Executable location: {public_dist}/{APP_NAME}.exe")
     print("Installer location: installer/")
 
 if __name__ == "__main__":

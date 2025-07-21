@@ -1,0 +1,28 @@
+python -m nuitka --mingw64 \
+  --windows-company-name="ANSNEW TECH." \
+  --windows-product-name="Advance PDF READER" \
+  --windows-file-version="1.0.0" \
+  --windows-product-version="1.0.0" \
+  --windows-file-description="Smile :)" \
+  --windows-icon-from-ico="assets/icons/icon.ico" \
+  --disable-console \
+  --follow-imports \
+  --plugin-enable=tk-inter \
+  --include-package=PIL \
+  --include-package=fitz \
+  --include-package=requests \
+  --include-data-dir=assets=assets \
+  --include-data-dir=assets/icons=assets/icons \
+  --include-data-dir=assets/images=assets/images \
+  --include-data-dir=assets/json=assets/json \
+  --output-dir=dist \
+  --verbose \
+  --standalone \
+  --onefile \
+  --jobs=2 \
+  --lto=no \
+  --include-module=tkinter \
+  --include-module=tkinter.ttk \
+  --include-module=tkinter.messagebox \
+  --include-module=tkinter.filedialog \
+  pdfReader.py
