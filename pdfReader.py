@@ -9,13 +9,28 @@ import json
 import requests
 import datetime
 
-# Asset folder structure
-ASSET_DIR = os.path.join(os.path.dirname(__file__), 'assets')
-ICON_PATH = os.path.join(ASSET_DIR, 'icons', 'icon.ico')
-LOADING_IMG_PATH = os.path.join(ASSET_DIR, 'images', 'loading.png')
-SESSION_FILE = os.path.join(ASSET_DIR, 'json', 'last_session.json')
-TOKEN_FILE = os.path.join(ASSET_DIR, 'json', 'github_token.json')
-LICENSE_FILE = os.path.join(ASSET_DIR, 'json', 'license_info.json')
+def resource_path(relative_path):
+    """Return absolute path to resource, works for dev and Nuitka onefile"""
+    if hasattr(sys, '_MEIPASS'):
+        base_path = sys._MEIPASS
+    else:
+        base_path = os.path.abspath(".")
+    return os.path.join(base_path, relative_path)
+
+# ✅ Updated Asset Paths (WORKS in onefile & dev)
+ICON_PATH = resource_path('assets/icons/icon.ico')
+LOADING_IMG_PATH = resource_path('assets/images/loading.png')
+SESSION_FILE = resource_path('assets/json/last_session.json')
+TOKEN_FILE = resource_path('assets/json/github_token.json')
+LICENSE_FILE = resource_path('assets/json/license_info.json')
+
+# # Asset folder structure
+# ASSET_DIR = os.path.join(os.path.dirname(__file__), 'assets')
+# ICON_PATH = os.path.join(ASSET_DIR, 'icons', 'icon.ico')
+# LOADING_IMG_PATH = os.path.join(ASSET_DIR, 'images', 'loading.png')
+# SESSION_FILE = os.path.join(ASSET_DIR, 'json', 'last_session.json')
+# TOKEN_FILE = os.path.join(ASSET_DIR, 'json', 'github_token.json')
+# LICENSE_FILE = os.path.join(ASSET_DIR, 'json', 'license_info.json')
 
 try:
     import pystray
