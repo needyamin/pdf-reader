@@ -32,6 +32,7 @@ REQUIRED_PACKAGES = [
     "Pillow",
     "pymupdf",
     "requests"
+    "webbrowser"
 ]
 
 # Build directory setup
@@ -148,6 +149,7 @@ def build_executable():
         "--include-package=PIL",
         "--include-package=fitz",
         "--include-package=requests",
+        "--include-package=webbrowser",
         # This bundles ALL assets (icons, images, json, etc.)
         "--include-data-dir=assets=assets",
         "--output-dir=" + DIST_DIR,

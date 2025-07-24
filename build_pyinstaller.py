@@ -35,6 +35,7 @@ def ensure_requirements_txt():
         'pywin32',
         'pystray',
         'requests',
+        'webbrowser',
     ]
     if not os.path.exists(REQUIREMENTS_TXT):
         with open(REQUIREMENTS_TXT, 'w') as f:

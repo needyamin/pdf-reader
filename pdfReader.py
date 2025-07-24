@@ -8,6 +8,7 @@ import threading
 import json
 import requests
 import datetime
+import webbrowser
 
 def resource_path(relative_path):
     """Return absolute path to resource, works for dev and Nuitka onefile"""
@@ -18,6 +19,7 @@ def resource_path(relative_path):
     return os.path.join(base_path, relative_path)
 
 # ✅ Updated Asset Paths (WORKS in onefile & dev)
+ASSET_DIR = resource_path('assets/images/YAMiN_HOSSAIN.png')
 ICON_PATH = resource_path('assets/icons/icon.ico')
 LOADING_IMG_PATH = resource_path('assets/images/loading.png')
 SESSION_FILE = resource_path('assets/json/last_session.json')
@@ -236,6 +238,13 @@ class PDFReaderApp(tk.Tk):
         help_menu.add_separator()
         help_menu.add_command(label='Add to Auto Startup', command=self.add_to_startup)
         self.menu.add_cascade(label='Help', menu=help_menu)
+        # Activate Software
+        activate_software = tk.Menu(self.menu, tearoff=0)
+        activate_software.add_command(label='Active', command=self._prompt_license)
+        activate_software.add_separator()
+        activate_software.add_command(label='Buy Me Coffee', command=self.show_license)
+        self.menu.add_cascade(label='Active', menu=activate_software)
+        
 
         # Toolbar
         self.toolbar = tk.Frame(self, bg=TOOLBAR_COLOR, height=50)
@@ -1352,6 +1361,68 @@ class PDFReaderApp(tk.Tk):
         if hasattr(self, '_text_drag_offset'):
             del self._text_drag_offset
 
+
+
+
+    def show_license(self):
+            license_win = tk.Toplevel(self)
+            license_win.title("License")
+            license_win.configure(bg=BG_COLOR)
+            license_win.resizable(False, False)
+            try:
+                license_win.iconbitmap(ICON_PATH)
+            except Exception:
+                pass
+
+            license_text = (
+                "This software is licensed under the MIT License.\n\n"
+                "Permission is hereby granted, free of charge, to any person obtaining a copy "
+                "of this software and associated documentation files (the \"Software\"), to deal "
+                "in the Software without restriction, including without limitation the rights "
+                "to use, copy, modify, merge, publish, distribute, sublicense, and/or sell "
+                "copies of the Software, and to permit persons to whom the Software is "
+                "furnished to do so, subject to the following conditions:\n\n"
+                "The above copyright notice and this permission notice shall be included in all "
+                "copies or substantial portions of the Software.\n\n"
+                "THE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR "
+                "IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, "
+                "FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE "
+                "AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER "
+                "LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, "
+                "OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE "
+                "SOFTWARE."
+            )
+
+            text_label = tk.Label(
+                license_win,
+                text=license_text,
+                bg=BG_COLOR,
+                fg="white",
+                justify="left",
+                anchor="nw",
+                wraplength=400
+            )
+            text_label.pack(padx=15, pady=(15, 5))
+
+            # Hyperlink label
+            link_text = "For license and project info, click here: https://pdf-reader.ansnew.com"
+            link_label = tk.Label(
+                license_win,
+                text=link_text,
+                fg="cyan",
+                bg=BG_COLOR,
+                cursor="hand2",
+                wraplength=400,
+                justify="left"
+            )
+            link_label.pack(padx=15, pady=(0, 15))
+
+            def open_link(event):
+                webbrowser.open_new("https://pdf-reader.ansnew.com")
+
+            link_label.bind("<Button-1>", open_link)
+
+
     def show_about(self):
         about_win = tk.Toplevel(self)
         about_win.title("About")
@@ -1363,7 +1434,7 @@ class PDFReaderApp(tk.Tk):
             pass
         # Load photo
         try:
-            img_path = os.path.join(ASSET_DIR, 'images', 'YAMiN_HOSSAIN.png')
+            img_path = os.path.join(ASSET_DIR)
             img = Image.open(img_path)
             img = img.resize((120, 120), Image.LANCZOS)
             photo = ImageTk.PhotoImage(img)

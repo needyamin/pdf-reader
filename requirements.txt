@@ -4,4 +4,5 @@ Pillow
 pywin32
 pystray
 requests
+webbrowser
 # tkinter is included with standard Python on Windows 
