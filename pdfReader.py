@@ -9,6 +9,10 @@ import json
 import requests
 import datetime
 import webbrowser
+import logging
+from pathlib import Path
+import socket
+import time
 
 def resource_path(relative_path):
     """Return absolute path to resource, works for dev and Nuitka onefile"""
@@ -18,13 +22,73 @@ def resource_path(relative_path):
         base_path = os.path.abspath(".")
     return os.path.join(base_path, relative_path)
 
-# ✅ Updated Asset Paths (WORKS in onefile & dev)
+def get_user_data_dir():
+    """Return per-user writable data directory for the application.
+
+    On Windows, prefers %APPDATA% (Roaming). Falls back to the user's home directory if unavailable.
+    """
+    if sys.platform == 'win32':
+        base_dir = os.environ.get('APPDATA') or os.path.expanduser('~')
+    else:
+        base_dir = os.path.expanduser('~')
+    return os.path.join(base_dir, 'Advanced PDF Reader')
+
+def setup_logging():
+    """Setup minimal logging for production"""
+    # Only log critical errors in production
+    logging.basicConfig(
+        level=logging.ERROR,
+        format='%(levelname)s: %(message)s',
+        handlers=[logging.StreamHandler(sys.stderr)]
+    )
+    
+    # Suppress all library logging
+    logging.getLogger('PIL').setLevel(logging.CRITICAL)
+    logging.getLogger('fitz').setLevel(logging.CRITICAL)
+    logging.getLogger('requests').setLevel(logging.CRITICAL)
+    logging.getLogger('urllib3').setLevel(logging.CRITICAL)
+    
+    return logging.getLogger(__name__)
+
+# Initialize logger
+logger = setup_logging()
+
+# Single instance lock
+SINGLE_INSTANCE_PORT = 12345
+_instance_socket = None
+
+def is_already_running():
+    """Check if another instance is already running"""
+    global _instance_socket
+    try:
+        _instance_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        _instance_socket.bind(('localhost', SINGLE_INSTANCE_PORT))
+        _instance_socket.listen(1)
+        return False  # We're the first instance
+    except OSError:
+        # Port is already in use, another instance is running
+        return True
+
+def cleanup_single_instance():
+    """Clean up single instance socket"""
+    global _instance_socket
+    if _instance_socket:
+        try:
+            _instance_socket.close()
+        except:
+            pass
+        _instance_socket = None
+
+# ✅ Asset paths (read-only, bundled inside onefile)
 ASSET_DIR = resource_path('assets/images/YAMiN_HOSSAIN.png')
 ICON_PATH = resource_path('assets/icons/icon.ico')
 LOADING_IMG_PATH = resource_path('assets/images/loading.png')
-SESSION_FILE = resource_path('assets/json/last_session.json')
-TOKEN_FILE = resource_path('assets/json/github_token.json')
 LICENSE_FILE = resource_path('assets/json/license_info.json')
+
+# ✅ Writable paths (stored in user profile, no external assets folder needed)
+USER_DATA_DIR = get_user_data_dir()
+SESSION_FILE = os.path.join(USER_DATA_DIR, 'last_session.json')
+TOKEN_FILE = os.path.join(USER_DATA_DIR, 'github_token.json')
 
 # # Asset folder structure
 # ASSET_DIR = os.path.join(os.path.dirname(__file__), 'assets')
@@ -43,6 +107,11 @@ if sys.platform == 'win32':
     try:
         from ctypes import windll
         windll.shcore.SetProcessDpiAwareness(1)
+        # Set app user model ID for proper taskbar grouping
+        try:
+            windll.shell32.SetCurrentProcessExplicitAppUserModelID("PDFReader.YAMiN.2.0.0")
+        except Exception:
+            pass
     except Exception:
         pass
 
@@ -58,8 +127,9 @@ BUTTON_ACTIVE = '#3a3f4b'
 HIGHLIGHT_COLOR = '#98c379'
 FONT = ('Segoe UI', 11)
 FONT_BOLD = ('Segoe UI', 11, 'bold')
+FONT_SMALL = ('Segoe UI', 9)
 
-__version__ = "1.0.0"
+__version__ = "2.0.0"
 GITHUB_REPO = "needyamin/pdf-reader"
 
 class Tooltip:
@@ -88,6 +158,12 @@ class Tooltip:
 class PDFReaderApp(tk.Tk):
     def __init__(self):
         super().__init__()
+        
+        # Single instance check
+        if is_already_running():
+            # Another instance is already running
+            messagebox.showinfo("PDF Reader", "PDF Reader is already running.")
+            sys.exit(0)
         self.title('Advanced PDF Reader')
         self.geometry('1200x800')
         self.configure(bg=BG_COLOR)
@@ -96,11 +172,42 @@ class PDFReaderApp(tk.Tk):
         # Set application icon (window, taskbar, startbar)
         try:
             self.iconbitmap(ICON_PATH)
-        except Exception:
-            pass
+            # Also set the window icon for taskbar
+            self.wm_iconbitmap(ICON_PATH)
+            # Windows-specific taskbar icon
+            if sys.platform == 'win32':
+                try:
+                    import win32gui
+                    import win32con
+                    # Get the window handle
+                    hwnd = self.winfo_id()
+                    # Load the icon
+                    icon_handle = windll.user32.LoadImageW(
+                        None, ICON_PATH, win32con.IMAGE_ICON, 0, 0,
+                        win32con.LR_LOADFROMFILE | win32con.LR_DEFAULTSIZE
+                    )
+                    if icon_handle:
+                        # Set the icon for the window
+                        windll.user32.SendMessageW(hwnd, win32con.WM_SETICON, win32con.ICON_BIG, icon_handle)
+                        windll.user32.SendMessageW(hwnd, win32con.WM_SETICON, win32con.ICON_SMALL, icon_handle)
+                except Exception as e:
+                    pass  # Icon setting failed, continue without it
+        except Exception as e:
+            pass  # Window icon failed, continue without it
+            # Create a default icon if the file doesn't exist
+            try:
+                from PIL import ImageTk
+                # Create a simple default icon
+                img = PILImage.new('RGB', (32, 32), color='blue')
+                self.iconphoto(True, ImageTk.PhotoImage(img))
+            except Exception:
+                pass
         # Ensure app fully exits on close (no background/system tray)
         self.protocol('WM_DELETE_WINDOW', self._on_close)
         self.bind('<<ReallyExit>>', lambda e: self._really_exit())
+        
+        # Clean up single instance socket on close
+        self.bind('<Destroy>', lambda e: cleanup_single_instance())
         self.pdf_doc = None
         self.current_page = 0
         self.zoom = 1.0
@@ -137,8 +244,10 @@ class PDFReaderApp(tk.Tk):
         self.bind_all('<R>', lambda e: self.rotate_page())
         # Open
         self.bind_all('<Control-o>', lambda e: self.open_pdf())
-        # Export as Image
-        self.bind_all('<Control-s>', lambda e: self.export_image())
+        # Save PDF (always ask for location)
+        self.bind_all('<Control-s>', lambda e: self.save_pdf_as())
+        # Save As (same as Save)
+        self.bind_all('<Control-Shift-S>', lambda e: self.save_pdf_as())
         # Fit to Window
         self.bind_all('<f>', lambda e: self.toggle_fit())
         self.bind_all('<F>', lambda e: self.toggle_fit())
@@ -156,14 +265,9 @@ class PDFReaderApp(tk.Tk):
         # self.bind_all('<Escape>', lambda e: self.quit())  # ESC now toggles sidebar
         self.bind_all('<Return>', lambda e: self._goto_page_from_entry())
         self.focus_set()
-        self.undo_stack = []
-        self.redo_stack = []
-        self.bind_all('<Control-z>', lambda e: self.undo())
-        self.bind_all('<Control-y>', lambda e: self.redo())
+        # Undo/redo stacks removed as requested
         self.bind_all('<Delete>', lambda e: self._delete_annot_under_mouse(e))
-        self.bind_all('<Control-c>', lambda e: self._copy_annot(e))
-        self.bind_all('<Control-v>', lambda e: self._paste_annot(e))
-        self._copied_annot_data = None
+        # Copied annotation data removed as requested
         self._loading_label = None  # For sidebar loading indicator
         self._session_loaded = False
         # Check if a PDF was passed as command-line argument
@@ -181,11 +285,49 @@ class PDFReaderApp(tk.Tk):
     def _setup_style(self):
         style = ttk.Style(self)
         style.theme_use('clam')
+        
+        # Configure modern dark theme
         style.configure('TFrame', background=BG_COLOR)
         style.configure('TLabel', background=BG_COLOR, foreground=FG_COLOR, font=FONT)
-        style.configure('TButton', background=TOOLBAR_COLOR, foreground=FG_COLOR, borderwidth=0, focusthickness=0, focuscolor=TOOLBAR_COLOR, font=FONT)
-        style.map('TButton', background=[('active', BUTTON_ACTIVE)])
+        style.configure('TButton', 
+                       background=TOOLBAR_COLOR, 
+                       foreground=FG_COLOR, 
+                       borderwidth=0, 
+                       focusthickness=0, 
+                       focuscolor=TOOLBAR_COLOR, 
+                       font=FONT,
+                       padding=(8, 4))
+        style.map('TButton', 
+                 background=[('active', BUTTON_ACTIVE), ('pressed', ACCENT_COLOR)],
+                 foreground=[('active', FG_COLOR), ('pressed', BG_COLOR)])
         style.configure('Hover.TButton', background=BUTTON_ACTIVE, foreground=ACCENT_COLOR)
+        
+        # Configure scrollbars
+        style.configure('TScrollbar', 
+                       background=SIDEBAR_COLOR, 
+                       troughcolor=TOOLBAR_COLOR,
+                       borderwidth=0,
+                       arrowcolor=FG_COLOR)
+        style.map('TScrollbar', 
+                 background=[('active', ACCENT_COLOR)])
+        
+        # Configure entry widgets
+        style.configure('TEntry',
+                       fieldbackground=TOOLBAR_COLOR,
+                       foreground=FG_COLOR,
+                       insertcolor=FG_COLOR,
+                       borderwidth=1,
+                       relief='solid')
+        
+        # Configure checkbuttons and radiobuttons
+        style.configure('TCheckbutton',
+                       background=BG_COLOR,
+                       foreground=FG_COLOR,
+                       focuscolor=ACCENT_COLOR)
+        style.configure('TRadiobutton',
+                       background=BG_COLOR,
+                       foreground=FG_COLOR,
+                       focuscolor=ACCENT_COLOR)
 
     def _create_widgets(self):
         # Menu bar
@@ -194,8 +336,8 @@ class PDFReaderApp(tk.Tk):
         # File menu
         file_menu = tk.Menu(self.menu, tearoff=0)
         file_menu.add_command(label='Open...', command=self.open_pdf, accelerator='Ctrl+O')
-        file_menu.add_command(label='Save', command=self.save_pdf, accelerator='Ctrl+S')
-        file_menu.add_command(label='Save As...', command=self.save_as, accelerator='Ctrl+Shift+S')
+        file_menu.add_command(label='Save', command=self.save_pdf_as, accelerator='Ctrl+S')
+        file_menu.add_command(label='Save As...', command=self.save_pdf_as, accelerator='Ctrl+Shift+S')
         file_menu.add_separator()
         file_menu.add_command(label='Export as Image...', command=self.export_image)
         file_menu.add_separator()
@@ -203,14 +345,7 @@ class PDFReaderApp(tk.Tk):
         file_menu.add_separator()
         file_menu.add_command(label='Exit', command=self.exit_app, accelerator='Ctrl+Q')
         self.menu.add_cascade(label='File', menu=file_menu)
-        # Edit menu
-        edit_menu = tk.Menu(self.menu, tearoff=0)
-        edit_menu.add_command(label='Undo', command=self.undo, accelerator='Ctrl+Z')
-        edit_menu.add_command(label='Redo', command=self.redo, accelerator='Ctrl+Y')
-        edit_menu.add_separator()
-        edit_menu.add_command(label='Copy', command=self.copy, accelerator='Ctrl+C')
-        edit_menu.add_command(label='Paste', command=self.paste, accelerator='Ctrl+V')
-        self.menu.add_cascade(label='Edit', menu=edit_menu)
+        # Edit menu removed as requested
         # View menu
         view_menu = tk.Menu(self.menu, tearoff=0)
         view_menu.add_command(label='Zoom In', command=lambda: self.change_zoom(1.25), accelerator='Ctrl++')
@@ -236,7 +371,6 @@ class PDFReaderApp(tk.Tk):
         help_menu.add_command(label='About', command=self.show_about)
         help_menu.add_command(label='Shortcuts', command=self.show_shortcuts)
         help_menu.add_separator()
-        help_menu.add_command(label='Add to Auto Startup', command=self.add_to_startup)
         self.menu.add_cascade(label='Help', menu=help_menu)
         # Activate Software
         activate_software = tk.Menu(self.menu, tearoff=0)
@@ -265,6 +399,8 @@ class PDFReaderApp(tk.Tk):
         self.thumbnail_scrollbar = ttk.Scrollbar(self.sidebar, orient='vertical', command=self.thumbnail_canvas.yview)
         self.thumbnail_scrollbar.pack(side='right', fill='y')
         self.thumbnail_canvas.configure(yscrollcommand=self.thumbnail_scrollbar.set)
+        # Configure for smooth scrolling
+        self.thumbnail_canvas.configure(yscrollincrement=1)
         self.thumbnail_frame = tk.Frame(self.thumbnail_canvas, bg=SIDEBAR_COLOR)
         self.thumbnail_canvas.create_window((0, 0), window=self.thumbnail_frame, anchor='nw')
         self.thumbnail_frame.bind('<Configure>', lambda e: self.thumbnail_canvas.configure(scrollregion=self.thumbnail_canvas.bbox('all')))
@@ -310,43 +446,27 @@ class PDFReaderApp(tk.Tk):
         self.paned.paneconfig(self.sidebar, stretch='never')
         self.paned.paneconfig(self.display_outer, stretch='always')
 
-        # Status bar
-        self.status = tk.Label(self, text='No document loaded', bg=STATUS_COLOR, fg=FG_COLOR, anchor='w', font=FONT)
-        self.status.pack(side='bottom', fill='x')
+        # Status bar with improved styling
+        self.status = tk.Label(self, 
+                              text='No document loaded', 
+                              bg=STATUS_COLOR, 
+                              fg=FG_COLOR, 
+                              anchor='w', 
+                              font=FONT,
+                              relief='flat',
+                              bd=1,
+                              highlightthickness=0)
+        self.status.pack(side='bottom', fill='x', padx=0, pady=0)
 
         # Mouse zoom (Ctrl+Wheel)
         self.canvas.bind('<Control-MouseWheel>', self._on_canvas_ctrl_mousewheel)
         self.canvas.bind('<Control-Button-4>', self._on_canvas_ctrl_mousewheel)  # Linux scroll up
         self.canvas.bind('<Control-Button-5>', self._on_canvas_ctrl_mousewheel)  # Linux scroll down
-        # Annotation toolbar (scaffold)
-        self.annot_toolbar = tk.Frame(self.toolbar, bg=TOOLBAR_COLOR)
-        self.annot_toolbar.pack(side='right', padx=8)
-        self.annot_mode = tk.StringVar(value='none')
-        self.annot_btns = {}
-        for mode, icon, tip in [
-            # ('highlight', '🖍️', 'Highlight'),
-            ('draw', '✏️', 'Free Draw'),
-            # ('text', '📝', 'Text Note'),
-            # ('form', '🗒️', 'Fill Form'),
-            ]:
-            btn = ttk.Radiobutton(self.annot_toolbar, text=f'{icon} {tip if mode=="eraser" else ""}', variable=self.annot_mode, value=mode, style='TButton', command=lambda m=mode: self.set_annotation_mode(m))
-            btn.pack(side='left', padx=2)
-            Tooltip(btn, tip)
-            self.annot_btns[mode] = btn
+        # Modern Annotation Toolbar
+        self._create_annotation_toolbar()
 
-        # Annotation color/width pickers
-        self.annot_options = tk.Frame(self.toolbar, bg=TOOLBAR_COLOR)
-        self.annot_options.pack(side='right', padx=8)
-        self.color_var = tk.StringVar(value='#ff0000')  # Default annotation color is red
-        self.width_var = tk.IntVar(value=2)
-        tk.Label(self.annot_options, text='Color:', bg=TOOLBAR_COLOR, fg=FG_COLOR).pack(side='left')
-        self.color_btn = tk.Button(self.annot_options, bg=self.color_var.get(), width=2, command=self._pick_color)
-        self.color_btn.pack(side='left', padx=2)
-        tk.Label(self.annot_options, text='Width:', bg=TOOLBAR_COLOR, fg=FG_COLOR).pack(side='left')
-        self.width_spin = tk.Spinbox(self.annot_options, from_=1, to=10, width=2, textvariable=self.width_var)
-        self.width_spin.pack(side='left', padx=2)
-        Tooltip(self.color_btn, 'Pick annotation color')
-        Tooltip(self.width_spin, 'Set pen width')
+        # Annotation options (color, width, opacity)
+        self._create_annotation_options()
 
         # Mouse wheel scroll for main PDF canvas
         self.canvas.bind('<MouseWheel>', self._on_canvas_mousewheel)         # Windows
@@ -378,15 +498,15 @@ class PDFReaderApp(tk.Tk):
         # Set focus to main canvas by default so arrow keys work for scrolling
         self.canvas.focus_set()
         
-        # Add a method to ensure canvas focus and bind it to various events
+        # Simplified focus management for better performance
+        self._page_entry_has_focus = False
+        
         def ensure_canvas_focus(event=None):
-            if self.canvas.winfo_exists():
+            if not self._page_entry_has_focus:
                 self.canvas.focus_set()
         
-        # Bind focus events to ensure canvas gets focus
-        self.canvas.bind('<FocusOut>', lambda e: self.after(10, ensure_canvas_focus))
-        self.bind('<Button-1>', lambda e: ensure_canvas_focus())
-        self.display_frame.bind('<Button-1>', lambda e: ensure_canvas_focus())
+        # Minimal focus management - only essential bindings
+        self.canvas.bind('<FocusOut>', lambda e: self.after(100, ensure_canvas_focus))
 
     def _add_toolbar_buttons(self):
         btns = []
@@ -399,7 +519,7 @@ class PDFReaderApp(tk.Tk):
             btns.append(btn)
             return btn
         make_btn('Open', self.open_pdf, '📂', 'Open PDF (Ctrl+O)')
-        make_btn('Save', self.save_pdf, '💾', 'Save PDF (Ctrl+S)')
+        make_btn('Save', self.save_pdf_as, '💾', 'Save PDF (Ctrl+S)')
         make_btn('Prev', self.prev_page, '⬅️', 'Previous Page (Left, PageUp, Shift+Space)')
         make_btn('Next', self.next_page, '➡️', 'Next Page (Right, PageDown, Space)')
         make_btn('Zoom +', lambda: self.change_zoom(1.25), '➕', 'Zoom In (Ctrl +, +, =)')
@@ -408,50 +528,94 @@ class PDFReaderApp(tk.Tk):
         make_btn('Rotate', self.rotate_page, '🔄', 'Rotate Page (R)')
         # REMOVE the Annotate placeholder button
         # make_btn('Annotate', self.annotate_placeholder, '🖊️', 'Annotation tools (coming soon)')
-        # ADD Erase button
-        make_btn('Erase', lambda: self.set_annotation_mode('eraser'), '🧹', 'Eraser (Remove Annotation)')
         # Fit to Window toggle
         self.fit_btn = ttk.Checkbutton(self.toolbar, text='🖥️ Fit to Window', variable=self.fit_to_window, command=self.show_page, style='TButton')
         self.fit_btn.pack(side='left', padx=(16,2), pady=8)
         Tooltip(self.fit_btn, 'Toggle Fit to Window (F, Ctrl+F)')
-        # Page number entry
+        # Page number entry with improved styling
+        # Page navigation input with improved UX
+        page_frame = tk.Frame(self.toolbar, bg=TOOLBAR_COLOR)
+        page_frame.pack(side='left', padx=(16,12), pady=8)
+        
+        # Page label
+        page_label = tk.Label(page_frame, text='Page:', bg=TOOLBAR_COLOR, fg=FG_COLOR, font=FONT)
+        page_label.pack(side='left')
+        
         self.page_entry_var = tk.StringVar()
-        self.page_entry = tk.Entry(self.toolbar, width=4, textvariable=self.page_entry_var, font=FONT, bg=TOOLBAR_COLOR, fg=FG_COLOR, insertbackground=FG_COLOR, relief='flat', justify='center')
-        self.page_entry.pack(side='left', padx=(16,2), pady=8)
-        Tooltip(self.page_entry, 'Go to page (G, Enter)')
-        self.page_entry.bind('<FocusIn>', lambda e: self.page_entry.select_range(0, 'end'))
+        self.page_entry = tk.Entry(page_frame, 
+                                  width=6, 
+                                  textvariable=self.page_entry_var, 
+                                  font=FONT, 
+                                  bg='#2d3142', 
+                                  fg=FG_COLOR, 
+                                  insertbackground=FG_COLOR, 
+                                  relief='solid', 
+                                  bd=1,
+                                  justify='center',
+                                  highlightthickness=2,
+                                  highlightbackground=ACCENT_COLOR,
+                                  highlightcolor=ACCENT_COLOR)
+        self.page_entry.pack(side='left', padx=(4,2))
+        
+        # Total pages label
+        self.page_total_label = tk.Label(page_frame, 
+                                        text='/ 0', 
+                                        bg=TOOLBAR_COLOR, 
+                                        fg=FG_COLOR, 
+                                        font=FONT)
+        self.page_total_label.pack(side='left')
+        
+        # Go button for better UX
+        go_btn = tk.Button(page_frame, 
+                          text='Go', 
+                          command=self._goto_page_from_entry,
+                          bg=ACCENT_COLOR, 
+                          fg='white', 
+                          font=FONT, 
+                          relief='flat', 
+                          bd=0,
+                          padx=8,
+                          cursor='hand2')
+        go_btn.pack(side='left', padx=(4,0))
+        
+        # Enhanced tooltip and bindings
+        Tooltip(self.page_entry, 'Enter page number and press Enter or click Go')
+        Tooltip(go_btn, 'Go to specified page')
+        
+        # Minimal page entry bindings for performance
+        self.page_entry.bind('<FocusIn>', lambda e: setattr(self, '_page_entry_has_focus', True))
+        self.page_entry.bind('<FocusOut>', lambda e: setattr(self, '_page_entry_has_focus', False))
         self.page_entry.bind('<Return>', lambda e: self._goto_page_from_entry())
-        self.page_total_label = tk.Label(self.toolbar, text='/ 0', bg=TOOLBAR_COLOR, fg=FG_COLOR, font=FONT)
-        self.page_total_label.pack(side='left', padx=(0,12), pady=8)
-        # Form mode Done button (hidden by default)
-        self.form_done_btn = ttk.Button(self.toolbar, text='✅ Done', command=self._exit_form_mode, style='TButton')
-        Tooltip(self.form_done_btn, 'Exit form mode (Esc or Done)')
-        self.form_done_btn.pack_forget()
+        self.page_entry.bind('<Escape>', lambda e: self.canvas.focus_set())
+        # Remove the problematic KeyPress binding that was blocking input
+        # self.page_entry.bind('<KeyPress>', self._validate_page_input)
+        
+        # Don't trace the variable as it interferes with typing
+        # self.page_entry_var.trace('w', self._update_page_entry)
 
     def _show_sidebar_loading(self, show=True):
         if show:
-            if not self._loading_label:
-                self._loading_label = tk.Label(self.thumbnail_frame, text='Loading...', bg=SIDEBAR_COLOR, fg=ACCENT_COLOR, font=FONT_BOLD)
-                self._loading_label.pack(pady=20)
+            if not hasattr(self, '_loading_label') or not self._loading_label:
+                if hasattr(self, 'thumbnail_frame'):
+                    self._loading_label = tk.Label(self.thumbnail_frame, text='Loading...', bg=SIDEBAR_COLOR, fg=ACCENT_COLOR, font=FONT_BOLD)
+                    self._loading_label.pack(pady=20)
         else:
-            if self._loading_label:
+            if hasattr(self, '_loading_label') and self._loading_label:
                 self._loading_label.destroy()
                 self._loading_label = None
 
     def open_pdf(self, file_path=None):
-        print(f"[LOG] open_pdf called with file_path={file_path}")
+        # Opening PDF
         if not file_path:
             file_path = filedialog.askopenfilename(filetypes=[('PDF Files', '*.pdf')])
-            print(f"[LOG] File dialog returned: {file_path}")
         if not file_path:
-            print("[LOG] No file selected or dialog cancelled.")
             return
         self._show_sidebar_loading(True)
-        self.update_idletasks()
+        # Removed update_idletasks for performance
         try:
             self.pdf_doc = fitz.open(file_path)
             self._current_pdf_path = file_path  # Track current file path
-            print(f"[LOG] PDF loaded: {file_path}")
+            # PDF loaded successfully
             self.current_page = 0
             self.zoom = 1.0
             self.rotation = 0
@@ -460,36 +624,48 @@ class PDFReaderApp(tk.Tk):
             self.fit_to_window.set(True)  # Always fit to window on open
             self.show_page()
             self.after(100, self.show_page)  # Ensure fit after canvas is ready
+            # Save session after successful PDF load
             self._save_last_session(file_path, self.current_page)
+        except fitz.FileNotFoundError:
+            messagebox.showerror('File Not Found', f'The PDF file was not found:\n{file_path}')
+        except fitz.EmptyFileError:
+            messagebox.showerror('Invalid PDF', f'The PDF file is empty or corrupted:\n{file_path}')
+        except fitz.FileDataError:
+            messagebox.showerror('PDF Error', f'The PDF file has invalid data:\n{file_path}')
+        except PermissionError:
+            messagebox.showerror('Permission Denied', f'Permission denied accessing the PDF file:\n{file_path}')
         except Exception as e:
-            print(f"[LOG] Failed to open PDF: {e}")
-            messagebox.showerror('Error', f'Failed to open PDF: {e}')
+            messagebox.showerror('Error', f'An unexpected error occurred while opening the PDF:\n{str(e)}')
         self._show_sidebar_loading(False)
 
     def _render_thumbnails(self):
         for widget in self.thumbnail_frame.winfo_children():
             widget.destroy()
         self.thumbnails = []
+        
+        # Standard thumbnail size to prevent overlap
+        max_thumb_width = 120
+        max_thumb_height = 160
+        
         for i in range(len(self.pdf_doc)):
             page = self.pdf_doc.load_page(i)
             pix = page.get_pixmap(matrix=fitz.Matrix(0.18, 0.18))
             img = Image.frombytes('RGB', [pix.width, pix.height], pix.samples)
+            
+            # Resize image to standard thumbnail size while maintaining aspect ratio
+            img.thumbnail((max_thumb_width, max_thumb_height), Image.Resampling.LANCZOS)
             thumb = ImageTk.PhotoImage(img)
             self.thumbnails.append(thumb)
             
-            # Create a frame to hold thumbnail with relative positioning
-            thumb_frame = tk.Frame(self.thumbnail_frame, bg=SIDEBAR_COLOR, bd=2, relief='solid', highlightthickness=2)
-            thumb_frame.pack(pady=4, padx=6)
-            
-            # Set frame size based on thumbnail image size
-            thumb_width = thumb.width()
-            thumb_height = thumb.height()
-            thumb_frame.configure(width=thumb_width, height=thumb_height)
+            # Create a frame to hold thumbnail with fixed positioning
+            thumb_frame = tk.Frame(self.thumbnail_frame, bg=SIDEBAR_COLOR, bd=2, relief='solid', 
+                                 highlightthickness=2, width=max_thumb_width, height=max_thumb_height)
+            thumb_frame.pack(pady=4, padx=6, fill='x')
             thumb_frame.pack_propagate(False)  # Prevent frame from shrinking
             
-            # Thumbnail image
+            # Center the thumbnail image in the frame
             btn = tk.Label(thumb_frame, image=thumb, bg=SIDEBAR_COLOR, bd=0, highlightthickness=0)
-            btn.place(relx=0, rely=0, relwidth=1, relheight=1)
+            btn.place(relx=0.5, rely=0.5, anchor='center')
             
             # Page number badge (positioned on top-right corner)
             page_num_label = tk.Label(thumb_frame, text=str(i+1), bg=ACCENT_COLOR, fg=FG_COLOR, 
@@ -515,6 +691,13 @@ class PDFReaderApp(tk.Tk):
             # Highlight current page
             self._update_thumbnail_highlight(thumb_frame, i)
             self._propagate_mousewheel_to_canvas(thumb_frame, self.thumbnail_canvas)
+        
+        # Force update of scroll region after all thumbnails are created
+        # Removed update_idletasks for performance
+        self.thumbnail_canvas.configure(scrollregion=self.thumbnail_canvas.bbox('all'))
+        
+        # Enable smooth scrolling with proper configuration
+        self.thumbnail_canvas.configure(yscrollincrement=1)
 
     def _update_thumbnail_highlight(self, btn, idx):
         if idx == self.current_page:
@@ -531,30 +714,25 @@ class PDFReaderApp(tk.Tk):
                     child.configure(bg=ACCENT_COLOR, fg=FG_COLOR)
 
     def show_page(self):
-        print(f'[DEBUG] show_page called: page={self.current_page}, zoom={self.zoom}, fit={self.fit_to_window.get()}, size=({self.canvas.winfo_width()}x{self.canvas.winfo_height()})')
         if not self.pdf_doc:
             self.page_entry_var.set('')
             self.page_total_label.config(text='/ 0')
             return
-        # --- Track form widget state: (page, zoom, fit, canvas size) ---
+        
+        # Check if canvas is ready
         canvas_width = self.canvas.winfo_width()
         canvas_height = self.canvas.winfo_height()
-        form_state = (self.current_page, self.zoom, self.fit_to_window.get(), canvas_width, canvas_height)
-        # Remove old form entries if any, only if not in form mode or state changed ---
-        if hasattr(self, '_form_entries') and (not getattr(self, 'annot_mode', None) or self.annot_mode.get() != 'form' or getattr(self, '_form_fields_active_state', None) != form_state):
-            for entry in self._form_entries:
-                if isinstance(entry, tuple):
-                    print('[DEBUG] Destroying form widget:', type(entry[0]).__name__)
-                    self.canvas.delete(entry[1])
-                    entry[0].destroy()
-                else:
-                    print('[DEBUG] Destroying form widget:', type(entry).__name__)
-                    entry.destroy()
-            self._form_entries.clear()
-        # Always reload the page from the PDF
-        page = self.pdf_doc.load_page(self.current_page)
         if canvas_width < 10 or canvas_height < 10:
             return
+        
+        # Store current scroll position before page change (optimized)
+        try:
+            current_scroll_x = self.canvas.canvasx(0)
+            current_scroll_y = self.canvas.canvasy(0)
+        except:
+            current_scroll_x = current_scroll_y = 0
+        # Always reload the page from the PDF
+        page = self.pdf_doc.load_page(self.current_page)
         page_rect = page.rect
         if self.fit_to_window.get():
             zoom_x = canvas_width / page_rect.width
@@ -584,23 +762,53 @@ class PDFReaderApp(tk.Tk):
             self._pdf_render_height = new_height
             self.images = [ImageTk.PhotoImage(img)]
             self.canvas.config(scrollregion=(0,0,new_width,new_height))
-            self.canvas.delete('all')
-            self.canvas.create_image(canvas_width//2, canvas_height//2, image=self.images[0], anchor='center')
+            self.canvas.delete('pdf_image')
+            self.canvas.delete('annotation')
+            self.canvas.create_image(canvas_width//2, canvas_height//2, image=self.images[0], anchor='center', tags='pdf_image')
             self.canvas.config(xscrollcommand=self.h_scroll.set, yscrollcommand=self.v_scroll.set)
             self.h_scroll.grid_remove()
             self.v_scroll.grid_remove()
         else:
             self._pdf_scale = zoom
-            self._pdf_offset_x = 0
-            self._pdf_offset_y = 0
+            # Calculate offsets for centering
+            self._pdf_offset_x = (canvas_width - img.width) // 2
+            self._pdf_offset_y = (canvas_height - img.height) // 2
             self._pdf_render_width = img.width
             self._pdf_render_height = img.height
             self.images = [ImageTk.PhotoImage(img)]
-            self.canvas.config(scrollregion=(0,0,img.width,img.height))
-            self.canvas.delete('all')
-            self.canvas.create_image(0, 0, image=self.images[0], anchor='nw')
+            
+            # Set scrollregion to include PDF content plus centering space
+            # This allows the PDF to be centered in the canvas
+            scroll_width = max(img.width, canvas_width)
+            scroll_height = max(img.height, canvas_height)
+            
+            # Add padding to center the PDF
+            if img.width < canvas_width:
+                scroll_width = canvas_width
+            if img.height < canvas_height:
+                scroll_height = canvas_height
+            
+            self.canvas.config(scrollregion=(0, 0, scroll_width, scroll_height))
+            self.canvas.delete('pdf_image')
+            self.canvas.delete('annotation')
+            
+            # Position image at center of scroll region
+            center_x = scroll_width // 2
+            center_y = scroll_height // 2
+            self.canvas.create_image(center_x, center_y, image=self.images[0], anchor='center', tags='pdf_image')
+            
+            self.canvas.xview_moveto(0.0)
+            self.canvas.yview_moveto(0.0)
+            
             self.h_scroll.grid()
             self.v_scroll.grid()
+        # Render annotations on the canvas
+        self._render_annotations()
+        
+        # Reset scroll position tracking for new pages
+        self._last_scroll_x = 0
+        self._last_scroll_y = 0
+        
         self.page_entry_var.set(str(self.current_page+1))
         self.page_total_label.config(text=f'/ {len(self.pdf_doc)}')
         fname = self.pdf_doc.name if hasattr(self.pdf_doc, 'name') else ''
@@ -608,41 +816,89 @@ class PDFReaderApp(tk.Tk):
         focused_widget = self.focus_get()
         focus_info = f"Focus: {type(focused_widget).__name__}" if focused_widget else "Focus: None"
         self.status.config(text=f'{os.path.basename(fname)} | Page {self.current_page+1}/{len(self.pdf_doc)} | Zoom: {int(self.zoom*100)}% | Rotation: {self.rotation}° | Fit: {"ON" if self.fit_to_window.get() else "OFF"} | {focus_info}')
+        
+        # Update page entry to reflect current page (only if not focused to avoid interference)
+        if hasattr(self, 'page_entry_var') and self.pdf_doc and not self._page_entry_has_focus:
+            self.page_entry_var.set(str(self.current_page + 1))
+        
         for idx, widget in enumerate(self.thumbnail_frame.winfo_children()):
             self._update_thumbnail_highlight(widget, idx)
-        # --- Only enable form fields if in form mode and not already active for this state ---
-        if getattr(self, 'annot_mode', None) and self.annot_mode.get() == 'form':
-            if getattr(self, '_form_fields_active_state', None) != form_state:
-                self._enable_form_fields()
-                self._form_fields_active_state = form_state
 
     def prev_page(self):
         if self.pdf_doc and self.current_page > 0:
             self.current_page -= 1
             self.show_page()
+            # Auto-scroll thumbnail to current page
+            self.after(50, lambda: self._scroll_to_thumbnail(self.current_page))
+            # Save session after page change
+            if self.pdf_doc:
+                self._save_last_session(self.pdf_doc.name, self.current_page)
 
     def next_page(self):
         if self.pdf_doc and self.current_page < len(self.pdf_doc) - 1:
             self.current_page += 1
             self.show_page()
+            # Auto-scroll thumbnail to current page
+            self.after(50, lambda: self._scroll_to_thumbnail(self.current_page))
+            # Save session after page change
+            if self.pdf_doc:
+                self._save_last_session(self.pdf_doc.name, self.current_page)
 
     def go_to_page(self, page_num):
         if self.pdf_doc and 0 <= page_num < len(self.pdf_doc):
             self.current_page = page_num
             self.show_page()
+            # Auto-scroll thumbnail to current page
+            self.after(50, lambda: self._scroll_to_thumbnail(self.current_page))
             self._save_last_session(self.pdf_doc.name, self.current_page)
 
+    def _validate_page_input(self, event):
+        """Validate page input to only allow numbers and common keys"""
+        char = event.char
+        # Allow digits, backspace, delete, arrow keys, etc.
+        if char and not (char.isdigit() or char in '\b\x7f'):
+            return 'break'  # Prevent non-digit characters
+        return None
+    
+    def _update_page_entry(self, *args):
+        """Update page entry to show current page"""
+        if self.pdf_doc:
+            current_page_num = self.current_page + 1
+            if self.page_entry_var.get() != str(current_page_num):
+                self.page_entry_var.set(str(current_page_num))
+    
     def _goto_page_from_entry(self):
         if not self.pdf_doc:
             return
+        
         try:
-            page = int(self.page_entry_var.get()) - 1
+            page_text = self.page_entry_var.get().strip()
+            if not page_text:
+                return
+            
+            page = int(page_text) - 1
             if 0 <= page < len(self.pdf_doc):
                 self.current_page = page
                 self.show_page()
+                # Auto-scroll thumbnail to current page
+                self.after(50, lambda: self._scroll_to_thumbnail(self.current_page))
                 self._save_last_session(self.pdf_doc.name, self.current_page)
-        except Exception:
-            pass
+                
+                # Visual feedback
+                self.page_entry.configure(bg=ACCENT_COLOR)
+                self.after(200, lambda: self.page_entry.configure(bg='#2d3142'))
+                
+                # Return focus to canvas after navigation
+                self.after(100, lambda: self.canvas.focus_set())
+            else:
+                # Invalid page number - show error feedback
+                self.page_entry.configure(bg='#ff6b6b')
+                self.after(500, lambda: self.page_entry.configure(bg='#2d3142'))
+                
+        except ValueError:
+            # Invalid input - show error feedback
+            self.page_entry.configure(bg='#ff6b6b')
+            self.after(500, lambda: self.page_entry.configure(bg='#2d3142'))
 
     def change_zoom(self, factor):
         if self.pdf_doc:
@@ -661,7 +917,7 @@ class PDFReaderApp(tk.Tk):
         messagebox.showinfo('Annotation', 'Annotation tools coming soon!')
 
     def _on_resize(self, event):
-        # Debounce: only redraw after resizing stops for 100ms
+        # Debounce: only redraw after resizing stops for 200ms to reduce redraws
         if self._resize_after_id:
             self.after_cancel(self._resize_after_id)
         self._resize_after_id = self.after(100, self._debounced_resize)
@@ -683,6 +939,7 @@ class PDFReaderApp(tk.Tk):
         self.show_page()  # Always update page and mapping after fit toggle
 
     def focus_page_entry(self):
+        self._page_entry_has_focus = True
         self.page_entry.focus_set()
         self.page_entry.select_range(0, 'end')
 
@@ -717,31 +974,51 @@ class PDFReaderApp(tk.Tk):
             thumbnails = [w for w in self.thumbnail_frame.winfo_children() if isinstance(w, tk.Frame)]
             if 0 <= page_num < len(thumbnails):
                 thumb = thumbnails[page_num]
-                # Calculate position and scroll
+                
+                # Get thumbnail position and size
                 thumb_y = thumb.winfo_y()
+                thumb_height = thumb.winfo_height()
                 canvas_height = self.thumbnail_canvas.winfo_height()
                 frame_height = self.thumbnail_frame.winfo_height()
                 
-                # Calculate scroll position to center the thumbnail
-                scroll_pos = (thumb_y - canvas_height/2) / max(1, frame_height - canvas_height)
-                scroll_pos = max(0, min(1, scroll_pos))  # Clamp between 0 and 1
+                # Calculate if thumbnail is already visible
+                thumb_top = thumb_y
+                thumb_bottom = thumb_y + thumb_height
+                canvas_top = self.thumbnail_canvas.canvasy(0)
+                canvas_bottom = canvas_top + canvas_height
                 
-                self.thumbnail_canvas.yview_moveto(scroll_pos)
+                # Only scroll if thumbnail is not fully visible
+                if thumb_top < canvas_top or thumb_bottom > canvas_bottom:
+                    # Calculate scroll position to center the thumbnail
+                    scroll_pos = (thumb_y - canvas_height/2 + thumb_height/2) / max(1, frame_height - canvas_height)
+                    scroll_pos = max(0, min(1, scroll_pos))  # Clamp between 0 and 1
+                    
+                    # Smooth scroll to the position
+                    self.thumbnail_canvas.yview_moveto(scroll_pos)
         except Exception:
             pass
 
     def _on_sidebar_mousewheel(self, event):
-        # Sidebar scroll: more responsive (8 units)
+        # Smooth sidebar scrolling with adaptive speed
+        canvas_height = self.thumbnail_canvas.winfo_height()
+        frame_height = self.thumbnail_frame.winfo_height()
+        
+        # Calculate smooth scroll amount based on canvas size
+        if canvas_height > 0:
+            scroll_units = max(1, canvas_height // 20)  # 5% of canvas height
+        else:
+            scroll_units = 3  # Fallback for small canvases
+        
         if hasattr(event, 'delta'):
             if event.delta > 0:
-                self.thumbnail_canvas.yview_scroll(-8, 'units')
+                self.thumbnail_canvas.yview_scroll(-scroll_units, 'units')
             elif event.delta < 0:
-                self.thumbnail_canvas.yview_scroll(8, 'units')
+                self.thumbnail_canvas.yview_scroll(scroll_units, 'units')
         else:
             if event.num == 4:
-                self.thumbnail_canvas.yview_scroll(-8, 'units')
+                self.thumbnail_canvas.yview_scroll(-scroll_units, 'units')
             elif event.num == 5:
-                self.thumbnail_canvas.yview_scroll(8, 'units')
+                self.thumbnail_canvas.yview_scroll(scroll_units, 'units')
 
     def _on_canvas_ctrl_mousewheel(self, event):
         if event.num == 4 or event.delta > 0:
@@ -770,384 +1047,458 @@ class PDFReaderApp(tk.Tk):
             pix.save(file_path)
             messagebox.showinfo('Exported', f'Page exported as {file_path}')
 
-    def _push_undo(self, action, data=None):
-        self.undo_stack.append((action, data))
-        self.redo_stack.clear()
-        self.status.config(text='Action added to undo stack.')
+    # Undo/redo methods removed as requested
 
-    def _push_redo(self, action, data=None):
-        self.redo_stack.append((action, data))
+    # Edit menu methods removed as requested
 
-    def undo(self):
-        if not self.undo_stack:
-            self.status.config(text='Nothing to undo.')
+    def _create_annotation_toolbar(self):
+        """Create a modern annotation toolbar with all tools."""
+        self.annot_toolbar = tk.Frame(self.toolbar, bg=TOOLBAR_COLOR)
+        self.annot_toolbar.pack(side='right', padx=8)
+        
+        # Separator
+        separator = tk.Frame(self.annot_toolbar, width=1, bg=ACCENT_COLOR)
+        separator.pack(side='left', fill='y', padx=4)
+        
+        self.annot_mode = tk.StringVar(value='none')
+        self.annot_btns = {}
+        
+        # Annotation tools with modern icons and tooltips
+        tools = [
+            ('draw', '✏️', 'Free Draw', '#2196f3'),
+            ('eraser', '🧹', 'Eraser', '#f44336')
+        ]
+        
+        for mode, icon, tooltip, color in tools:
+            btn = tk.Button(
+                self.annot_toolbar,
+                text=icon,
+                font=('Segoe UI Emoji', 12),
+                bg=TOOLBAR_COLOR,
+                fg=FG_COLOR,
+                activebackground=BUTTON_ACTIVE,
+                activeforeground=FG_COLOR,
+                relief='flat',
+                bd=0,
+                padx=8,
+                pady=4,
+                cursor='hand2',
+                command=lambda m=mode: self.set_annotation_mode(m)
+            )
+            btn.pack(side='left', padx=1)
+            
+            # Add hover effects
+            btn.bind('<Enter>', lambda e, b=btn, c=color: self._on_annot_btn_enter(e, b, c))
+            btn.bind('<Leave>', lambda e, b=btn: self._on_annot_btn_leave(e, b))
+            
+            Tooltip(btn, tooltip)
+            self.annot_btns[mode] = btn
+        
+    
+    def _create_annotation_options(self):
+        """Create annotation options (width only)."""
+        self.annot_options = tk.Frame(self.toolbar, bg=TOOLBAR_COLOR)
+        self.annot_options.pack(side='right', padx=8)
+        
+        # Color palette (4 primary colors)
+        self.color_var = tk.StringVar(value='#ff0000')
+        tk.Label(self.annot_options, text='Color:', bg=TOOLBAR_COLOR, fg=FG_COLOR, font=FONT_SMALL).pack(side='left')
+        
+        # 4-color palette
+        colors = ['#ff0000', '#0000ff', '#00ff00', '#000000']  # Red, Blue, Green, Black
+        self.color_btns = []
+        for color in colors:
+            btn = tk.Button(
+                self.annot_options,
+                bg=color,
+                width=2,
+                height=1,
+                relief='solid',
+                bd=1,
+                cursor='hand2',
+                command=lambda c=color: self._set_color(c)
+            )
+            btn.pack(side='left', padx=1)
+            self.color_btns.append(btn)
+            if color == '#ff0000':  # Default selected color
+                btn.config(relief='sunken', bd=2)
+        
+        # Width control
+        tk.Label(self.annot_options, text='Width:', bg=TOOLBAR_COLOR, fg=FG_COLOR, font=FONT_SMALL).pack(side='left')
+        self.width_var = tk.IntVar(value=2)
+        self.width_spin = tk.Spinbox(
+            self.annot_options, 
+            from_=1, 
+            to=10, 
+            width=3, 
+            textvariable=self.width_var,
+            font=FONT_SMALL,
+            bg=TOOLBAR_COLOR,
+            fg=FG_COLOR,
+            insertbackground=FG_COLOR,
+            relief='solid',
+            bd=1
+        )
+        self.width_spin.pack(side='left', padx=2)
+        Tooltip(self.width_spin, 'Set pen width (1-10)')
+    
+    def _set_color(self, color):
+        """Set annotation color from palette."""
+        self.color_var.set(color)
+        # Update button states
+        for btn in self.color_btns:
+            btn.config(relief='solid', bd=1)
+        # Highlight selected color
+        for btn in self.color_btns:
+            if btn.cget('bg') == color:
+                btn.config(relief='sunken', bd=2)
+                break
+    
+    def _on_annot_btn_enter(self, event, btn, color):
+        """Handle annotation button hover enter."""
+        btn.config(bg=color, fg='white')
+    
+    def _on_annot_btn_leave(self, event, btn):
+        """Handle annotation button hover leave."""
+        btn.config(bg=TOOLBAR_COLOR, fg=FG_COLOR)
+    
+    def _render_annotations(self):
+        """Render PDF annotations on the canvas (highly optimized for performance)."""
+        if not self.pdf_doc:
             return
-        action, data = self.undo_stack.pop()
-        if action == 'add_annot':
-            page = self.pdf_doc.load_page(data['page'])
-            for xref in data['annots']:
-                try:
-                    page.delete_annot(page.load_annot(xref))
-                except Exception:
-                    pass
-            self._push_redo('remove_annot', data)
-            self.pdf_doc.saveIncr()
-            self.show_page()
-            self.status.config(text='Undo: Annotation removed.')
-        elif action == 'remove_annot':
-            # Not implemented: would require full annotation serialization
-            self.status.config(text='Undo: Cannot re-add annotation (not implemented).')
-        elif action == 'form_fill':
-            page = self.pdf_doc.load_page(data['page'])
-            widget = data['widget']
-            widget.field_value = data['old_value']
-            widget.update()
-            self._push_redo('form_fill', {'page': data['page'], 'widget': widget, 'old_value': data['new_value'], 'new_value': data['old_value']})
-            self.pdf_doc.saveIncr()
-            self.show_page()
-            self.status.config(text='Undo: Form fill reverted.')
-        else:
-            self.status.config(text='Undo: Not implemented for this action.')
-
-    def redo(self):
-        if not self.redo_stack:
-            self.status.config(text='Nothing to redo.')
+        
+        # Skip rendering if canvas is not ready (performance optimization)
+        try:
+            if self.canvas.winfo_width() < 10 or self.canvas.winfo_height() < 10:
+                return
+        except:
             return
-        action, data = self.redo_stack.pop()
-        if action == 'remove_annot':
-            page = self.pdf_doc.load_page(data['page'])
-            for xref in data['annots']:
-                try:
-                    page.delete_annot(page.load_annot(xref))
-                except Exception:
-                    pass
-            self._push_undo('add_annot', data)
-            self.pdf_doc.saveIncr()
-            self.show_page()
-            self.status.config(text='Redo: Annotation removed again.')
-        elif action == 'form_fill':
-            page = self.pdf_doc.load_page(data['page'])
-            widget = data['widget']
-            widget.field_value = data['new_value']
-            widget.update()
-            self._push_undo('form_fill', {'page': data['page'], 'widget': widget, 'old_value': data['old_value'], 'new_value': data['new_value']})
-            self.pdf_doc.saveIncr()
-            self.show_page()
-            self.status.config(text='Redo: Form fill applied again.')
-        else:
-            self.status.config(text='Redo: Not implemented for this action.')
-
-    def copy(self):
-        messagebox.showinfo('Copy', 'Copy not implemented yet.')
-    def paste(self):
-        messagebox.showinfo('Paste', 'Paste not implemented yet.')
-
-    def _pick_color(self):
-        import tkinter.colorchooser as cc
-        color = cc.askcolor(color=self.color_var.get())[1]
-        if color:
-            self.color_var.set(color)
-            self.color_btn.config(bg=color)
+        
+        # Clear existing annotations first
+        self.canvas.delete('annotation')
+            
+        try:
+            page = self.pdf_doc.load_page(self.current_page)
+            annotations = list(page.annots())  # Convert to list once for performance
+            
+            # Limit annotations to prevent lag on pages with many annotations
+            if len(annotations) > 50:
+                annotations = annotations[:50]  # Only render first 50 annotations
+            
+            for annot in annotations:
+                rect = annot.rect
+                x0, y0 = self.pdf_to_canvas(rect.x0, rect.y0)
+                x1, y1 = self.pdf_to_canvas(rect.x1, rect.y1)
+                
+                # Skip if annotation is outside visible area (performance optimization)
+                canvas_width = self.canvas.winfo_width()
+                canvas_height = self.canvas.winfo_height()
+                if x0 > canvas_width or x1 < 0 or y0 > canvas_height or y1 < 0:
+                    continue
+                
+                if annot.type[0] == fitz.PDF_ANNOT_INK:
+                    if hasattr(annot, 'stroke') and annot.stroke:
+                        stroke_points = annot.stroke
+                        if len(stroke_points) > 0:
+                            canvas_points = []
+                            for stroke in stroke_points:
+                                # Limit stroke points to prevent lag
+                                if len(stroke) > 100:
+                                    stroke = stroke[::max(1, len(stroke)//100)]  # Sample every nth point
+                                for point in stroke:
+                                    px, py = self.pdf_to_canvas(point.x, point.y)
+                                    canvas_points.extend([px, py])
+                            if canvas_points:
+                                color = '#ff0000'
+                                width = 2
+                                if hasattr(annot, 'colors') and annot.colors:
+                                    stroke_color = annot.colors.get('stroke')
+                                    if stroke_color:
+                                        color = self._rgb01_to_hex(stroke_color)
+                                if hasattr(annot, 'border') and annot.border:
+                                    width = max(1, int(annot.border.get('width', 2)))
+                                
+                                self.canvas.create_line(canvas_points, fill=color, width=width, tags='annotation')
+                
+                elif annot.type[0] == fitz.PDF_ANNOT_FREETEXT:
+                    # Draw text annotations
+                    content = annot.content if annot.content else "Text"
+                    self.canvas.create_text(
+                        (x0 + x1) / 2, (y0 + y1) / 2,
+                        text=content, fill='#0000ff', font=('Arial', 10),
+                        tags='annotation'
+                    )
+                
+                elif annot.type[0] == fitz.PDF_ANNOT_HIGHLIGHT:
+                    # Draw highlight annotations
+                    self.canvas.create_rectangle(
+                        x0, y0, x1, y1,
+                        fill='#ffff00', stipple='gray25', outline='',
+                        tags='annotation'
+                    )
+                
+                # Draw annotation border for visibility
+                self.canvas.create_rectangle(
+                    x0, y0, x1, y1,
+                    outline='#cccccc', width=1, dash=(2, 2),
+                    tags='annotation'
+                )
+        except Exception:
+            pass
 
     def set_annotation_mode(self, mode):
+        """Set the current annotation mode and configure UI accordingly."""
         prev_mode = self.annot_mode.get() if hasattr(self, 'annot_mode') else None
         self.annot_mode.set(mode)
+        
+        # Update button states
         for m, btn in self.annot_btns.items():
             if m == mode:
-                btn.configure(style='Hover.TButton')
+                btn.config(bg=BUTTON_ACTIVE, fg=FG_COLOR)
             else:
-                btn.configure(style='TButton')
-        if mode == 'eraser':
-            self.status.config(text='Eraser: Click on an annotation to remove it.')
-        elif mode == 'form':
-            self.status.config(text='Form fields enabled. Fill and click Done or press Esc to finish.')
-            self.form_done_btn.pack(side='right', padx=8)
-            self.bind_all('<Escape>', lambda e: self._exit_form_mode())
-        else:
-            self.status.config(text=f'Annotation mode: {mode.capitalize()}')
-            self.form_done_btn.pack_forget()
-            self.unbind_all('<Escape>')
-        if mode in ('highlight', 'draw'):
+                btn.config(bg=TOOLBAR_COLOR, fg=FG_COLOR)
+        
+        # Update status message
+        status_messages = {
+            'none': 'Ready',
+            'draw': 'Click and drag to draw freehand',
+            'eraser': 'Click on an annotation to remove it'
+        }
+        self.status.config(text=status_messages.get(mode, f'Annotation mode: {mode.capitalize()}'))
+        
+        
+        # Show/hide annotation options
+        if mode == 'draw':
             self.annot_options.pack(side='right', padx=8)
         else:
             self.annot_options.pack_forget()
+        
+        # Clear existing canvas bindings (optimized)
         self.canvas.unbind('<Button-1>')
         self.canvas.unbind('<B1-Motion>')
         self.canvas.unbind('<ButtonRelease-1>')
+        self.canvas.unbind('<Double-Button-1>')
+        self.canvas.unbind('<Motion>')
         self.canvas.config(cursor='arrow')
-        if mode == 'highlight':
-            self.canvas.bind('<Button-1>', self._start_text_highlight)
-            self.canvas.config(cursor='xterm')
-        elif mode == 'draw':
-            self.canvas.bind('<Button-1>', self._start_draw)
-            self.canvas.bind('<B1-Motion>', self._draw_draw)
-            self.canvas.bind('<ButtonRelease-1>', self._end_draw)
-            self.canvas.config(cursor='pencil')
-        elif mode == 'text':
-            self.canvas.bind('<Button-1>', self._add_text_note)
-            self.canvas.config(cursor='plus')
-        elif mode == 'image':
-            self.canvas.bind('<Button-1>', self._start_image_annot)
-            self.canvas.bind('<B1-Motion>', self._resize_image_annot)
-            self.canvas.bind('<ButtonRelease-1>', self._end_image_annot)
-            self.canvas.config(cursor='plus')
-        elif mode == 'form':
-            # Only enable form fields if not already active for this state
-            canvas_width = self.canvas.winfo_width()
-            canvas_height = self.canvas.winfo_height()
-            form_state = (self.current_page, self.zoom, self.fit_to_window.get(), canvas_width, canvas_height)
-            if getattr(self, '_form_fields_active_state', None) != form_state:
-                self._enable_form_fields()
-                self._form_fields_active_state = form_state
+        
+        # Clear eraser hover highlight
+        self.canvas.delete('eraser_hover')
+        if hasattr(self, '_eraser_hover_rect'):
+            del self._eraser_hover_rect
+        
+        # Set mode-specific bindings and cursor (optimized - no recursion)
+        if mode == 'draw':
+            # Check if already in draw mode for toggle behavior
+            if prev_mode == 'draw':
+                # Switch to none mode without recursion
+                mode = 'none'
+                self.annot_mode.set(mode)
+                # Update button states for none mode
+                for m, btn in self.annot_btns.items():
+                    if m == mode:
+                        btn.config(bg=BUTTON_ACTIVE, fg=FG_COLOR)
+                    else:
+                        btn.config(bg=TOOLBAR_COLOR, fg=FG_COLOR)
+                self.status.config(text='Ready')
+                self.annot_options.pack_forget()
+            else:
+                # Enter draw mode
+                self.canvas.bind('<Button-1>', self._start_draw)
+                self.canvas.bind('<B1-Motion>', self._draw_draw)
+                self.canvas.bind('<ButtonRelease-1>', self._end_draw)
+                self.canvas.config(cursor='pencil')
         elif mode == 'eraser':
-            self.canvas.bind('<Button-1>', self._erase_annot)
-            self.canvas.bind('<Motion>', self._highlight_eraser_hover)
-            self.canvas.config(cursor='dotbox')
-        else:
-            self._disable_form_fields()
-            self.canvas.config(cursor='arrow')
-        # Remove old form entries if not in form mode
-        if mode != 'form' and hasattr(self, '_form_entries'):
-            for entry in self._form_entries:
-                if isinstance(entry, tuple):
-                    self.canvas.delete(entry[1])
-                    entry[0].destroy()
-                else:
-                    entry.destroy()
-            self._form_entries.clear()
-            self._form_fields_active_state = None
+            # Check if already in eraser mode for toggle behavior
+            if prev_mode == 'eraser':
+                # Switch to none mode without recursion
+                mode = 'none'
+                self.annot_mode.set(mode)
+                # Update button states for none mode
+                for m, btn in self.annot_btns.items():
+                    if m == mode:
+                        btn.config(bg=BUTTON_ACTIVE, fg=FG_COLOR)
+                    else:
+                        btn.config(bg=TOOLBAR_COLOR, fg=FG_COLOR)
+                self.status.config(text='Ready')
+                self.annot_options.pack_forget()
+            else:
+                # Enter eraser mode
+                self.canvas.bind('<Button-1>', self._erase_annot)
+                self.canvas.bind('<Motion>', self._highlight_eraser_hover)
+                self.canvas.config(cursor='X_cursor')
+        
+        # Ensure canvas has focus for annotation tools (only if not page entry focused)
+        if not self._page_entry_has_focus:
+            self.canvas.focus_set()
+        
 
     # --- Coordinate conversion helpers ---
     def canvas_to_pdf(self, x, y):
         """Convert canvas coordinates to PDF page coordinates."""
-        px = (x - self._pdf_offset_x) / self._pdf_scale
-        py = (y - self._pdf_offset_y) / self._pdf_scale
+        pdf_image_items = self.canvas.find_withtag('pdf_image')
+        if pdf_image_items:
+            pdf_coords = self.canvas.coords(pdf_image_items[0])
+            pdf_center_x, pdf_center_y = pdf_coords[0], pdf_coords[1]
+            
+            pdf_bbox = self.canvas.bbox(pdf_image_items[0])
+            if pdf_bbox:
+                pdf_width = pdf_bbox[2] - pdf_bbox[0]
+                pdf_height = pdf_bbox[3] - pdf_bbox[1]
+                
+                pdf_top_left_x = pdf_center_x - (pdf_width / 2)
+                pdf_top_left_y = pdf_center_y - (pdf_height / 2)
+                
+                px = (x - pdf_top_left_x) / self._pdf_scale
+                py = (y - pdf_top_left_y) / self._pdf_scale
+            else:
+                px = x / self._pdf_scale
+                py = y / self._pdf_scale
+        else:
+            px = x / self._pdf_scale
+            py = y / self._pdf_scale
         return px, py
+    
     def pdf_to_canvas(self, x, y):
         """Convert PDF page coordinates to canvas coordinates."""
-        cx = x * self._pdf_scale + self._pdf_offset_x
-        cy = y * self._pdf_scale + self._pdf_offset_y
+        pdf_image_items = self.canvas.find_withtag('pdf_image')
+        if pdf_image_items:
+            pdf_coords = self.canvas.coords(pdf_image_items[0])
+            pdf_center_x, pdf_center_y = pdf_coords[0], pdf_coords[1]
+            
+            pdf_bbox = self.canvas.bbox(pdf_image_items[0])
+            if pdf_bbox:
+                pdf_width = pdf_bbox[2] - pdf_bbox[0]
+                pdf_height = pdf_bbox[3] - pdf_bbox[1]
+                
+                pdf_top_left_x = pdf_center_x - (pdf_width / 2)
+                pdf_top_left_y = pdf_center_y - (pdf_height / 2)
+                
+                cx = x * self._pdf_scale + pdf_top_left_x
+                cy = y * self._pdf_scale + pdf_top_left_y
+            else:
+                cx = x * self._pdf_scale
+                cy = y * self._pdf_scale
+        else:
+            cx = x * self._pdf_scale
+            cy = y * self._pdf_scale
         return cx, cy
 
-    # --- Update annotation tools to use coordinate conversion ---
-    # --- Professional Highlight Tool (text selection, click-drag) ---
-    def _start_text_highlight(self, event):
-        cx, cy = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
-        print(f'[DEBUG] Highlight start canvas: ({cx}, {cy}), scale: {getattr(self, "_pdf_scale", None)}, offset: ({getattr(self, "_pdf_offset_x", None)}, {getattr(self, "_pdf_offset_y", None)})')
-        self._highlight_start = (cx, cy)
-        self.canvas.bind('<B1-Motion>', self._drag_text_highlight)
-        self.canvas.bind('<ButtonRelease-1>', self._end_text_highlight)
-        self._highlight_rect = self.canvas.create_rectangle(self._highlight_start[0], self._highlight_start[1], self._highlight_start[0], self._highlight_start[1], outline=HIGHLIGHT_COLOR, width=2, dash=(2,2))
-    def _drag_text_highlight(self, event):
-        x0, y0 = self._highlight_start
-        x1, y1 = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
-        self.canvas.coords(self._highlight_rect, x0, y0, x1, y1)
-    def _end_text_highlight(self, event):
-        x0, y0 = self._highlight_start
-        x1, y1 = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
-        self.canvas.delete(self._highlight_rect)
-        self.canvas.unbind('<B1-Motion>')
-        self.canvas.unbind('<ButtonRelease-1>')
-        # Convert to PDF coordinates
-        px0, py0 = self.canvas_to_pdf(x0, y0)
-        px1, py1 = self.canvas_to_pdf(x1, y1)
-        rect = fitz.Rect(min(px0, px1), min(py0, py1), max(px0, px1), max(py0, py1))
-        page = self.pdf_doc.load_page(self.current_page)
-        # Find all words in the rectangle and highlight them
-        words = page.get_text('words')
-        added = False
-        annots_added = []
-        for w in words:
-            wx0, wy0, wx1, wy1, word, *_ = w
-            word_rect = fitz.Rect(wx0, wy0, wx1, wy1)
-            if rect.intersects(word_rect):
-                annot = page.add_highlight_annot(word_rect)
-                annot.set_colors(stroke=self.color_var.get(), fill=self.color_var.get())
-                annot.update()
-                annots_added.append(annot.xref)
-                added = True
-        if added:
-            self._push_undo('add_annot', {'page': self.current_page, 'annots': annots_added})
-            self.pdf_doc.saveIncr()
-            self.show_page()
-        self._highlight_start = None
-        self._highlight_rect = None
-
+    # --- Draw Tool ---
     def _start_draw(self, event):
-        cx, cy = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
-        print(f'[DEBUG] Draw start canvas: ({cx}, {cy}), scale: {getattr(self, "_pdf_scale", None)}, offset: ({getattr(self, "_pdf_offset_x", None)}, {getattr(self, "_pdf_offset_y", None)})')
+        cx, cy = event.x, event.y
         self._draw_points = [(cx, cy)]
         self._draw_line = self.canvas.create_line(cx, cy, cx, cy, fill=self.color_var.get(), width=self.width_var.get())
         self._draw_history = []
+        # Initialize drawing state
+        self._last_draw_update = 0
     def _draw_draw(self, event):
         if hasattr(self, '_draw_line'):
-            cx, cy = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
+            cx, cy = event.x, event.y
             self._draw_points.append((cx, cy))
-            self.canvas.coords(self._draw_line, *sum(self._draw_points, ()))
+            
+            # Optimized coordinate update - only update every 5 points for performance
+            if len(self._draw_points) % 5 == 0:
+                coords = []
+                for point in self._draw_points:
+                    coords.extend(point)
+                self.canvas.coords(self._draw_line, *coords)
     def _end_draw(self, event):
         if hasattr(self, '_draw_line'):
-            page = self.pdf_doc.load_page(self.current_page)
-            # Convert all points to PDF coordinates
-            pdf_points = [self.canvas_to_pdf(x, y) for x, y in self._draw_points]
-            annot = page.add_ink_annot([pdf_points])
-            rgb = self._hex_to_rgb01(self.color_var.get())
-            annot.set_colors(stroke=rgb)
-            annot.set_border(width=self.width_var.get())
-            annot.update()
-            self._push_undo('add_annot', {'page': self.current_page, 'annots': [annot.xref]})
-            try:
-                self.pdf_doc.saveIncr()
-            except Exception as e:
-                # Suppress the repaired file error during drawing
-                if "Can't do incremental writes on a repaired file" not in str(e):
-                    print(f"[LOG] saveIncr failed: {e}, trying full save.")
-                try:
-                    self.pdf_doc.save(self.pdf_doc.name)
-                except Exception as e2:
-                    # Only show error if user tries to save and cancels
-                    if "save to original must be incremental" not in str(e2):
-                        print(f"[LOG] Full save also failed: {e2}")
-                        messagebox.showerror('Error', f'Failed to save PDF: {e2}')
-            self.show_page()
-            self._draw_history.append(self._draw_line)
-            del self._draw_line
-            del self._draw_points
+            # Final coordinate update before ending
+            if hasattr(self, '_draw_points') and len(self._draw_points) > 1:
+                coords = []
+                for point in self._draw_points:
+                    coords.extend(point)
+                self.canvas.coords(self._draw_line, *coords)
+            
+            # Only create annotation if we have enough points (minimum 3 points)
+            if hasattr(self, '_draw_points') and len(self._draw_points) >= 3:
+                page = self.pdf_doc.load_page(self.current_page)
+                
+                pdf_points = []
+                for cx, cy in self._draw_points:
+                    px, py = self.canvas_to_pdf(cx, cy)
+                    pdf_points.append((px, py))
+                
+                annot = page.add_ink_annot([pdf_points])
+                rgb = self._hex_to_rgb01(self.color_var.get())
+                annot.set_colors(stroke=rgb)
+                annot.set_border(width=self.width_var.get())
+                annot.update()
+                
+                # Undo functionality removed as requested
+                self._save_pdf_safe(show_message=False)
+                
+                # Optimized: Only re-render annotations, don't reload entire page
+                self._render_annotations()
+            
+            # Cleanup
+            if hasattr(self, '_draw_line'):
+                self._draw_history.append(self._draw_line)
+                del self._draw_line
+            if hasattr(self, '_draw_points'):
+                del self._draw_points
 
-    # --- Professional Form Fill ---
-    def _enable_form_fields(self):
-        print(f'[DEBUG] _enable_form_fields called for page {self.current_page}')
-        page = self.pdf_doc.load_page(self.current_page)
-        widgets = list(page.widgets())
-        if not hasattr(self, '_form_entries'):
-            self._form_entries = []
-        else:
-            for entry in self._form_entries:
-                if isinstance(entry, tuple):
-                    print('[DEBUG] Destroying form widget:', type(entry[0]).__name__)
-                    self.canvas.delete(entry[1])
-                    entry[0].destroy()
-                else:
-                    print('[DEBUG] Destroying form widget:', type(entry).__name__)
-                    entry.destroy()
-            self._form_entries.clear()
-        if not widgets:
-            print('[DEBUG] No form widgets detected on this page.')
-            return
-        for widget in widgets:
-            rect = widget.rect
-            x0, y0 = self.pdf_to_canvas(rect.x0, rect.y0)
-            x1, y1 = self.pdf_to_canvas(rect.x1, rect.y1)
-            w, h = x1 - x0, y1 - y0
-            if widget.field_type == getattr(fitz, 'PDF_WIDGET_TYPE_TEXT', 4096):
-                print(f'[DEBUG] Creating Entry at ({x0},{y0}) size ({w}x{h})')
-                entry = tk.Entry(self.canvas, width=20, relief='solid', bd=2, highlightthickness=2, highlightbackground=ACCENT_COLOR, highlightcolor=ACCENT_COLOR)
-                entry.insert(0, widget.field_value or '')
-                win = self.canvas.create_window(x0, y0, anchor='nw', window=entry, width=w, height=h)
-                entry.lift()
-                entry.bind('<FocusIn>', lambda e, ent=entry: ent.config(highlightbackground=HIGHLIGHT_COLOR))
-                entry.bind('<FocusOut>', lambda e, w=widget, ent=entry: self._save_form_field(w, ent, refresh=False))
-                entry.bind('<Return>', lambda e, w=widget, ent=entry: self._save_form_field(w, ent, refresh=False))
-                self._form_entries.append((entry, win))
-            elif widget.field_type == getattr(fitz, 'PDF_WIDGET_TYPE_CHECKBOX', 32768):
-                print(f'[DEBUG] Creating Checkbutton at ({x0},{y0}) size ({w}x{h})')
-                export_value = getattr(widget, 'export_value', None) or 'Yes'
-                is_checked = (widget.field_value == export_value or widget.field_value == 'On' or widget.field_value is True)
-                var = tk.BooleanVar(value=is_checked)
-                cb = tk.Checkbutton(self.canvas, variable=var, bg=BG_COLOR, activebackground=BG_COLOR, selectcolor=ACCENT_COLOR, relief='solid', bd=2, highlightthickness=2)
-                win = self.canvas.create_window(x0, y0, anchor='nw', window=cb, width=w, height=h)
-                cb.lift()
-                def on_cb_toggle(v=var, w=widget, export_value=export_value, cb=cb):
-                    try:
-                        if hasattr(w, 'set_checked'):
-                            w.set_checked(v.get())
-                        else:
-                            if v.get():
-                                w.field_value = export_value
-                            else:
-                                w.field_value = None
-                        w.update()
-                        self.pdf_doc.saveIncr()
-                        checked = (w.field_value == export_value or w.field_value == 'On' or w.field_value is True)
-                        v.set(checked)
-                        print(f'[DEBUG] Checkbox toggled: {checked}')
-                    except Exception as ex:
-                        print('[DEBUG] Checkbox toggle error:', ex)
-                var.trace_add('write', lambda *a, v=var, w=widget, export_value=export_value, cb=cb: on_cb_toggle(v, w, export_value, cb))
-                self._form_entries.append((cb, win))
-            elif widget.field_type == getattr(fitz, 'PDF_WIDGET_TYPE_RADIO', 65536):
-                print(f'[DEBUG] Creating Radiobutton at ({x0},{y0}) size ({w}x{h})')
-                if not hasattr(self, '_radio_vars'):
-                    self._radio_vars = {}
-                if widget.field_name not in self._radio_vars:
-                    self._radio_vars[widget.field_name] = tk.StringVar(value=widget.field_value or '')
-                var = self._radio_vars[widget.field_name]
-                rb = tk.Radiobutton(self.canvas, variable=var, value=widget.field_value or widget.field_label or 'On', bg=BG_COLOR, activebackground=BG_COLOR, selectcolor=ACCENT_COLOR, relief='solid', bd=2, highlightthickness=2)
-                win = self.canvas.create_window(x0, y0, anchor='nw', window=rb, width=w, height=h)
-                rb.lift()
-                def on_rb_toggle(v=var, w=widget):
-                    w.field_value = v.get()
-                    w.update()
-                    self.pdf_doc.saveIncr()
-                    print(f'[DEBUG] Radiobutton toggled: {v.get()}')
-                var.trace_add('write', lambda *a, v=var, w=widget: on_rb_toggle(v, w))
-                self._form_entries.append((rb, win))
-            elif widget.field_type == getattr(fitz, 'PDF_WIDGET_TYPE_COMBO', 131072):
-                print(f'[DEBUG] Creating Combobox at ({x0},{y0}) size ({w}x{h})')
-                values = widget.field_options or []
-                var = tk.StringVar(value=widget.field_value or (values[0] if values else ''))
-                combo = ttk.Combobox(self.canvas, textvariable=var, values=values, font=FONT)
-                win = self.canvas.create_window(x0, y0, anchor='nw', window=combo, width=w, height=h)
-                combo.lift()
-                def on_combo_select(event, v=var, w=widget):
-                    w.field_value = v.get()
-                    w.update()
-                    self.pdf_doc.saveIncr()
-                    print(f'[DEBUG] Combobox selected: {v.get()}')
-                combo.bind('<<ComboboxSelected>>', on_combo_select)
-                self._form_entries.append((combo, win))
-            elif widget.field_type == getattr(fitz, 'PDF_WIDGET_TYPE_LIST', 262144):
-                print(f'[DEBUG] Creating Listbox at ({x0},{y0}) size ({w}x{h})')
-                values = widget.field_options or []
-                var = tk.StringVar(value=widget.field_value or (values[0] if values else ''))
-                lb = tk.Listbox(self.canvas, listvariable=tk.StringVar(value=values), selectmode='single', font=FONT)
-                win = self.canvas.create_window(x0, y0, anchor='nw', window=lb, width=w, height=h)
-                lb.lift()
-                def on_lb_select(event, v=var, w=widget, lb=lb):
-                    sel = lb.curselection()
-                    if sel:
-                        w.field_value = lb.get(sel[0])
-                        w.update()
-                        self.pdf_doc.saveIncr()
-                        print(f'[DEBUG] Listbox selected: {lb.get(sel[0])}')
-                lb.bind('<<ListboxSelect>>', on_lb_select)
-                self._form_entries.append((lb, win))
-
-    def _save_form_field(self, widget, entry, refresh=False):
-        widget.field_value = entry.get()
-        widget.update()
-        self.pdf_doc.saveIncr()
-        # Do NOT call show_page() here, even if refresh=True
-        # Only destroy/recreate widgets on navigation, zoom, fit, or explicit refresh
 
     def _highlight_eraser_hover(self, event):
-        # Visual feedback: highlight annotation under cursor
-        page = self.pdf_doc.load_page(self.current_page)
-        x, y = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
-        found = None
-        for annot in page.annots():
-            rect = annot.rect
-            if rect.contains(fitz.Point(x, y)):
-                found = rect
-                break
-        # Remove previous highlight
+        # Highly optimized eraser hover - minimal processing
+        if not hasattr(self, '_last_hover_pos'):
+            self._last_hover_pos = (0, 0)
+        
+        # Only process if mouse moved more than 10 pixels (increased threshold for performance)
+        if abs(event.x - self._last_hover_pos[0]) < 10 and abs(event.y - self._last_hover_pos[1]) < 10:
+            return
+        
+        self._last_hover_pos = (event.x, event.y)
+        
+        # Remove previous highlight first
         if hasattr(self, '_eraser_hover_rect'):
             self.canvas.delete(self._eraser_hover_rect)
             del self._eraser_hover_rect
-        if found:
-            # Draw highlight rectangle
-            self._eraser_hover_rect = self.canvas.create_rectangle(
-                found.x0, found.y0, found.x1, found.y1,
-                outline='red', width=2, dash=(3,2))
+        
+        # Only check annotations if PDF is loaded and we're in eraser mode
+        if not self.pdf_doc or (hasattr(self, 'annot_mode') and self.annot_mode.get() != 'eraser'):
+            return
+            
+        try:
+            # Use cached page if available to avoid repeated loading
+            if not hasattr(self, '_cached_page') or self._cached_page_num != self.current_page:
+                self._cached_page = self.pdf_doc.load_page(self.current_page)
+                self._cached_page_num = self.current_page
+            
+            page = self._cached_page
+            
+            try:
+                x, y = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
+            except:
+                x, y = event.x, event.y
+            
+            # Convert to PDF coordinates for annotation checking
+            px, py = self.canvas_to_pdf(x, y)
+            
+            # Limit annotation checking to prevent lag
+            annotations = list(page.annots())
+            if len(annotations) > 20:  # Only check first 20 annotations
+                annotations = annotations[:20]
+            
+            found = None
+            for annot in annotations:
+                rect = annot.rect
+                if rect.contains(fitz.Point(px, py)):
+                    found = rect
+                    break
+            
+            if found:
+                # Convert back to canvas coordinates for highlighting
+                x0, y0 = self.pdf_to_canvas(found.x0, found.y0)
+                x1, y1 = self.pdf_to_canvas(found.x1, found.y1)
+                
+                # Draw highlight rectangle
+                self._eraser_hover_rect = self.canvas.create_rectangle(
+                    x0, y0, x1, y1,
+                    outline='red', width=2, dash=(3,2), tags='eraser_hover')
+        except:
+            pass  # Ignore errors to prevent lag
 
     def _hex_to_rgb01(self, hex_color):
         hex_color = hex_color.lstrip('#')
@@ -1158,12 +1509,22 @@ class PDFReaderApp(tk.Tk):
             return tuple(int(hex_color[i]*2, 16)/255.0 for i in range(3))
         else:
             raise ValueError("Invalid hex color")
+    
+    def _rgb01_to_hex(self, rgb_tuple):
+        """Convert RGB tuple (0-1 range) to hex color."""
+        if not rgb_tuple or len(rgb_tuple) != 3:
+            return '#ff0000'  # default red
+        r, g, b = rgb_tuple
+        return f"#{int(r*255):02x}{int(g*255):02x}{int(b*255):02x}"
 
     def _erase_annot(self, event):
         # Find and delete annotation under cursor (improved hit-test for ink)
         page = self.pdf_doc.load_page(self.current_page)
-        x = self.canvas.canvasx(self.winfo_pointerx() - self.canvas.winfo_rootx())
-        y = self.canvas.canvasy(self.winfo_pointery() - self.canvas.winfo_rooty())
+        try:
+            x = self.canvas.canvasx(self.winfo_pointerx() - self.canvas.winfo_rootx())
+            y = self.canvas.canvasy(self.winfo_pointery() - self.canvas.winfo_rooty())
+        except:
+            x = y = 0
         px, py = self.canvas_to_pdf(x, y)
         found = False
         for annot in page.annots():
@@ -1173,29 +1534,46 @@ class PDFReaderApp(tk.Tk):
             elif annot.type[0] == fitz.PDF_ANNOT_INK and self._is_point_near_ink(annot, px, py, tolerance=14):
                 found = True
             if found:
-                self._push_undo('remove_annot', {'page': self.current_page, 'annots': [annot.xref]})
+                # Undo functionality removed as requested
                 page.delete_annot(annot)
                 break
         if hasattr(self, '_eraser_hover_rect'):
             self.canvas.delete(self._eraser_hover_rect)
             del self._eraser_hover_rect
         if found:
-            print("[LOG] Annotation erased, refreshing page.")
-            try:
-                self.pdf_doc.saveIncr()
-            except Exception as e:
-                # Suppress the repaired file error during erasing
-                if "Can't do incremental writes on a repaired file" not in str(e):
-                    print(f"[LOG] saveIncr failed: {e}, trying full save.")
-                try:
-                    self.pdf_doc.save(self.pdf_doc.name)
-                except Exception as e2:
-                    if "save to original must be incremental" not in str(e2):
-                        print(f"[LOG] Full save also failed: {e2}")
-                        messagebox.showerror('Error', f'Failed to save PDF: {e2}')
-            self.show_page()
+            # Annotation erased
+            self._save_pdf_safe(show_message=False)
+            # Optimized: Only re-render annotations, don't reload entire page
+            self._render_annotations()
         else:
-            messagebox.showinfo('Eraser', 'No annotation found at this location.')
+            # Create a centered message box for eraser
+            msg_box = tk.Toplevel(self)
+            msg_box.title('Eraser')
+            msg_box.configure(bg=BG_COLOR)
+            msg_box.geometry('300x100')
+            msg_box.resizable(False, False)
+            
+            # Center the message box
+            msg_box.transient(self)
+            msg_box.grab_set()
+            
+            # Center on screen
+            # Removed update_idletasks for performance
+            x = (msg_box.winfo_screenwidth() // 2) - (msg_box.winfo_width() // 2)
+            y = (msg_box.winfo_screenheight() // 2) - (msg_box.winfo_height() // 2)
+            msg_box.geometry(f"+{x}+{y}")
+            
+            # Message label
+            tk.Label(msg_box, text='No annotation found at this location.', 
+                    bg=BG_COLOR, fg=FG_COLOR, font=FONT).pack(expand=True)
+            
+            # OK button
+            tk.Button(msg_box, text='OK', command=msg_box.destroy,
+                     bg=TOOLBAR_COLOR, fg=FG_COLOR, font=FONT, relief='flat',
+                     padx=20).pack(pady=10)
+            
+            # Auto close after 2 seconds
+            msg_box.after(2000, msg_box.destroy)
 
     def _is_point_near_ink(self, annot, px, py, tolerance=8):
         # px, py are in PDF coordinates
@@ -1220,149 +1598,18 @@ class PDFReaderApp(tk.Tk):
         proj_y = y0 + t * dy
         return hypot(px - proj_x, py - proj_y)
 
-    # --- Professional Image Tool: Preview, Resize, Move Before Finalize ---
-    def _start_image_annot(self, event):
-        cx, cy = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
-        print(f'[DEBUG] Image annot start canvas: ({cx}, {cy}), scale: {getattr(self, "_pdf_scale", None)}, offset: ({getattr(self, "_pdf_offset_x", None)}, {getattr(self, "_pdf_offset_y", None)})')
-        self._img_start = (cx, cy)
-        self._img_rect = self.canvas.create_rectangle(cx, cy, cx, cy, outline=ACCENT_COLOR, width=2, dash=(2,2))
-        self._img_preview = None
-        self._img_preview_path = None
-        self.canvas.bind('<Double-Button-1>', self._finalize_image_annot)
-        self.canvas.bind('<Return>', self._finalize_image_annot)
-    def _resize_image_annot(self, event):
-        if hasattr(self, '_img_rect'):
-            cx, cy = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
-            self.canvas.coords(self._img_rect, self._img_start[0], self._img_start[1], cx, cy)
-    def _end_image_annot(self, event):
-        if hasattr(self, '_img_rect'):
-            file_path = filedialog.askopenfilename(filetypes=[('Image Files', '*.png;*.jpg;*.jpeg;*.bmp')])
-            if not file_path:
-                self.canvas.delete(self._img_rect)
-                del self._img_rect
-                del self._img_start
-                return
-            self._img_preview_path = file_path
-            x0, y0 = self._img_start
-            x1, y1 = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
-            self._img_box = (min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1))
-            # Show preview image on canvas
-            from PIL import Image as PILImage
-            img = PILImage.open(file_path)
-            w = max(1, int(self._img_box[2] - self._img_box[0]))
-            h = max(1, int(self._img_box[3] - self._img_box[1]))
-            img = img.resize((w, h), PILImage.LANCZOS)
-            self._img_preview_img = ImageTk.PhotoImage(img)
-            if self._img_preview:
-                self.canvas.delete(self._img_preview)
-            self._img_preview = self.canvas.create_image(self._img_box[0], self._img_box[1], image=self._img_preview_img, anchor='nw')
-            # Allow drag/resize: bind mouse events
-            self.canvas.bind('<B1-Motion>', self._drag_image_annot)
-            self.canvas.bind('<Button-1>', self._select_image_annot)
-    def _select_image_annot(self, event):
-        # Start drag
-        self._drag_offset = (self.canvas.canvasx(event.x) - self._img_box[0], self.canvas.canvasy(event.y) - self._img_box[1])
-    def _drag_image_annot(self, event):
-        # Move preview image
-        if hasattr(self, '_img_preview'):
-            x = self.canvas.canvasx(event.x) - self._drag_offset[0]
-            y = self.canvas.canvasy(event.y) - self._drag_offset[1]
-            w = self._img_box[2] - self._img_box[0]
-            h = self._img_box[3] - self._img_box[1]
-            self._img_box = (x, y, x + w, y + h)
-            self.canvas.coords(self._img_preview, x, y)
-            self.canvas.coords(self._img_rect, x, y, x + w, y + h)
-    def _finalize_image_annot(self, event=None):
-        if hasattr(self, '_img_preview') and self._img_preview_path:
-            px0, py0 = self.canvas_to_pdf(self._img_box[0], self._img_box[1])
-            px1, py1 = self.canvas_to_pdf(self._img_box[2], self._img_box[3])
-            rect = fitz.Rect(min(px0,px1), min(py0,py1), max(px0,px1), max(py0,py1))
-            page = self.pdf_doc.load_page(self.current_page)
-            pix = fitz.Pixmap(self._img_preview_path)
-            annot = page.insert_image(rect, pixmap=pix, keep_proportion=False, overlay=True, xref=None, rotate=0, mask=None, alpha=False, annots=True)
-            # PyMuPDF's insert_image does not return an annotation, so we need to find the last image annotation
-            last_annot = None
-            for a in page.annots():
-                last_annot = a
-            if last_annot:
-                self._push_undo('add_annot', {'page': self.current_page, 'annots': [last_annot.xref]})
-            self.pdf_doc.saveIncr()
-            self.show_page()
-            self.canvas.delete(self._img_rect)
-            self.canvas.delete(self._img_preview)
-            del self._img_rect
-            del self._img_preview
-            del self._img_box
-            del self._img_preview_path
-            del self._img_preview_img
-            self.canvas.unbind('<B1-Motion>')
-            self.canvas.unbind('<Button-1>')
-            self.canvas.unbind('<Double-Button-1>')
-            self.canvas.unbind('<Return>')
-
-    # --- Professional Text Note Tool: Resizable, Movable, Editable Before Finalize ---
-    def _add_text_note(self, event):
-        cx, cy = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
-        print(f'[DEBUG] Text note start canvas: ({cx}, {cy}), scale: {getattr(self, "_pdf_scale", None)}, offset: ({getattr(self, "_pdf_offset_x", None)}, {getattr(self, "_pdf_offset_y", None)})')
-        self._text_box = [cx, cy, cx+120, cy+40]  # Default size
-        self._text_rect = self.canvas.create_rectangle(*self._text_box, outline=ACCENT_COLOR, width=2, dash=(2,2))
-        self._text_entry = tk.Text(self.canvas, width=20, height=2, font=FONT, bg=BG_COLOR, fg=FG_COLOR, insertbackground=FG_COLOR, relief='solid', bd=2, highlightthickness=2, highlightbackground=ACCENT_COLOR, highlightcolor=ACCENT_COLOR)
-        self._text_entry.place(x=cx, y=cy, width=120, height=40)
-        self._text_entry.focus_set()
-        self._text_entry.bind('<B1-Motion>', self._resize_text_note)
-        self._text_entry.bind('<Double-Button-1>', self._finalize_text_note)
-        self._text_entry.bind('<Return>', self._finalize_text_note)
-        self._text_entry.bind('<Escape>', self._cancel_text_note)
-        self._text_entry.bind('<FocusIn>', lambda e: self._text_entry.config(highlightbackground=HIGHLIGHT_COLOR))
-        self._text_entry.bind('<FocusOut>', lambda e: self._text_entry.config(highlightbackground=ACCENT_COLOR))
-        self._text_drag_offset = None
-        self._text_entry.bind('<Button-1>', self._start_drag_text_note)
-    def _start_drag_text_note(self, event):
-        self._text_drag_offset = (event.x, event.y)
-        self._text_entry.bind('<B1-Motion>', self._drag_text_note)
-    def _drag_text_note(self, event):
-        dx = event.x - self._text_drag_offset[0]
-        dy = event.y - self._text_drag_offset[1]
-        x, y, w, h = self._text_entry.winfo_x(), self._text_entry.winfo_y(), self._text_entry.winfo_width(), self._text_entry.winfo_height()
-        new_x = x + dx
-        new_y = y + dy
-        self._text_entry.place(x=new_x, y=new_y)
-        self.canvas.coords(self._text_rect, new_x, new_y, new_x + w, new_y + h)
-    def _resize_text_note(self, event):
-        # Resize box by dragging lower right corner
-        x, y = self._text_entry.winfo_x(), self._text_entry.winfo_y()
-        w, h = max(40, event.x), max(20, event.y)
-        self._text_entry.place(x=x, y=y, width=w, height=h)
-        self.canvas.coords(self._text_rect, x, y, x + w, y + h)
-    def _finalize_text_note(self, event=None):
-        text = self._text_entry.get('1.0', 'end').strip()
-        if text:
-            x, y = self._text_entry.winfo_x(), self._text_entry.winfo_y()
-            w, h = self._text_entry.winfo_width(), self._text_entry.winfo_height()
-            px, py = self.canvas_to_pdf(x, y)
-            page = self.pdf_doc.load_page(self.current_page)
-            annot = page.add_freetext_annot(fitz.Rect(px, py, px + w/self._pdf_scale, py + h/self._pdf_scale), text, fontsize=12, fontname="helv", align=0)
-            annot.set_colors(stroke=self.color_var.get(), fill=None)
-            annot.update()
-            self._push_undo('add_annot', {'page': self.current_page, 'annots': [annot.xref]})
-            self.pdf_doc.saveIncr()
-            self.show_page()
-        self.canvas.delete(self._text_rect)
-        self._text_entry.destroy()
-        del self._text_rect
-        del self._text_entry
-        if hasattr(self, '_text_drag_offset'):
-            del self._text_drag_offset
-    def _cancel_text_note(self, event=None):
-        self.canvas.delete(self._text_rect)
-        self._text_entry.destroy()
-        del self._text_rect
-        del self._text_entry
-        if hasattr(self, '_text_drag_offset'):
-            del self._text_drag_offset
 
 
-
+    def _disable_form_fields(self):
+        """Disable form fields and remove widgets."""
+        if hasattr(self, '_form_entries'):
+            for entry in self._form_entries:
+                if isinstance(entry, tuple):
+                    self.canvas.delete(entry[1])
+                    entry[0].destroy()
+                else:
+                    entry.destroy()
+            self._form_entries.clear()
 
     def show_license(self):
             license_win = tk.Toplevel(self)
@@ -1499,13 +1746,10 @@ class PDFReaderApp(tk.Tk):
     def show_shortcuts(self):
         shortcuts = [
             ('Open PDF', 'Ctrl+O'),
-            ('Save As', 'Ctrl+S'),
-            ('Export as Image', 'Ctrl+S'),
+            ('Save PDF', 'Ctrl+S'),
+            ('Save As', 'Ctrl+Shift+S'),
+            ('Export as Image', 'File > Export as Image'),
             ('Exit', 'Ctrl+Q, Esc'),
-            ('Undo', 'Ctrl+Z'),
-            ('Redo', 'Ctrl+Y'),
-            ('Copy', 'Ctrl+C'),
-            ('Paste', 'Ctrl+V'),
             ('Next Page', 'Right, PageDown, Space'),
             ('Previous Page', 'Left, PageUp, Shift+Space'),
             ('First Page', 'Home'),
@@ -1551,31 +1795,6 @@ class PDFReaderApp(tk.Tk):
             tk.Label(scroll_frame, text=keys, bg=BG_COLOR, fg=ACCENT_COLOR, font=FONT_BOLD, anchor='e').grid(row=i, column=1, sticky='e', pady=2, padx=4)
         tk.Button(top, text='Close', command=top.destroy, bg=TOOLBAR_COLOR, fg=FG_COLOR, font=FONT, relief='flat').pack(pady=12)
 
-    def add_to_startup(self):
-        import os, sys
-        import shutil
-        import getpass
-        import tkinter.messagebox as messagebox
-        # Windows only: add shortcut to Startup folder
-        if sys.platform != 'win32':
-            messagebox.showinfo('Auto Startup', 'Auto startup is only supported on Windows.')
-            return
-        startup_dir = os.path.join(os.environ['APPDATA'], r'Microsoft\Windows\Start Menu\Programs\Startup')
-        exe_path = sys.executable if getattr(sys, 'frozen', False) else sys.argv[0]
-        shortcut_path = os.path.join(startup_dir, 'PDFReader.lnk')
-        try:
-            import pythoncom
-            from win32com.shell import shell, shellcon
-            from win32com.client import Dispatch
-            shell = Dispatch('WScript.Shell')
-            shortcut = shell.CreateShortCut(shortcut_path)
-            shortcut.Targetpath = exe_path
-            shortcut.WorkingDirectory = os.path.dirname(exe_path)
-            shortcut.IconLocation = os.path.abspath(ICON_PATH)
-            shortcut.save()
-            messagebox.showinfo('Auto Startup', 'PDF Reader will now start automatically with Windows.')
-        except Exception as e:
-            messagebox.showerror('Auto Startup', f'Failed to add to startup: {e}')
 
     def _on_close(self):
         if pystray is None:
@@ -1597,14 +1816,29 @@ class PDFReaderApp(tk.Tk):
                     pass
             try:
                 icon_img = PILImage.open(ICON_PATH)
-            except Exception:
-                icon_img = PILImage.new('RGB', (64, 64), color='gray')
+                # Resize to proper tray icon size
+                icon_img = icon_img.resize((64, 64), PILImage.Resampling.LANCZOS)
+            except Exception as e:
+                pass  # Tray icon failed
+                # Create a proper default icon
+                icon_img = PILImage.new('RGBA', (64, 64), color=(0, 100, 200, 255))
+                # Add a simple "P" text
+                from PIL import ImageDraw, ImageFont
+                draw = ImageDraw.Draw(icon_img)
+                try:
+                    font = ImageFont.truetype("arial.ttf", 40)
+                except:
+                    font = ImageFont.load_default()
+                draw.text((20, 12), "P", fill=(255, 255, 255, 255), font=font)
             menu = pystray.Menu(
                 pystray.MenuItem('Show', show_window),
                 pystray.MenuItem('Exit', quit_app)
             )
             self.tray_icon = pystray.Icon('PDFReader', icon_img, 'PDF Reader', menu)
-            threading.Thread(target=self.tray_icon.run, daemon=True).start()
+            # Start the tray icon in a separate thread
+            tray_thread = threading.Thread(target=self.tray_icon.run, daemon=True)
+            tray_thread.start()
+            # System tray started
     def _show_from_tray(self):
         self.deiconify()
         if hasattr(self, 'tray_icon') and self.tray_icon:
@@ -1622,86 +1856,89 @@ class PDFReaderApp(tk.Tk):
         if not self.pdf_doc:
             return
         page = self.pdf_doc.load_page(self.current_page)
-        x = self.canvas.canvasx(self.winfo_pointerx() - self.canvas.winfo_rootx())
-        y = self.canvas.canvasy(self.winfo_pointery() - self.canvas.winfo_rooty())
+        try:
+            x = self.canvas.canvasx(self.winfo_pointerx() - self.canvas.winfo_rootx())
+            y = self.canvas.canvasy(self.winfo_pointery() - self.canvas.winfo_rooty())
+        except:
+            x = y = 0
         found = False
         for annot in page.annots():
             rect = annot.rect
             if rect.contains(fitz.Point(*self.canvas_to_pdf(x, y))):
-                self._push_undo('remove_annot', {'page': self.current_page, 'annots': [annot.xref]})
+                # Undo functionality removed as requested
                 page.delete_annot(annot)
                 found = True
                 break
         if found:
-            self.pdf_doc.saveIncr()
+            try:
+                self.pdf_doc.saveIncr()
+            except Exception as e:
+                logger.warning(f"Incremental save failed, using full save: {e}")
+                # Save to temporary file and replace original
+                import tempfile
+                with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
+                    tmp_path = tmp_file.name
+                self.pdf_doc.save(tmp_path, incremental=False, encryption=False)
+                import shutil
+                shutil.move(tmp_path, self.pdf_doc.name)
+                # Reload the document to reflect changes
+                self.pdf_doc = fitz.open(self.pdf_doc.name)
             self.show_page()
             self.status.config(text='Annotation deleted (Delete key).')
         else:
             self.status.config(text='No annotation detected under mouse.')
 
-    def _copy_annot(self, event):
-        if not self.pdf_doc:
-            return
-        page = self.pdf_doc.load_page(self.current_page)
-        x = self.canvas.canvasx(self.winfo_pointerx() - self.canvas.winfo_rootx())
-        y = self.canvas.canvasy(self.winfo_pointery() - self.canvas.winfo_rooty())
-        for annot in page.annots():
-            rect = annot.rect
-            if rect.contains(fitz.Point(*self.canvas_to_pdf(x, y))):
-                if annot.type[0] ==  fitz.PDF_ANNOT_FREETEXT:
-                    self._copied_annot_data = {
-                        'type': 'text',
-                        'text': annot.info.get('content', ''),
-                        'rect': annot.rect,
-                        'color': annot.colors['stroke']
-                    }
-                    self.status.config(text='Text annotation copied.')
-                    return
-        self.status.config(text='No annotation detected to copy.')
-
-    def _paste_annot(self, event):
-        if not self.pdf_doc or not self._copied_annot_data:
-            self.status.config(text='Nothing to paste.')
-            return
-        page = self.pdf_doc.load_page(self.current_page)
-        x = self.canvas.canvasx(self.winfo_pointerx() - self.canvas.winfo_rootx())
-        y = self.canvas.canvasy(self.winfo_pointery() - self.canvas.winfo_rooty())
-        if self._copied_annot_data['type'] == 'text':
-            w = self._copied_annot_data['rect'].width
-            h = self._copied_annot_data['rect'].height
-            px, py = self.canvas_to_pdf(x, y)
-            annot = page.add_freetext_annot(fitz.Rect(px, py, px + w, py + h), self._copied_annot_data['text'], fontsize=12, fontname="helv", align=0)
-            annot.set_colors(stroke=self._copied_annot_data['color'], fill=None)
-            annot.update()
-            self._push_undo('add_annot', {'page': self.current_page, 'annots': [annot.xref]})
-            self.pdf_doc.saveIncr()
-            self.show_page()
-            
-            self.status.config(text='Text annotation pasted.')
-        else:
-            self.status.config(text='Only text annotation copy/paste supported.')
+    # Copy/paste annotation methods removed as requested
 
     def _save_last_session(self, file_path, page_num):
+        """Save current session to persistent storage"""
         try:
+            # Ensure directory exists
+            os.makedirs(os.path.dirname(SESSION_FILE), exist_ok=True)
+            
+            session_data = {
+                'file': file_path,
+                'page': page_num,
+                'zoom': self.zoom,
+                'rotation': self.rotation,
+                'fit_to_window': self.fit_to_window.get(),
+                'sidebar_visible': self.sidebar_visible,
+                'timestamp': time.time()
+            }
+            
             with open(SESSION_FILE, 'w') as f:
-                json.dump({'file': file_path, 'page': page_num}, f)
-        except Exception:
-            pass
+                json.dump(session_data, f, indent=2)
+        except Exception as e:
+            pass  # Session save failed
 
     def _load_last_session(self):
+        """Load last session from persistent storage"""
         if self._session_loaded:
             return
         self._session_loaded = True
+        
         try:
+            if not os.path.exists(SESSION_FILE):
+                return
+                
             with open(SESSION_FILE, 'r') as f:
                 data = json.load(f)
+                
             file_path = data.get('file')
             page_num = data.get('page', 0)
+            
+            # Restore other settings
+            self.zoom = data.get('zoom', 1.0)
+            self.rotation = data.get('rotation', 0)
+            self.fit_to_window.set(data.get('fit_to_window', True))
+            self.sidebar_visible = data.get('sidebar_visible', True)
+            
             if file_path and os.path.exists(file_path):
+                # Restoring last session
                 self.open_pdf(file_path)
                 self.after(500, lambda: self.go_to_page(page_num))
-        except Exception:
-            pass
+        except Exception as e:
+            pass  # Session load failed
 
     def exit_app(self):
         # If you want to always fully exit:
@@ -1738,7 +1975,7 @@ class PDFReaderApp(tk.Tk):
                         return latest_version, download_url
             return None, None
         except Exception as e:
-            print(f"Update check failed: {e}")
+            pass  # Update check failed
             return None, None
 
     def download_and_replace(self, download_url):
@@ -1788,10 +2025,16 @@ class PDFReaderApp(tk.Tk):
                     self.canvas.yview_scroll(-20, 'units')
                 elif event.num == 5:
                     self.canvas.yview_scroll(20, 'units')
+        
+        # Update scroll position tracking
+        try:
+            self._last_scroll_x = self.canvas.canvasx(0)
+            self._last_scroll_y = self.canvas.canvasy(0)
+        except:
+            self._last_scroll_x = self._last_scroll_y = 0
 
     def _on_canvas_key_scroll(self, direction, amount=20):
         """Handle keyboard scrolling of the main PDF canvas"""
-        print(f"[DEBUG] Key scroll: {direction}, amount: {amount}")
         if direction == 'up':
             self.canvas.yview_scroll(-amount, 'units')
         elif direction == 'down':
@@ -1800,6 +2043,13 @@ class PDFReaderApp(tk.Tk):
             self.canvas.xview_scroll(-amount, 'units')
         elif direction == 'right':
             self.canvas.xview_scroll(amount, 'units')
+        
+        # Update scroll position tracking
+        try:
+            self._last_scroll_x = self.canvas.canvasx(0)
+            self._last_scroll_y = self.canvas.canvasy(0)
+        except:
+            self._last_scroll_x = self._last_scroll_y = 0
 
     def _propagate_mousewheel_to_canvas(self, widget, canvas):
         # Ensure mouse wheel events on widget and all children are handled by canvas
@@ -1827,15 +2077,87 @@ class PDFReaderApp(tk.Tk):
             self.attributes('-fullscreen', False)
             self.status.config(text='Exited Full Screen')
 
-    def save_pdf(self):
+    def _save_pdf_safe(self, show_message=True):
+        """Safe PDF save method that handles all edge cases."""
         if not self.pdf_doc or not self._current_pdf_path:
-            messagebox.showwarning('No PDF', 'No PDF loaded.')
-            return
+            if show_message:
+                messagebox.showwarning('No PDF', 'No PDF loaded to save.')
+            return False
+        
         try:
-            self.pdf_doc.save(self._current_pdf_path)
-            messagebox.showinfo('Saved', f'Saved: {self._current_pdf_path}')
+            # Try incremental save first
+            self.pdf_doc.saveIncr()
+                # PDF saved incrementally
+            if show_message:
+                self.status.config(text=f'Saved: {os.path.basename(self._current_pdf_path)}')
+                messagebox.showinfo('Saved', f'PDF saved successfully:\n{os.path.basename(self._current_pdf_path)}')
+            return True
         except Exception as e:
-            messagebox.showerror('Save Error', f'Could not save PDF: {e}')
+            # Incremental save failed, trying full save
+            try:
+                # Use temporary file approach for full save
+                import tempfile
+                import shutil
+                
+                # Create temporary file
+                with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
+                    tmp_path = tmp_file.name
+                
+                # Save to temporary file
+                self.pdf_doc.save(tmp_path, incremental=False, encryption=False)
+                
+                # Replace original file
+                shutil.move(tmp_path, self._current_pdf_path)
+                
+                # Reload the document to reflect changes
+                self.pdf_doc = fitz.open(self._current_pdf_path)
+                
+                # PDF saved with full save
+                if show_message:
+                    self.status.config(text=f'Saved: {os.path.basename(self._current_pdf_path)}')
+                    messagebox.showinfo('Saved', f'PDF saved successfully:\n{os.path.basename(self._current_pdf_path)}')
+                return True
+            except Exception as e2:
+                # Full save also failed
+                if show_message:
+                    messagebox.showerror('Save Error', f'Could not save PDF:\n{str(e2)}')
+                return False
+
+    def save_pdf(self):
+        """Save PDF with user feedback."""
+        self._save_pdf_safe(show_message=True)
+
+    def save_pdf_as(self):
+        """Save PDF to a new location (Save As)."""
+        if not self.pdf_doc:
+            messagebox.showwarning('No PDF', 'No PDF loaded to save.')
+            return
+        
+        # Ask user for save location
+        from tkinter import filedialog
+        file_path = filedialog.asksaveasfilename(
+            title='Save PDF As',
+            defaultextension='.pdf',
+            filetypes=[
+                ('PDF files', '*.pdf'),
+                ('All files', '*.*')
+            ],
+            initialdir=os.path.dirname(self._current_pdf_path) if self._current_pdf_path else None,
+            initialfile=os.path.basename(self._current_pdf_path).replace('.pdf', '_copy.pdf') if self._current_pdf_path else 'document.pdf'
+        )
+        
+        if not file_path:
+            return  # User cancelled
+        
+        try:
+            # Save to new location
+            self.pdf_doc.save(file_path, incremental=False, encryption=False)
+            # PDF saved as
+            self.status.config(text=f'Saved as: {os.path.basename(file_path)}')
+            messagebox.showinfo('Saved', f'PDF saved successfully as:\n{os.path.basename(file_path)}')
+        except Exception as e:
+            # Save As failed
+            messagebox.showerror('Save Error', f'Could not save PDF:\n{str(e)}')
 
     def _check_license(self):
         # Check license file for start date and license key
@@ -1904,7 +2226,7 @@ class PDFReaderApp(tk.Tk):
         dialog.lift()
         dialog.attributes('-topmost', True)
         # Center dialog
-        dialog.update_idletasks()
+        # Removed update_idletasks for performance
         w, h = 340, 160
         x = self.winfo_rootx() + (self.winfo_width() - w) // 2
         y = self.winfo_rooty() + (self.winfo_height() - h) // 2
@@ -1968,13 +2290,27 @@ if __name__ == '__main__':
     splash.update()
 
     def show_main():
-        splash.destroy()
+        try:
+            splash.destroy()
+        except:
+            pass
+        
         app = PDFReaderApp()
+        
+        # Ensure window is visible and on top BEFORE loading PDF
+        app.deiconify()  # Show window if minimized
+        app.lift()       # Bring to front
+        app.focus_force()  # Force focus
+        app.attributes('-topmost', True)  # Stay on top temporarily
+        app.after(100, lambda: app.attributes('-topmost', False))  # Remove topmost after 100ms
+        
+        # Update the window to ensure it's visible
+        app.update()
+        
         # If a PDF file was passed as argument, open it instead of loading session
         if pdf_file_to_open and os.path.exists(pdf_file_to_open):
-            app.after(100, lambda: app.open_pdf(pdf_file_to_open))
-        app.lift()
-        app.focus_force()
+            app.after(200, lambda: app.open_pdf(pdf_file_to_open))
+        
         app.mainloop()
 
     splash.after(1000, show_main)

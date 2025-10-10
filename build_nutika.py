@@ -4,35 +4,46 @@ import shutil
 from pathlib import Path
 import subprocess
 import json
+import uuid
 
 # ---
 # To access bundled assets in your app, use this function:
 # (Copy this to your main app, e.g., pdfReader.py)
 def resource_path(relative_path):
     import sys, os
-    if hasattr(sys, '_MEIPASS'):
-        return os.path.join(sys._MEIPASS, relative_path)
+    # Prefer assets located next to the executable (installer layout)
+    if getattr(sys, 'frozen', False):
+        base_dir = os.path.dirname(sys.executable)
+        candidate = os.path.join(base_dir, relative_path)
+        if os.path.exists(candidate):
+            return candidate
+    # Nuitka/PyInstaller onefile temp extraction dir
+    temp_dir = getattr(sys, '_MEIPASS', None) or os.environ.get('NUITKA_ONEFILE_TEMP_DIR')
+    if temp_dir:
+        candidate = os.path.join(temp_dir, relative_path)
+        if os.path.exists(candidate):
+            return candidate
+    # Fallback to project directory (dev mode)
     return os.path.join(os.path.abspath('.'), relative_path)
 # Example: resource_path('assets/icons/icon.ico')
 # ---
 
-# Configuration
+# Production Configuration
 APP_NAME = "Advanced PDF Reader"
-VERSION = "1.0.0"
+VERSION = "2.0.0"
 MAIN_SCRIPT = "pdfReader.py"
 ICON_PATH = resource_path("assets/icons/icon.ico")
-AUTHOR = "Yamin Hossain"
-DESCRIPTION = "Modern PDF Reader and Annotator"
+AUTHOR = "YAMiN HOSSAIN"
+DESCRIPTION = "Professional PDF Reader and Annotator"
 
 # Dependencies
 REQUIRED_PACKAGES = [
-    "nuitka",
+    "nuitka>=1.8.0",
     "ordered-set",
     "zstandard",
-    "Pillow",
-    "pymupdf",
-    "requests"
-    "webbrowser"
+    "Pillow>=10.0.0",
+    "pymupdf>=1.23.0",
+    "requests>=2.31.0"
 ]
 
 # Build directory setup
@@ -46,33 +57,64 @@ def clean_directories():
     for dir_path in [BUILD_DIR, DIST_DIR]:
         if os.path.exists(dir_path):
             shutil.rmtree(dir_path)
-            print(f"Cleaned {dir_path}/")
+            print(f"  [REMOVED] {dir_path}/")
+        else:
+            print(f"  [OK] {dir_path}/ - already clean")
 
-def copy_assets():
-    """Copy assets to build directory"""
-    print("Copying assets...")
-    assets_dest = os.path.join(DIST_DIR, "assets")
+def copy_assets(target_root: str = None):
+    """Copy assets to the specified output directory (defaults to DIST_DIR)."""
+    print("Preparing assets...")
+    target_root = target_root or DIST_DIR
+    assets_dest = os.path.join(target_root, "assets")
+
+    if os.path.exists(assets_dest):
+        shutil.rmtree(assets_dest)
+        print(f"  [REMOVED] Existing assets at {assets_dest}/")
+
     if os.path.exists(ASSETS_DIR):
+        print(f"  [COPYING] Assets from {ASSETS_DIR}/ to {assets_dest}/")
         shutil.copytree(ASSETS_DIR, assets_dest)
-        print(f"Copied assets to {assets_dest}/")
+        print(f"  [SUCCESS] Assets copied successfully!")
+    else:
+        print(f"  [WARNING] Assets directory {ASSETS_DIR}/ not found")
 
-def optimize_images():
-    """Optimize image assets using PIL"""
+    # Ensure session file exists next to the executable for persistence
+    session_file = os.path.join(assets_dest, "json", "last_session.json")
+    os.makedirs(os.path.dirname(session_file), exist_ok=True)
+    if not os.path.exists(session_file):
+        print(f"  Creating session file: {session_file}")
+        with open(session_file, 'w') as f:
+            json.dump({"file": "", "page": 0, "timestamp": 0}, f)
+        print(f"  [SUCCESS] Session file created!")
+    else:
+        print(f"  [OK] Session file already exists")
+
+    print("Assets prepared successfully!")
+
+def optimize_images(target_root: str = None):
+    """Optimize image assets using PIL in the specified output directory (defaults to DIST_DIR)."""
     try:
         from PIL import Image
         print("Optimizing images...")
-        for root, _, files in os.walk(os.path.join(DIST_DIR, "assets")):
+        optimized_count = 0
+        target_root = target_root or DIST_DIR
+        for root, _, files in os.walk(os.path.join(target_root, "assets")):
             for file in files:
                 if file.lower().endswith(('.png', '.jpg', '.jpeg')):
                     file_path = os.path.join(root, file)
                     try:
                         image = Image.open(file_path)
                         image.save(file_path, optimize=True, quality=85)
-                        print(f"Optimized {file}")
+                        optimized_count += 1
+                        print(f"  [OPTIMIZED] {file}")
                     except Exception as e:
-                        print(f"Failed to optimize {file}: {e}")
+                        print(f"  [WARNING] Failed to optimize {file}: {e}")
+        if optimized_count > 0:
+            print(f"  [SUCCESS] Optimized {optimized_count} images")
+        else:
+            print("  [OK] No images found to optimize")
     except ImportError:
-        print("PIL not available, skipping image optimization")
+        print("  [WARNING] PIL not available - skipping image optimization")
 
 def create_version_info():
     """Create version info for Windows executable"""
@@ -109,29 +151,87 @@ VSVersionInfo(
         f.write(version_info)
     return "version_info.txt"
 
+def find_iscc_executable():
+    """Locate Inno Setup Compiler (ISCC.exe) on Windows.
+
+    Order of detection:
+      1) PATH (iscc / ISCC.exe)
+      2) INNO_SETUP_PATH env var (file or directory)
+      3) Common install directories in Program Files / Program Files (x86)
+    """
+    # PATH lookup
+    path_exe = shutil.which("iscc") or shutil.which("ISCC.exe")
+    if path_exe and os.path.exists(path_exe):
+        return path_exe
+
+    candidates = []
+
+    # Environment variable can point to file or directory
+    env_path = os.environ.get("INNO_SETUP_PATH")
+    if env_path:
+        candidates.append(env_path)
+        if os.path.isdir(env_path):
+            candidates.append(os.path.join(env_path, "ISCC.exe"))
+
+    # Common installation locations
+    program_files = os.environ.get("ProgramFiles")
+    program_files_x86 = os.environ.get("ProgramFiles(x86)")
+
+    defaults = [
+        r"C:\\Program Files\\Inno Setup 6\\ISCC.exe",
+        r"C:\\Program Files (x86)\\Inno Setup 6\\ISCC.exe",
+    ]
+    for base in (program_files, program_files_x86):
+        if base:
+            defaults.append(os.path.join(base, "Inno Setup 6", "ISCC.exe"))
+
+    candidates.extend(defaults)
+
+    for candidate in candidates:
+        if candidate and os.path.exists(candidate):
+            return candidate
+
+    return None
+
 def check_dependencies():
     """Check and install required packages"""
-    print("Checking dependencies...")
+    print("Verifying build environment...")
     try:
-        import pkg_resources
+        import importlib.metadata as metadata
         packages_to_install = []
+        print("Checking required packages:")
         for package in REQUIRED_PACKAGES:
+            package_name = package.split('>=')[0].split('==')[0]
             try:
-                pkg_resources.require(package)
-            except pkg_resources.DistributionNotFound:
+                version = metadata.version(package_name)
+                print(f"  [OK] {package_name} (v{version}) - installed")
+            except metadata.PackageNotFoundError:
+                print(f"  [MISSING] {package_name} - missing")
                 packages_to_install.append(package)
         
         if packages_to_install:
-            print(f"Installing missing packages: {', '.join(packages_to_install)}")
+            print(f"\nInstalling {len(packages_to_install)} missing packages...")
+            for package in packages_to_install:
+                print(f"  Installing: {package}")
             subprocess.check_call([sys.executable, "-m", "pip", "install", *packages_to_install])
+            print("[SUCCESS] All packages installed successfully!")
+        else:
+            print("[OK] All required packages are already installed!")
     except Exception as e:
-        print(f"Error checking dependencies: {e}")
+        print(f"[ERROR] Build environment error: {e}")
         sys.exit(1)
 
 def build_executable():
-    """Build executable using Nuitka"""
-    print("Building executable with Nuitka...")
+    """Build production executable using Nuitka"""
+    print("Starting production build...")
     
+    # Compute a balanced parallel jobs count to avoid RAM pressure on Windows
+    try:
+        cpu_count = os.cpu_count() or 2
+        jobs_count = max(2, min(4, cpu_count // 2))
+    except Exception:
+        jobs_count = 2
+
     nuitka_args = [
         sys.executable,
         "-m", "nuitka",
@@ -143,46 +243,51 @@ def build_executable():
         "--windows-file-description=" + DESCRIPTION,
         "--windows-icon-from-ico=" + ICON_PATH,
         # This flag ensures the app does not show a terminal window
-        "--disable-console",
-        "--follow-imports",
+        "--windows-console-mode=disable",
         "--plugin-enable=tk-inter",
         "--include-package=PIL",
         "--include-package=fitz",
         "--include-package=requests",
-        "--include-package=webbrowser",
         # This bundles ALL assets (icons, images, json, etc.)
         "--include-data-dir=assets=assets",
+        # Ensure the output filename matches APP_NAME.exe
+        "--output-filename=" + APP_NAME + ".exe",
         "--output-dir=" + DIST_DIR,
-        "--verbose",
         "--standalone",
         "--onefile",
-        "--jobs=4",
-        "--lto=yes",
-        "--include-module=tkinter",
-        "--include-module=tkinter.ttk",
-        "--include-module=tkinter.messagebox",
-        "--include-module=tkinter.filedialog",
+        f"--jobs={jobs_count}",  # dynamic parallelism for faster builds
+        "--onefile-no-compression",  # faster build/startup; larger exe
+        "--lto=no",  # Disabled LTO to fix MinGW compilation issues
+        "--assume-yes-for-downloads",
+        # Additional MinGW compatibility options
+        "--disable-dll-dependency-cache",
+        "--no-prefer-source",
+        # Production optimizations
+        "--remove-output",
+        "--no-pyi-file",
+        "--warn-unusual-code",
+        "--warn-implicit-exceptions",
         MAIN_SCRIPT
     ]
     
     try:
-        print("Running Nuitka compilation...")
-        result = subprocess.run(nuitka_args, check=True, capture_output=True, text=True)
-        print(result.stdout)
-        if result.stderr:
-            print("Warnings/Errors:")
-            print(result.stderr)
+        print("Building production executable...")
+        print("Nuitka build output:")
+        print("-" * 50)
+        result = subprocess.run(nuitka_args, check=True)
+        print("-" * 50)
         print("Build completed successfully!")
+        print(f"Executable location: {DIST_DIR}")
     except subprocess.CalledProcessError as e:
         print(f"Build failed with error code {e.returncode}")
-        print("Error output:")
-        print(e.stdout)
-        print(e.stderr)
+        print("Check the output above for error details.")
         sys.exit(1)
 
 def create_installer():
     """Create Windows installer using Inno Setup"""
     print("Creating installer...")
+    # Stable AppId based on app identity (remains constant across versions)
+    app_guid = str(uuid.uuid5(uuid.NAMESPACE_URL, f"{APP_NAME}|{AUTHOR}"))
     inno_script = f"""
 #define MyAppName "{APP_NAME}"
 #define MyAppVersion "{VERSION}"
@@ -190,7 +295,8 @@ def create_installer():
 #define MyAppExeName "{APP_NAME}.exe"
 
 [Setup]
-AppId={{{{YOUR-UUID-HERE}}}}
+; Use the generated GUID as a literal AppId to remain stable across installs
+AppId={{{{{app_guid}}}}}
 AppName={{#MyAppName}}
 AppVersion={{#MyAppVersion}}
 AppPublisher={{#MyAppPublisher}}
@@ -207,8 +313,8 @@ Name: "desktopicon"; Description: "{{cm:CreateDesktopIcon}}"; GroupDescription: 
 Name: "startmenuicon"; Description: "Create Start Menu shortcuts"; GroupDescription: "{{cm:AdditionalIcons}}"
 
 [Files]
-Source: "{DIST_DIR}\\{APP_NAME}.exe"; DestDir: "{{app}}"; Flags: ignoreversion
-Source: "{DIST_DIR}\\assets\\*"; DestDir: "{{app}}\\assets\\"; Flags: ignoreversion recursesubdirs
+Source: "public\\{DIST_DIR}\\{APP_NAME}.exe"; DestDir: "{{app}}"; Flags: ignoreversion
+Source: "public\\{DIST_DIR}\\assets\\*"; DestDir: "{{app}}\\assets"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{{group}}\\{{#MyAppName}}"; Filename: "{{app}}\\{{#MyAppExeName}}"
@@ -223,48 +329,85 @@ Filename: "{{app}}\\{{#MyAppExeName}}"; Description: "{{cm:LaunchProgram,{{#Stri
         f.write(inno_script)
     
     # Run Inno Setup Compiler if available
+    iscc_path = find_iscc_executable()
+    if not iscc_path:
+        print("Failed to create installer: Inno Setup Compiler (ISCC.exe) not found.")
+        print("Searched PATH, INNO_SETUP_PATH, and common install directories.")
+        print("If installed at a custom location, set INNO_SETUP_PATH to the directory or full path to ISCC.exe.")
+        return False
     try:
-        subprocess.run(["iscc", "installer.iss"], check=True)
+        subprocess.run([iscc_path, "installer.iss"], check=True)
         print("Installer created successfully!")
-    except (subprocess.CalledProcessError, FileNotFoundError) as e:
-        print(f"Failed to create installer: {e}")
-        print("Please install Inno Setup to create the installer.")
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"Failed to create installer (exit code {e.returncode}).")
+        return False
 
 def main():
     """Main build process"""
     print(f"Building {APP_NAME} v{VERSION}")
+    print("=" * 60)
     
-    # Check dependencies first
-    check_dependencies()
-    
-    # Clean previous builds
-    clean_directories()
-    
-    # Build executable
-    build_executable()
+    try:
+        # Check dependencies first
+        print("\n[STEP 1] Checking dependencies...")
+        check_dependencies()
+        print("[SUCCESS] Dependencies check completed!")
+        
+        # Clean previous builds
+        print("\n[STEP 2] Cleaning previous builds...")
+        clean_directories()
+        print("[SUCCESS] Cleanup completed!")
+        
+        # Build executable
+        print("\n[STEP 3] Building executable with Nuitka...")
+        build_executable()
+        print("[SUCCESS] Executable build completed!")
 
-    # Move dist folder to public folder after build
-    public_dir = "public"
-    dist_dir = DIST_DIR
-    public_dist = os.path.join(public_dir, dist_dir)
-    if not os.path.exists(public_dir):
-        os.makedirs(public_dir)
-    if os.path.exists(public_dist):
-        shutil.rmtree(public_dist)
-    if os.path.exists(dist_dir):
-        shutil.move(dist_dir, public_dist)
-        print(f"Moved {dist_dir}/ to {public_dist}/")
+        # Move dist folder to public folder after build
+        print("\n[STEP 4] Organizing build output...")
+        public_dir = "public"
+        dist_dir = DIST_DIR
+        public_dist = os.path.join(public_dir, dist_dir)
+        if not os.path.exists(public_dir):
+            os.makedirs(public_dir)
+            print(f"Created directory: {public_dir}")
+        if os.path.exists(public_dist):
+            shutil.rmtree(public_dist)
+            print(f"Removed existing: {public_dist}")
+        if os.path.exists(dist_dir):
+            shutil.move(dist_dir, public_dist)
+            print(f"Moved {dist_dir}/ to {public_dist}/")
 
-    # Copy and optimize assets
-    copy_assets()
-    optimize_images()
-    
-    # Create installer
-    create_installer()
-    
-    print("\nBuild process completed!")
-    print(f"Executable location: {public_dist}/{APP_NAME}.exe")
-    print("Installer location: installer/")
+        # Copy assets beside the executable for installer packaging and runtime access
+        print("\n[STEP 5] Copying assets to public/dist...")
+        copy_assets(target_root=public_dist)
+        # Optional: optimize image assets to reduce installer size
+        optimize_images(target_root=public_dist)
+        print("[SUCCESS] Assets prepared in public/dist!")
+        
+        # Create installer
+        print("\n[STEP 6] Creating installer...")
+        installer_ok = create_installer()
+        if installer_ok:
+            print("[SUCCESS] Installer creation completed!")
+        else:
+            print("[WARNING] Installer was not created. You can still run the portable EXE from public/.")
+        
+        print("\n" + "=" * 60)
+        print("SUCCESS: Production build completed successfully!")
+        print(f"Executable: {public_dist}/{APP_NAME}.exe")
+        if installer_ok:
+            print("Installer: installer/Advanced PDF Reader-Setup.exe")
+            print("Ready for deployment!")
+        else:
+            print("Installer not built. Once ISCC is available, re-run to build the installer.")
+        print("=" * 60)
+        
+    except Exception as e:
+        print(f"\nERROR: Build failed with error: {e}")
+        print("Please check the output above for details.")
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
