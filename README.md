@@ -223,11 +223,11 @@ We welcome contributions! Please follow these guidelines:
 ### Development Setup
 ```bash
 # Fork the repository
-git clone https://github.com/your-username/pdf-reader.git
+git clone https://github.com/needyamin/pdf-reader.git
 cd pdf-reader
 
 # Create development branch
-git checkout -b feature/your-feature-name
+git checkout -b feature/needyamin
 
 # Make your changes
 # Test thoroughly
