@@ -277,7 +277,7 @@ def build_executable():
         result = subprocess.run(nuitka_args, check=True)
         print("-" * 50)
         print("Build completed successfully!")
-        print(f"Executable location: {DIST_DIR}")
+        print(f"Executable location: {os.path.join(DIST_DIR, APP_NAME + '.exe')}")
     except subprocess.CalledProcessError as e:
         print(f"Build failed with error code {e.returncode}")
         print("Check the output above for error details.")
@@ -288,6 +288,8 @@ def create_installer():
     print("Creating installer...")
     # Stable AppId based on app identity (remains constant across versions)
     app_guid = str(uuid.uuid5(uuid.NAMESPACE_URL, f"{APP_NAME}|{AUTHOR}"))
+    # Use f-string with proper escaping for Inno Setup variables
+    dist_path = os.path.join("public", DIST_DIR).replace("/", "\\")
     inno_script = f"""
 #define MyAppName "{APP_NAME}"
 #define MyAppVersion "{VERSION}"
@@ -313,8 +315,7 @@ Name: "desktopicon"; Description: "{{cm:CreateDesktopIcon}}"; GroupDescription: 
 Name: "startmenuicon"; Description: "Create Start Menu shortcuts"; GroupDescription: "{{cm:AdditionalIcons}}"
 
 [Files]
-Source: "public\\{DIST_DIR}\\{APP_NAME}.exe"; DestDir: "{{app}}"; Flags: ignoreversion
-Source: "public\\{DIST_DIR}\\assets\\*"; DestDir: "{{app}}\\assets"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{dist_path}\\*"; DestDir: "{{app}}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{{group}}\\{{#MyAppName}}"; Filename: "{{app}}\\{{#MyAppExeName}}"
@@ -396,9 +397,9 @@ def main():
         
         print("\n" + "=" * 60)
         print("SUCCESS: Production build completed successfully!")
-        print(f"Executable: {public_dist}/{APP_NAME}.exe")
+        print(f"Executable: {os.path.join(public_dist, APP_NAME + '.exe')}")
         if installer_ok:
-            print("Installer: installer/Advanced PDF Reader-Setup.exe")
+            print(f"Installer: installer/{APP_NAME}-Setup.exe")
             print("Ready for deployment!")
         else:
             print("Installer not built. Once ISCC is available, re-run to build the installer.")
