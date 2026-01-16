@@ -13,7 +13,11 @@ pystray>=0.19.0
 cryptography>=41.0.0
 
 # Development and building
+cx_Freeze>=6.15.0
 nuitka>=2.7.0
+
+# Installer (optional)
+# Inno Setup 6 is required to build the setup EXE (external tool)
 
 # Note: tkinter is included with standard Python on Windows
 # Note: webbrowser is a built-in Python module, no need to install 

@@ -91,10 +91,19 @@ python pdfReader.py
 
 ### Building Executable
 ```bash
-# Build with Nuitka (recommended)
-python build_nutika.py
+# Build with cx_Freeze
+python cx_Freeze_build.py build
 
-# Executable will be in the 'public/dist' folder
+# Executable will be in the 'build/exe.win-amd64-3.14' folder
+```
+
+### Build Installer (Setup EXE)
+```bash
+# Requires Inno Setup 6 installed
+# ISCC.exe must be on PATH or in the default install folder
+python cx_Freeze_build.py build
+
+# Setup EXE will be in the 'build' folder
 ```
 
 ## 📋 System Requirements
@@ -135,7 +144,7 @@ python build_nutika.py
 - **Framework**: Tkinter (Python's standard GUI library)
 - **PDF Engine**: PyMuPDF (fitz) for high-performance rendering
 - **Image Processing**: Pillow (PIL) for image manipulation
-- **Build System**: Nuitka for optimal executable creation
+- **Build System**: cx_Freeze + Inno Setup (installer)
 
 ### Performance Optimizations
 - **Smart Caching**: Page and annotation caching for instant access
@@ -154,7 +163,7 @@ python build_nutika.py
 ```
 pdf-reader/
 ├── 📄 pdfReader.py                 # Main application file
-├── 🔧 build_nutika.py              # Build script for executable
+├── 🔧 cx_Freeze_build.py           # Build script (exe + installer)
 ├── 📋 requirements.txt             # Python dependencies
 ├── 📖 README.md                    # Project documentation
 ├── 📁 assets/                      # Application assets
@@ -166,12 +175,9 @@ pdf-reader/
 │   └── 📄 json/
 │       ├── last_session.json       # Session persistence (runtime-updated)
 │       └── license_info.json       # License information
-├── 📁 public/
-│   └── 📁 dist/                    # Build output (Nuitka)
-│       ├── Advanced PDF Reader.exe
-│       └── assets/                 # Bundled assets for distribution
-├── 📁 installer/
-│   └── Advanced PDF Reader-Setup.exe  # Optional installer output
+├── 📁 build/
+│   ├── exe.win-amd64-3.14/         # cx_Freeze output
+│   └── Advanced PDF Reader-Setup.exe  # Inno Setup output
 ├── 📄 installer.iss                # Inno Setup script (optional)
 └── 📁 logs/                        # Application logs
     └── (runtime log files)

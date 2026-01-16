@@ -30,11 +30,11 @@ def resource_path(relative_path):
 
 # Production Configuration
 APP_NAME = "Advanced PDF Reader"
-VERSION = "2.0.0"
+VERSION = "3.0.0"
 MAIN_SCRIPT = "pdfReader.py"
 ICON_PATH = resource_path("assets/icons/icon.ico")
 AUTHOR = "YAMiN HOSSAIN"
-DESCRIPTION = "Professional PDF Reader and Annotator"
+DESCRIPTION = "Professional PDF Reader"
 
 # Dependencies
 REQUIRED_PACKAGES = [

@@ -15,11 +15,13 @@ import socket
 import time
 
 def resource_path(relative_path):
-    """Return absolute path to resource, works for dev and Nuitka onefile"""
-    if hasattr(sys, '_MEIPASS'):
+    """Return absolute path to resource for dev and frozen builds."""
+    if getattr(sys, "frozen", False):
+        base_path = os.path.dirname(sys.executable)
+    elif hasattr(sys, "_MEIPASS"):
         base_path = sys._MEIPASS
     else:
-        base_path = os.path.abspath(".")
+        base_path = os.path.dirname(os.path.abspath(__file__))
     return os.path.join(base_path, relative_path)
 
 def get_user_data_dir():
@@ -53,12 +55,67 @@ def setup_logging():
 # Initialize logger
 logger = setup_logging()
 
+# Suppress MuPDF stderr output for format errors
+import contextlib
+
+# Global stderr suppressor for MuPDF errors
+_original_stderr = None
+_null_file = None
+
+def suppress_mupdf_stderr():
+    """Globally suppress MuPDF stderr output"""
+    global _original_stderr, _null_file
+    if _original_stderr is None:
+        _original_stderr = sys.stderr
+    try:
+        if _null_file:
+            _null_file.close()
+        _null_file = open(os.devnull, 'w', encoding='utf-8', errors='ignore')
+        sys.stderr = _null_file
+    except:
+        pass
+
+def restore_stderr():
+    """Restore original stderr"""
+    global _original_stderr, _null_file
+    if _original_stderr:
+        try:
+            if _null_file and sys.stderr == _null_file:
+                _null_file.close()
+                _null_file = None
+            sys.stderr = _original_stderr
+        except:
+            pass
+
+class MuPDFErrorSuppressor:
+    """Context manager to suppress MuPDF stderr errors"""
+    def __enter__(self):
+        suppress_mupdf_stderr()
+        return self
+    
+    def __exit__(self, *args, **kwargs):
+        restore_stderr()
+        return True
+
+def suppress_mupdf_errors(func):
+    """Decorator to suppress MuPDF errors"""
+    def wrapper(*args, **kwargs):
+        try:
+            with MuPDFErrorSuppressor():
+                return func(*args, **kwargs)
+        except Exception as e:
+            # Only show critical errors, ignore format warnings
+            if 'format error' not in str(e).lower():
+                raise
+            return None
+    return wrapper
+
 # Single instance lock
 SINGLE_INSTANCE_PORT = 12345
 _instance_socket = None
 
-def is_already_running():
-    """Check if another instance is already running"""
+def is_already_running(pdf_path=None):
+    """Check if another instance is already running and send file if provided."""
     global _instance_socket
     try:
         _instance_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -67,6 +124,14 @@ def is_already_running():
         return False  # We're the first instance
     except OSError:
         # Port is already in use, another instance is running
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.connect(('localhost', SINGLE_INSTANCE_PORT))
+            payload = pdf_path if pdf_path else "__RAISE__"
+            sock.sendall(payload.encode('utf-8'))
+            sock.close()
+        except Exception:
+            pass
         return True
 
 def cleanup_single_instance():
@@ -107,9 +172,9 @@ if sys.platform == 'win32':
     try:
         from ctypes import windll
         windll.shcore.SetProcessDpiAwareness(1)
-        # Set app user model ID for proper taskbar grouping
+        # Set a stable AppUserModelID to prevent duplicate taskbar icons
         try:
-            windll.shell32.SetCurrentProcessExplicitAppUserModelID("PDFReader.YAMiN.2.0.0")
+            windll.shell32.SetCurrentProcessExplicitAppUserModelID("AdvancedPDFReader.YAMiN")
         except Exception:
             pass
     except Exception:
@@ -129,7 +194,7 @@ FONT = ('Segoe UI', 11)
 FONT_BOLD = ('Segoe UI', 11, 'bold')
 FONT_SMALL = ('Segoe UI', 9)
 
-__version__ = "2.0.0"
+__version__ = "3.0.0"
 GITHUB_REPO = "needyamin/pdf-reader"
 
 class Tooltip:
@@ -155,14 +220,223 @@ class Tooltip:
             self.tipwindow.destroy()
             self.tipwindow = None
 
+class SweetAlert2:
+    """SweetAlert2-style modern dialog for Tkinter"""
+    
+    @staticmethod
+    def _create_dialog(parent, title, message, icon_type='info', buttons=['OK'], default_button=0):
+        """Create a SweetAlert2-style dialog"""
+        dialog = tk.Toplevel(parent)
+        dialog.title(title)
+        dialog.configure(bg=BG_COLOR)
+        dialog.resizable(False, False)
+        dialog.transient(parent)
+        dialog.grab_set()
+        dialog.attributes('-topmost', True)
+        
+        try:
+            dialog.iconbitmap(ICON_PATH)
+        except:
+            pass
+        
+        # Size dialog based on content
+        dialog.update_idletasks()
+        dialog.minsize(360, 180)
+        
+        # Icon colors based on type
+        icon_colors = {
+            'success': '#10b981',
+            'error': '#ef4444',
+            'warning': '#f59e0b',
+            'info': '#3b82f6',
+            'question': '#8b5cf6'
+        }
+        icon_color = icon_colors.get(icon_type, icon_colors['info'])
+        
+        # Icon circle
+        icon_frame = tk.Frame(dialog, bg=BG_COLOR)
+        icon_frame.pack(pady=(20, 10))
+        
+        icon_canvas = tk.Canvas(icon_frame, width=60, height=60, bg=BG_COLOR, highlightthickness=0)
+        icon_canvas.pack()
+        icon_canvas.create_oval(5, 5, 55, 55, fill=icon_color, outline='')
+        
+        # Icon symbols
+        if icon_type == 'success':
+            icon_canvas.create_line(18, 30, 28, 40, fill='white', width=3, capstyle='round')
+            icon_canvas.create_line(28, 40, 42, 22, fill='white', width=3, capstyle='round')
+        elif icon_type == 'error':
+            icon_canvas.create_line(20, 20, 40, 40, fill='white', width=3, capstyle='round')
+            icon_canvas.create_line(40, 20, 20, 40, fill='white', width=3, capstyle='round')
+        elif icon_type == 'warning':
+            icon_canvas.create_text(30, 25, text='!', fill='white', font=('Segoe UI', 28, 'bold'))
+        elif icon_type == 'question':
+            icon_canvas.create_text(30, 30, text='?', fill='white', font=('Segoe UI', 28, 'bold'))
+        else:  # info
+            icon_canvas.create_text(30, 30, text='i', fill='white', font=('Segoe UI', 28, 'bold'))
+        
+        # Title
+        title_label = tk.Label(dialog, text=title, bg=BG_COLOR, fg=FG_COLOR, 
+                              font=('Segoe UI', 16, 'bold'))
+        title_label.pack(pady=(0, 8))
+        
+        # Message
+        msg_label = tk.Label(dialog, text=message, bg=BG_COLOR, fg=FG_COLOR, 
+                            font=('Segoe UI', 11), wraplength=380, justify='center')
+        msg_label.pack(pady=(0, 20), padx=20)
+        
+        # Buttons
+        btn_frame = tk.Frame(dialog, bg=BG_COLOR)
+        btn_frame.pack(pady=(0, 20))
+        
+        result = {'value': None}
+        
+        def on_button_click(value):
+            result['value'] = value
+            dialog.destroy()
+        
+        for i, btn_text in enumerate(buttons):
+            if i == default_button:
+                btn_bg = icon_color
+                btn_fg = 'white'
+            else:
+                btn_bg = TOOLBAR_COLOR
+                btn_fg = FG_COLOR
+            
+            btn = tk.Button(btn_frame, text=btn_text, command=lambda v=btn_text: on_button_click(v),
+                          bg=btn_bg, fg=btn_fg, font=('Segoe UI', 11, 'bold'),
+                          relief='flat', bd=0, padx=24, pady=8, cursor='hand2',
+                          activebackground=icon_color if i == default_button else BUTTON_ACTIVE,
+                          activeforeground='white')
+            btn.pack(side='left', padx=6)
+        
+        dialog.bind('<Return>', lambda e: on_button_click(buttons[default_button]))
+        dialog.bind('<Escape>', lambda e: on_button_click(buttons[-1] if buttons else 'Cancel'))
+        
+        # Final size and center
+        dialog.update_idletasks()
+        req_w = max(420, dialog.winfo_reqwidth())
+        req_h = max(200, dialog.winfo_reqheight())
+        screen_w = dialog.winfo_screenwidth()
+        screen_h = dialog.winfo_screenheight()
+        x = max(0, (screen_w // 2) - (req_w // 2))
+        y = max(0, (screen_h // 2) - (req_h // 2))
+        dialog.geometry(f'{req_w}x{req_h}+{x}+{y}')
+        
+        dialog.focus_set()
+        dialog.wait_window()
+        return result['value']
+    
+    @staticmethod
+    def success(parent, message, title='Success'):
+        return SweetAlert2._create_dialog(parent, title, message, 'success', ['OK'])
+    
+    @staticmethod
+    def error(parent, message, title='Error'):
+        return SweetAlert2._create_dialog(parent, title, message, 'error', ['OK'])
+    
+    @staticmethod
+    def warning(parent, message, title='Warning'):
+        return SweetAlert2._create_dialog(parent, title, message, 'warning', ['OK'])
+    
+    @staticmethod
+    def info(parent, message, title='Information'):
+        return SweetAlert2._create_dialog(parent, title, message, 'info', ['OK'])
+    
+    @staticmethod
+    def question(parent, message, title='Question', confirm_text='Yes', cancel_text='No'):
+        result = SweetAlert2._create_dialog(parent, title, message, 'question', [confirm_text, cancel_text], 0)
+        return result == confirm_text
+    
+    @staticmethod
+    def confirm(parent, message, title='Confirm'):
+        return SweetAlert2.question(parent, message, title, 'Yes', 'No')
+
+    @staticmethod
+    def prompt(parent, message, title='Input', default_value=''):
+        """SweetAlert2-style input prompt"""
+        dialog = tk.Toplevel(parent)
+        dialog.title(title)
+        dialog.configure(bg=BG_COLOR)
+        dialog.resizable(False, False)
+        dialog.transient(parent)
+        dialog.grab_set()
+        dialog.attributes('-topmost', True)
+
+        try:
+            dialog.iconbitmap(ICON_PATH)
+        except:
+            pass
+
+        # Size dialog based on content
+        dialog.update_idletasks()
+        dialog.minsize(360, 200)
+
+        # Title
+        title_label = tk.Label(dialog, text=title, bg=BG_COLOR, fg=FG_COLOR,
+                              font=('Segoe UI', 16, 'bold'))
+        title_label.pack(pady=(20, 8))
+
+        # Message
+        msg_label = tk.Label(dialog, text=message, bg=BG_COLOR, fg=FG_COLOR,
+                            font=('Segoe UI', 11), wraplength=380, justify='center')
+        msg_label.pack(pady=(0, 12), padx=20)
+
+        # Entry
+        entry_var = tk.StringVar(value=default_value)
+        entry = tk.Entry(dialog, textvariable=entry_var, font=FONT, width=32,
+                         bg=TOOLBAR_COLOR, fg=FG_COLOR, insertbackground=FG_COLOR,
+                         relief='solid', bd=1)
+        entry.pack(pady=(0, 16))
+        entry.focus_set()
+        entry.select_range(0, 'end')
+
+        # Buttons
+        btn_frame = tk.Frame(dialog, bg=BG_COLOR)
+        btn_frame.pack(pady=(0, 20))
+
+        result = {'value': None}
+
+        def on_ok():
+            result['value'] = entry_var.get().strip()
+            dialog.destroy()
+
+        def on_cancel():
+            result['value'] = None
+            dialog.destroy()
+
+        ok_btn = tk.Button(btn_frame, text='OK', command=on_ok,
+                          bg=ACCENT_COLOR, fg='white', font=('Segoe UI', 11, 'bold'),
+                          relief='flat', bd=0, padx=24, pady=8, cursor='hand2')
+        ok_btn.pack(side='left', padx=6)
+
+        cancel_btn = tk.Button(btn_frame, text='Cancel', command=on_cancel,
+                              bg=TOOLBAR_COLOR, fg=FG_COLOR, font=('Segoe UI', 11, 'bold'),
+                              relief='flat', bd=0, padx=24, pady=8, cursor='hand2')
+        cancel_btn.pack(side='left', padx=6)
+
+        dialog.bind('<Return>', lambda e: on_ok())
+        dialog.bind('<Escape>', lambda e: on_cancel())
+
+        # Final size and center
+        dialog.update_idletasks()
+        req_w = max(420, dialog.winfo_reqwidth())
+        req_h = max(220, dialog.winfo_reqheight())
+        screen_w = dialog.winfo_screenwidth()
+        screen_h = dialog.winfo_screenheight()
+        x = max(0, (screen_w // 2) - (req_w // 2))
+        y = max(0, (screen_h // 2) - (req_h // 2))
+        dialog.geometry(f'{req_w}x{req_h}+{x}+{y}')
+        
+        dialog.wait_window()
+        return result['value']
+
 class PDFReaderApp(tk.Tk):
-    def __init__(self):
+    def __init__(self, initial_pdf=None):
         super().__init__()
         
         # Single instance check
-        if is_already_running():
-            # Another instance is already running
-            messagebox.showinfo("PDF Reader", "PDF Reader is already running.")
+        if is_already_running(initial_pdf):
             sys.exit(0)
         self.title('Advanced PDF Reader')
         self.geometry('1200x800')
@@ -215,51 +489,71 @@ class PDFReaderApp(tk.Tk):
         self.thumbnails = []
         self.images = []
         self._resize_after_id = None  # For debouncing
-        self.fit_to_window = tk.BooleanVar(value=True)  # Default: fit to window ON
+        # fit_to_window removed - using fit_mode instead
+        self.fit_mode = tk.StringVar(value='fit_page')  # fit_page, fit_width, fit_height, actual_size
+        self._fit_mode_display = tk.StringVar(value='Fit Page')  # Display value for combobox
+        self.view_mode = tk.StringVar(value='single_page')  # single_page, continuous_scroll
         self.sidebar_visible = True
+        self._search_results = []
+        self._current_search_index = -1
+        self._rendered_pages = {}  # Cache for continuous scroll mode
+        self._find_dialog = None
+        self._bookmarks_loaded = False
+        self._page_heights = []
+        self._continuous_zoom = 1.0
+        self._find_dialog = None  # Initialize find dialog reference
+        self._thumb_render_id = 0
+        self._continuous_render_id = 0
+        self._render_lock = threading.Lock()
+        self._continuous_render_state = None
+        self._is_rendering = False
+        self._app_running = True
         self._setup_style()
         self._create_widgets()
         self.after(100, self._set_default_sidebar_size)
         self.bind('<Configure>', self._on_resize)
         # Navigation
-        self.bind_all('<Right>', lambda e: self.next_page())
-        self.bind_all('<Left>', lambda e: self.prev_page())
-        self.bind_all('<Next>', lambda e: self.next_page())  # PageDown
-        self.bind_all('<Prior>', lambda e: self.prev_page())  # PageUp
-        self.bind_all('<space>', lambda e: self.next_page())
-        self.bind_all('<Shift-space>', lambda e: self.prev_page())
-        self.bind_all('<Home>', lambda e: self.go_to_page(0))
-        self.bind_all('<End>', lambda e: self.go_to_page(len(self.pdf_doc)-1 if self.pdf_doc else 0))
-        # Zoom
+        self.bind_all('<Right>', lambda e: self.next_page() if self.pdf_doc else None)
+        self.bind_all('<Left>', lambda e: self.prev_page() if self.pdf_doc else None)
+        self.bind_all('<Next>', lambda e: self.next_page() if self.pdf_doc else None)  # PageDown
+        self.bind_all('<Prior>', lambda e: self.prev_page() if self.pdf_doc else None)  # PageUp
+        self.bind_all('<space>', lambda e: self.next_page() if self.pdf_doc else None)
+        self.bind_all('<Shift-space>', lambda e: self.prev_page() if self.pdf_doc else None)
+        self.bind_all('<Home>', lambda e: self.go_to_page(0) if self.pdf_doc else None)
+        self.bind_all('<End>', lambda e: self.go_to_page(len(self.pdf_doc)-1) if self.pdf_doc else None)
+        # Zoom - Fixed bindings
         self.bind_all('<Control-plus>', lambda e: self.change_zoom(1.25))
         self.bind_all('<Control-equal>', lambda e: self.change_zoom(1.25))
         self.bind_all('<Control-minus>', lambda e: self.change_zoom(0.8))
         self.bind_all('<Control-underscore>', lambda e: self.change_zoom(0.8))
-        self.bind_all('<Key-plus>', lambda e: self.change_zoom(1.25))
-        self.bind_all('<Key-equal>', lambda e: self.change_zoom(1.25))
-        self.bind_all('<Key-minus>', lambda e: self.change_zoom(0.8))
-        self.bind_all('<Key-underscore>', lambda e: self.change_zoom(0.8))
+        # Also bind to numpad
+        self.bind_all('<Control-KP_Add>', lambda e: self.change_zoom(1.25))
+        self.bind_all('<Control-KP_Subtract>', lambda e: self.change_zoom(0.8))
+        # Ctrl + MouseWheel zoom
+        self.bind_all('<Control-MouseWheel>', self._on_ctrl_mousewheel_zoom)
+        self.bind_all('<Control-Button-4>', self._on_ctrl_mousewheel_zoom)  # Linux
+        self.bind_all('<Control-Button-5>', self._on_ctrl_mousewheel_zoom)  # Linux
         # Rotate
-        self.bind_all('<r>', lambda e: self.rotate_page())
-        self.bind_all('<R>', lambda e: self.rotate_page())
+        self.bind_all('<r>', lambda e: self.rotate_page() if self.pdf_doc else None)
+        self.bind_all('<R>', lambda e: self.rotate_page() if self.pdf_doc else None)
         # Open
         self.bind_all('<Control-o>', lambda e: self.open_pdf())
         # Save PDF (always ask for location)
-        self.bind_all('<Control-s>', lambda e: self.save_pdf_as())
+        self.bind_all('<Control-s>', lambda e: self.save_pdf_as() if self.pdf_doc else None)
         # Save As (same as Save)
-        self.bind_all('<Control-Shift-S>', lambda e: self.save_pdf_as())
-        # Fit to Window
-        self.bind_all('<f>', lambda e: self.toggle_fit())
-        self.bind_all('<F>', lambda e: self.toggle_fit())
-        self.bind_all('<Control-f>', lambda e: self.toggle_fit())
+        self.bind_all('<Control-Shift-S>', lambda e: self.save_pdf_as() if self.pdf_doc else None)
+        # Fit to Window (removed, using fit mode instead)
+        # self.bind_all('<f>', lambda e: self.toggle_fit())
+        # self.bind_all('<F>', lambda e: self.toggle_fit())
         # Go to Page
         self.bind_all('<g>', lambda e: self.focus_page_entry())
         self.bind_all('<G>', lambda e: self.focus_page_entry())
         # Toggle Sidebar
-        self.bind_all('<s>', lambda e: self.toggle_sidebar())
-        self.bind_all('<S>', lambda e: self.toggle_sidebar())
-        self.bind_all('<Control-b>', lambda e: self.toggle_sidebar())
-        self.bind_all('<Escape>', lambda e: self.toggle_sidebar())
+        self.bind_all('<Control-Shift-T>', lambda e: self.toggle_sidebar())
+        # Find/Search
+        self.bind_all('<Control-f>', lambda e: self.show_find_dialog())
+        self.bind_all('<F3>', lambda e: self.find_next())
+        self.bind_all('<Shift-F3>', lambda e: self.find_previous())
         # Close
         self.bind_all('<Control-q>', lambda e: self.quit())
         # self.bind_all('<Escape>', lambda e: self.quit())  # ESC now toggles sidebar
@@ -281,6 +575,41 @@ class PDFReaderApp(tk.Tk):
         self.bind_all('<F11>', lambda e: self.toggle_fullscreen())
         self.bind_all('<Escape>', lambda e: self.exit_fullscreen())
         self._check_license()  # <-- moved here, after window is created
+        self._start_single_instance_listener()
+
+    def _start_single_instance_listener(self):
+        """Listen for file-open requests from secondary instances."""
+        if _instance_socket is None:
+            return
+
+        def listener():
+            while self._app_running:
+                try:
+                    conn, _ = _instance_socket.accept()
+                    data = conn.recv(4096)
+                    conn.close()
+                    if data:
+                        file_path = data.decode('utf-8', errors='ignore')
+                        if file_path == "__RAISE__":
+                            self.after(0, self._raise_window)
+                        elif os.path.exists(file_path):
+                            self.after(0, lambda p=file_path: self._open_and_raise(p))
+                except Exception:
+                    break
+
+        threading.Thread(target=listener, daemon=True).start()
+
+    def _open_and_raise(self, file_path):
+        self.open_pdf(file_path)
+        self._raise_window()
+
+    def _raise_window(self):
+        try:
+            self.deiconify()
+            self.lift()
+            self.focus_force()
+        except Exception:
+            pass
 
     def _setup_style(self):
         style = ttk.Style(self)
@@ -336,6 +665,7 @@ class PDFReaderApp(tk.Tk):
         # File menu
         file_menu = tk.Menu(self.menu, tearoff=0)
         file_menu.add_command(label='Open...', command=self.open_pdf, accelerator='Ctrl+O')
+        file_menu.add_command(label='Set as Default PDF Viewer', command=self.register_as_default_pdf_viewer)
         file_menu.add_command(label='Save', command=self.save_pdf_as, accelerator='Ctrl+S')
         file_menu.add_command(label='Save As...', command=self.save_pdf_as, accelerator='Ctrl+Shift+S')
         file_menu.add_separator()
@@ -345,16 +675,25 @@ class PDFReaderApp(tk.Tk):
         file_menu.add_separator()
         file_menu.add_command(label='Exit', command=self.exit_app, accelerator='Ctrl+Q')
         self.menu.add_cascade(label='File', menu=file_menu)
-        # Edit menu removed as requested
+        # Edit menu
+        edit_menu = tk.Menu(self.menu, tearoff=0)
+        edit_menu.add_command(label='Find...', command=self.show_find_dialog, accelerator='Ctrl+F')
+        edit_menu.add_command(label='Find Next', command=self.find_next, accelerator='F3')
+        edit_menu.add_command(label='Find Previous', command=self.find_previous, accelerator='Shift+F3')
+        self.menu.add_cascade(label='Edit', menu=edit_menu)
         # View menu
         view_menu = tk.Menu(self.menu, tearoff=0)
         view_menu.add_command(label='Zoom In', command=lambda: self.change_zoom(1.25), accelerator='Ctrl++')
         view_menu.add_command(label='Zoom Out', command=lambda: self.change_zoom(0.8), accelerator='Ctrl+-')
-        view_menu.add_command(label='Fit to Window', command=self.toggle_fit, accelerator='F')
+        view_menu.add_separator()
+        view_menu.add_radiobutton(label='Fit to Page', variable=self.fit_mode, value='fit_page', command=self._on_fit_mode_change)
+        view_menu.add_radiobutton(label='Fit to Width', variable=self.fit_mode, value='fit_width', command=self._on_fit_mode_change)
+        view_menu.add_radiobutton(label='Fit to Height', variable=self.fit_mode, value='fit_height', command=self._on_fit_mode_change)
+        view_menu.add_radiobutton(label='Actual Size', variable=self.fit_mode, value='actual_size', command=self._on_fit_mode_change)
         view_menu.add_separator()
         view_menu.add_command(label='Full Screen', command=self.toggle_fullscreen, accelerator='F11')
         view_menu.add_separator()
-        view_menu.add_command(label='Toggle Sidebar', command=self.toggle_sidebar, accelerator='S')
+        view_menu.add_command(label='Toggle Sidebar', command=self.toggle_sidebar, accelerator='Ctrl+Shift+T')
         self.menu.add_cascade(label='View', menu=view_menu)
         # Annotate menu (hidden for now)
         # annotate_menu = tk.Menu(self.menu, tearoff=0)
@@ -370,6 +709,8 @@ class PDFReaderApp(tk.Tk):
         help_menu = tk.Menu(self.menu, tearoff=0)
         help_menu.add_command(label='About', command=self.show_about)
         help_menu.add_command(label='Shortcuts', command=self.show_shortcuts)
+        help_menu.add_separator()
+        help_menu.add_command(label='Run Diagnostics', command=self.run_diagnostics)
         help_menu.add_separator()
         self.menu.add_cascade(label='Help', menu=help_menu)
         # Activate Software
@@ -389,14 +730,44 @@ class PDFReaderApp(tk.Tk):
         self.paned = tk.PanedWindow(self, orient='horizontal', sashwidth=6, bg=BG_COLOR, bd=0, sashrelief='flat', showhandle=True)
         self.paned.pack(side='top', fill='both', expand=True)
 
-        # Sidebar for thumbnails
-        self.sidebar = tk.Frame(self.paned, bg=SIDEBAR_COLOR, width=140)
+        # Sidebar for thumbnails and bookmarks
+        self.sidebar = tk.Frame(self.paned, bg=SIDEBAR_COLOR, width=200)
         self.sidebar.grid_propagate(False)
-        self.sidebar_header = tk.Label(self.sidebar, text='Thumbnails', bg=SIDEBAR_HEADER_COLOR, fg=ACCENT_COLOR, font=FONT_BOLD, anchor='center')
-        self.sidebar_header.pack(fill='x', pady=(0, 2))
-        self.thumbnail_canvas = tk.Canvas(self.sidebar, bg=SIDEBAR_COLOR, highlightthickness=0, bd=0)
+        
+        # Sidebar tabs
+        self.sidebar_tabs = tk.Frame(self.sidebar, bg=SIDEBAR_HEADER_COLOR)
+        self.sidebar_tabs.pack(fill='x')
+        
+        self.sidebar_tab = tk.StringVar(value='thumbnails')
+        thumb_tab = tk.Radiobutton(self.sidebar_tabs, text='📄 Pages', variable=self.sidebar_tab, 
+                                   value='thumbnails', command=self._switch_sidebar_tab,
+                                   bg=SIDEBAR_HEADER_COLOR, fg=FG_COLOR, selectcolor=ACCENT_COLOR,
+                                   activebackground=BUTTON_ACTIVE, font=FONT_SMALL, indicatoron=False,
+                                   relief='flat', bd=0, padx=8, pady=4)
+        thumb_tab.pack(side='left', fill='x', expand=True)
+        
+        bookmark_tab = tk.Radiobutton(self.sidebar_tabs, text='🔖 Bookmarks', variable=self.sidebar_tab,
+                                      value='bookmarks', command=self._switch_sidebar_tab,
+                                      bg=SIDEBAR_HEADER_COLOR, fg=FG_COLOR, selectcolor=ACCENT_COLOR,
+                                      activebackground=BUTTON_ACTIVE, font=FONT_SMALL, indicatoron=False,
+                                      relief='flat', bd=0, padx=8, pady=4)
+        bookmark_tab.pack(side='left', fill='x', expand=True)
+        
+        # Sidebar content container
+        self.sidebar_content = tk.Frame(self.sidebar, bg=SIDEBAR_COLOR)
+        self.sidebar_content.pack(fill='both', expand=True)
+        
+        # Thumbnails frame
+        self.thumbnails_container = tk.Frame(self.sidebar_content, bg=SIDEBAR_COLOR)
+        self.thumbnails_container.pack(fill='both', expand=True)
+        
+        self.sidebar_header_frame = tk.Frame(self.thumbnails_container, bg=SIDEBAR_HEADER_COLOR)
+        self.sidebar_header_frame.pack(fill='x', pady=(0, 2))
+        self.sidebar_header = tk.Label(self.sidebar_header_frame, text='', bg=SIDEBAR_HEADER_COLOR, fg=ACCENT_COLOR, font=FONT_BOLD, anchor='w')
+        self.sidebar_header.pack(side='left', padx=8, pady=2)
+        self.thumbnail_canvas = tk.Canvas(self.thumbnails_container, bg=SIDEBAR_COLOR, highlightthickness=0, bd=0)
         self.thumbnail_canvas.pack(side='left', fill='both', expand=True)
-        self.thumbnail_scrollbar = ttk.Scrollbar(self.sidebar, orient='vertical', command=self.thumbnail_canvas.yview)
+        self.thumbnail_scrollbar = ttk.Scrollbar(self.thumbnails_container, orient='vertical', command=self.thumbnail_canvas.yview)
         self.thumbnail_scrollbar.pack(side='right', fill='y')
         self.thumbnail_canvas.configure(yscrollcommand=self.thumbnail_scrollbar.set)
         # Configure for smooth scrolling
@@ -421,6 +792,17 @@ class PDFReaderApp(tk.Tk):
         self.thumbnail_canvas.bind('<Home>', lambda e: self.go_to_page(0))
         self.thumbnail_canvas.bind('<End>', lambda e: self.go_to_page(len(self.pdf_doc)-1 if self.pdf_doc else 0))
         self.thumbnail_canvas.bind('<Return>', lambda e: self.go_to_page(self.current_page))
+        
+        # Bookmarks frame
+        self.bookmarks_container = tk.Frame(self.sidebar_content, bg=SIDEBAR_COLOR)
+        self.bookmarks_canvas = tk.Canvas(self.bookmarks_container, bg=SIDEBAR_COLOR, highlightthickness=0, bd=0)
+        self.bookmarks_canvas.pack(side='left', fill='both', expand=True)
+        self.bookmarks_scrollbar = ttk.Scrollbar(self.bookmarks_container, orient='vertical', command=self.bookmarks_canvas.yview)
+        self.bookmarks_scrollbar.pack(side='right', fill='y')
+        self.bookmarks_canvas.configure(yscrollcommand=self.bookmarks_scrollbar.set)
+        self.bookmarks_frame = tk.Frame(self.bookmarks_canvas, bg=SIDEBAR_COLOR)
+        self.bookmarks_canvas.create_window((0, 0), window=self.bookmarks_frame, anchor='nw')
+        self.bookmarks_frame.bind('<Configure>', lambda e: self.bookmarks_canvas.configure(scrollregion=self.bookmarks_canvas.bbox('all')))
 
         # Main PDF display area with scrollbars
         self.display_outer = tk.Frame(self.paned, bg=BG_COLOR)
@@ -473,6 +855,11 @@ class PDFReaderApp(tk.Tk):
         self.canvas.bind('<Button-4>', self._on_canvas_mousewheel)           # Linux scroll up
         self.canvas.bind('<Button-5>', self._on_canvas_mousewheel)           # Linux scroll down
         
+        # Track scroll in continuous mode to update current page
+        # Store original scroll command
+        self._original_v_scroll_command = self.v_scroll['command']
+        self.v_scroll.configure(command=self._v_scroll_command)
+        
         # Keyboard scrolling for main PDF canvas
         # Up/Down arrows for vertical scrolling
         self.canvas.bind('<Up>', lambda e: self._on_canvas_key_scroll('up'))
@@ -520,6 +907,7 @@ class PDFReaderApp(tk.Tk):
             return btn
         make_btn('Open', self.open_pdf, '📂', 'Open PDF (Ctrl+O)')
         make_btn('Save', self.save_pdf_as, '💾', 'Save PDF (Ctrl+S)')
+        make_btn('Find', self.show_find_dialog, '🔍', 'Find Text (Ctrl+F)')
         make_btn('Prev', self.prev_page, '⬅️', 'Previous Page (Left, PageUp, Shift+Space)')
         make_btn('Next', self.next_page, '➡️', 'Next Page (Right, PageDown, Space)')
         make_btn('Zoom +', lambda: self.change_zoom(1.25), '➕', 'Zoom In (Ctrl +, +, =)')
@@ -528,10 +916,18 @@ class PDFReaderApp(tk.Tk):
         make_btn('Rotate', self.rotate_page, '🔄', 'Rotate Page (R)')
         # REMOVE the Annotate placeholder button
         # make_btn('Annotate', self.annotate_placeholder, '🖊️', 'Annotation tools (coming soon)')
-        # Fit to Window toggle
-        self.fit_btn = ttk.Checkbutton(self.toolbar, text='🖥️ Fit to Window', variable=self.fit_to_window, command=self.show_page, style='TButton')
-        self.fit_btn.pack(side='left', padx=(16,2), pady=8)
-        Tooltip(self.fit_btn, 'Toggle Fit to Window (F, Ctrl+F)')
+        # Fit mode dropdown
+        view_mode_frame = tk.Frame(self.toolbar, bg=TOOLBAR_COLOR)
+        view_mode_frame.pack(side='left', padx=(16,2), pady=8)
+        
+        tk.Label(view_mode_frame, text='Fit:', bg=TOOLBAR_COLOR, fg=FG_COLOR, font=FONT_SMALL).pack(side='left', padx=(0,4))
+        
+        self.fit_mode_menu = ttk.Combobox(view_mode_frame, textvariable=self._fit_mode_display, 
+                                          values=['Fit Page', 'Fit Width', 'Fit Height', 'Actual Size'],
+                                          state='readonly', width=12, font=FONT_SMALL)
+        self.fit_mode_menu.current(0)
+        self.fit_mode_menu.pack(side='left', padx=2)
+        self.fit_mode_menu.bind('<<ComboboxSelected>>', lambda e: self._on_fit_mode_change_combo())
         # Page number entry with improved styling
         # Page navigation input with improved UX
         page_frame = tk.Frame(self.toolbar, bg=TOOLBAR_COLOR)
@@ -612,92 +1008,211 @@ class PDFReaderApp(tk.Tk):
             return
         self._show_sidebar_loading(True)
         # Removed update_idletasks for performance
+        # Suppress stderr before opening PDF
+        suppress_mupdf_stderr()
         try:
             self.pdf_doc = fitz.open(file_path)
+            
+            # Validate PDF has pages (check needs to be outside error suppressor)
+            page_count = len(self.pdf_doc)
+            if page_count == 0:
+                self.pdf_doc = None
+                restore_stderr()  # Restore stderr for messagebox
+                SweetAlert2.error(self, 
+                    f'The PDF file appears to be corrupted or empty:\n\n{os.path.basename(file_path)}\n\n'
+                    'The file has 0 pages. This may be due to:\n'
+                    '• Corrupted PDF structure (xref table issues)\n'
+                    '• Incomplete file download\n'
+                    '• File format issues\n\n'
+                    'Try:\n'
+                    '• Opening in Adobe Reader to repair it\n'
+                    '• Re-downloading the file\n'
+                    '• Using a PDF repair tool',
+                    'Invalid PDF')
+                self._show_sidebar_loading(False)
+                return
+            
             self._current_pdf_path = file_path  # Track current file path
             # PDF loaded successfully
             self.current_page = 0
             self.zoom = 1.0
             self.rotation = 0
-            self.status.config(text=f'Loaded: {os.path.basename(file_path)}')
+            # Restore stderr after opening
+            restore_stderr()
+            
+            self.status.config(text=f'Loaded: {os.path.basename(file_path)} ({len(self.pdf_doc)} pages)')
             self._render_thumbnails()
-            self.fit_to_window.set(True)  # Always fit to window on open
+            self._load_bookmarks()  # Load bookmarks
+            self.fit_mode.set('fit_page')  # Reset fit mode
+            self.view_mode.set('single_page')  # Start with single page view
             self.show_page()
             self.after(100, self.show_page)  # Ensure fit after canvas is ready
             # Save session after successful PDF load
             self._save_last_session(file_path, self.current_page)
         except fitz.FileNotFoundError:
-            messagebox.showerror('File Not Found', f'The PDF file was not found:\n{file_path}')
+            self.pdf_doc = None
+            restore_stderr()
+            SweetAlert2.error(self, f'The PDF file was not found:\n\n{file_path}', 'File Not Found')
         except fitz.EmptyFileError:
-            messagebox.showerror('Invalid PDF', f'The PDF file is empty or corrupted:\n{file_path}')
+            self.pdf_doc = None
+            restore_stderr()
+            SweetAlert2.error(self, f'The PDF file is empty or corrupted:\n\n{file_path}', 'Invalid PDF')
         except fitz.FileDataError:
-            messagebox.showerror('PDF Error', f'The PDF file has invalid data:\n{file_path}')
+            self.pdf_doc = None
+            restore_stderr()
+            SweetAlert2.error(self, 
+                f'The PDF file has invalid data:\n\n{file_path}\n\n'
+                'This PDF may be corrupted. Try:\n'
+                '• Opening it in another PDF viewer to repair it\n'
+                '• Re-downloading the file\n'
+                '• Using a PDF repair tool',
+                'PDF Error')
+        except IndexError as e:
+            self.pdf_doc = None
+            restore_stderr()
+            SweetAlert2.error(self, 
+                f'Cannot access pages in this PDF:\n\n{file_path}\n\n'
+                'The PDF structure appears to be corrupted.\n'
+                f'Error: {str(e)}',
+                'PDF Error')
         except PermissionError:
-            messagebox.showerror('Permission Denied', f'Permission denied accessing the PDF file:\n{file_path}')
+            self.pdf_doc = None
+            restore_stderr()
+            SweetAlert2.error(self, f'Permission denied accessing the PDF file:\n\n{file_path}', 'Permission Denied')
         except Exception as e:
-            messagebox.showerror('Error', f'An unexpected error occurred while opening the PDF:\n{str(e)}')
-        self._show_sidebar_loading(False)
+            self.pdf_doc = None
+            restore_stderr()
+            error_msg = str(e)
+            if 'format error' in error_msg.lower() or 'xref' in error_msg.lower():
+                SweetAlert2.error(self, 
+                    f'The PDF file has format errors:\n\n{file_path}\n\n'
+                    'This PDF may be corrupted or have structural issues.\n'
+                    'The file might still be viewable, but some features may not work.\n\n'
+                    f'Error: {error_msg}',
+                    'PDF Format Error')
+            else:
+                SweetAlert2.error(self, f'An unexpected error occurred while opening the PDF:\n\n{error_msg}', 'Error')
+        finally:
+            restore_stderr()  # Always restore stderr
+            self._show_sidebar_loading(False)
 
     def _render_thumbnails(self):
+        """Render thumbnails without blocking UI."""
+        if not self.pdf_doc:
+            return
+        self._thumb_render_id += 1
+        render_id = self._thumb_render_id
+        self._show_sidebar_loading(True)
+        self._is_rendering = True
+        
+        def worker():
+            images = []
+            max_thumb_width = 120
+            max_thumb_height = 160
+            try:
+                for i in range(len(self.pdf_doc)):
+                    try:
+                        with MuPDFErrorSuppressor():
+                            page = self.pdf_doc.load_page(i)
+                            pix = page.get_pixmap(matrix=fitz.Matrix(0.18, 0.18))
+                            img = Image.frombytes('RGB', [pix.width, pix.height], pix.samples)
+                        img.thumbnail((max_thumb_width, max_thumb_height), Image.Resampling.LANCZOS)
+                        images.append((i, img))
+                    except Exception:
+                        continue
+            finally:
+                if self._app_running:
+                    try:
+                        self.after(0, lambda: self._apply_thumbnails(render_id, images))
+                    except RuntimeError:
+                        # Main loop has been stopped
+                        pass
+        
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_thumbnails(self, render_id, images):
+        """Apply thumbnails to UI (main thread)."""
+        if render_id != self._thumb_render_id:
+            return
         for widget in self.thumbnail_frame.winfo_children():
             widget.destroy()
         self.thumbnails = []
-        
-        # Standard thumbnail size to prevent overlap
         max_thumb_width = 120
         max_thumb_height = 160
-        
-        for i in range(len(self.pdf_doc)):
-            page = self.pdf_doc.load_page(i)
-            pix = page.get_pixmap(matrix=fitz.Matrix(0.18, 0.18))
-            img = Image.frombytes('RGB', [pix.width, pix.height], pix.samples)
-            
-            # Resize image to standard thumbnail size while maintaining aspect ratio
-            img.thumbnail((max_thumb_width, max_thumb_height), Image.Resampling.LANCZOS)
+        for i, img in images:
             thumb = ImageTk.PhotoImage(img)
             self.thumbnails.append(thumb)
-            
-            # Create a frame to hold thumbnail with fixed positioning
-            thumb_frame = tk.Frame(self.thumbnail_frame, bg=SIDEBAR_COLOR, bd=2, relief='solid', 
-                                 highlightthickness=2, width=max_thumb_width, height=max_thumb_height)
+            thumb_frame = tk.Frame(self.thumbnail_frame, bg=SIDEBAR_COLOR, bd=2, relief='solid',
+                                   highlightthickness=2, width=max_thumb_width, height=max_thumb_height)
             thumb_frame.pack(pady=4, padx=6, fill='x')
-            thumb_frame.pack_propagate(False)  # Prevent frame from shrinking
-            
-            # Center the thumbnail image in the frame
+            thumb_frame.pack_propagate(False)
             btn = tk.Label(thumb_frame, image=thumb, bg=SIDEBAR_COLOR, bd=0, highlightthickness=0)
             btn.place(relx=0.5, rely=0.5, anchor='center')
-            
-            # Page number badge (positioned on top-right corner)
-            page_num_label = tk.Label(thumb_frame, text=str(i+1), bg=ACCENT_COLOR, fg=FG_COLOR, 
-                                    font=('Segoe UI', 7, 'bold'), anchor='center',
-                                    relief='raised', bd=1)
-            # Position the badge in the top-right corner
+            page_num_label = tk.Label(thumb_frame, text=str(i+1), bg=ACCENT_COLOR, fg=FG_COLOR,
+                                      font=('Segoe UI', 7, 'bold'), anchor='center',
+                                      relief='raised', bd=1)
             page_num_label.place(relx=0.85, rely=0.05, width=20, height=16)
-            
-            # Bind events to the frame
             thumb_frame.bind('<Button-1>', lambda e, i=i: self.go_to_page(i))
+            thumb_frame.bind('<Button-3>', lambda e, i=i: self._show_thumbnail_context_menu(e, i))
             thumb_frame.bind('<Enter>', lambda e, f=thumb_frame: f.configure(bg=BUTTON_ACTIVE))
             thumb_frame.bind('<Leave>', lambda e, f=thumb_frame, idx=i: self._update_thumbnail_highlight(f, idx))
-            
-            # Also bind to the image and label for better UX
             btn.bind('<Button-1>', lambda e, i=i: self.go_to_page(i))
+            btn.bind('<Button-3>', lambda e, i=i: self._show_thumbnail_context_menu(e, i))
             btn.bind('<Enter>', lambda e, f=thumb_frame: f.configure(bg=BUTTON_ACTIVE))
             btn.bind('<Leave>', lambda e, f=thumb_frame, idx=i: self._update_thumbnail_highlight(f, idx))
-            
             page_num_label.bind('<Button-1>', lambda e, i=i: self.go_to_page(i))
+            page_num_label.bind('<Button-3>', lambda e, i=i: self._show_thumbnail_context_menu(e, i))
             page_num_label.bind('<Enter>', lambda e, f=thumb_frame: f.configure(bg=BUTTON_ACTIVE))
             page_num_label.bind('<Leave>', lambda e, f=thumb_frame, idx=i: self._update_thumbnail_highlight(f, idx))
-            
-            # Highlight current page
             self._update_thumbnail_highlight(thumb_frame, i)
             self._propagate_mousewheel_to_canvas(thumb_frame, self.thumbnail_canvas)
-        
-        # Force update of scroll region after all thumbnails are created
-        # Removed update_idletasks for performance
         self.thumbnail_canvas.configure(scrollregion=self.thumbnail_canvas.bbox('all'))
-        
-        # Enable smooth scrolling with proper configuration
         self.thumbnail_canvas.configure(yscrollincrement=1)
+        self._show_sidebar_loading(False)
+        self._is_rendering = False
+
+    def _show_thumbnail_context_menu(self, event, page_num):
+        """Show context menu for thumbnail (right-click)."""
+        menu = tk.Menu(self, tearoff=0, bg=TOOLBAR_COLOR, fg=FG_COLOR,
+                      activebackground=BUTTON_ACTIVE, activeforeground=FG_COLOR)
+        menu.add_command(label='Open Page', command=lambda: self.go_to_page(page_num))
+        menu.add_command(label='Add Bookmark', command=lambda: self._add_bookmark_for_page(page_num))
+        menu.add_separator()
+        menu.add_command(label='Show Bookmarks', command=self._show_bookmarks_tab)
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _show_bookmarks_tab(self):
+        """Switch sidebar to bookmarks tab."""
+        self.sidebar_tab.set('bookmarks')
+        self._switch_sidebar_tab()
+
+    def _add_bookmark_for_page(self, page_num):
+        """Add a bookmark for a specific page and switch to bookmarks."""
+        if not self.pdf_doc:
+            SweetAlert2.warning(self, 'No PDF loaded.', 'No PDF')
+            return
+        title = SweetAlert2.prompt(
+            self,
+            f'Enter bookmark title for Page {page_num + 1}:',
+            'Add Bookmark',
+            f'Page {page_num + 1}'
+        )
+        if not title:
+            return
+        try:
+            with MuPDFErrorSuppressor():
+                toc = self.pdf_doc.get_toc() or []
+                toc.append([1, title, page_num + 1])
+                self.pdf_doc.set_toc(toc)
+            self._save_pdf_safe(show_message=False)
+            self._load_bookmarks()
+            self._show_bookmarks_tab()
+            SweetAlert2.success(self, f'Bookmark added:\n\n{title}', 'Bookmark Added')
+        except Exception as e:
+            SweetAlert2.error(self, f'Error adding bookmark:\n\n{str(e)}', 'Bookmark Error')
 
     def _update_thumbnail_highlight(self, btn, idx):
         if idx == self.current_page:
@@ -719,33 +1234,81 @@ class PDFReaderApp(tk.Tk):
             self.page_total_label.config(text='/ 0')
             return
         
+        # Validate PDF has pages
+        if len(self.pdf_doc) == 0:
+            self.page_entry_var.set('')
+            self.page_total_label.config(text='/ 0')
+            self.status.config(text='Error: PDF has no readable pages (file may be corrupted)')
+            # Clear canvas
+            self.canvas.delete('pdf_image')
+            self.canvas.delete('annotation')
+            self.canvas.delete('search_highlight')
+            return
+        
+        # Validate current page is within range
+        if self.current_page < 0:
+            self.current_page = 0
+        if self.current_page >= len(self.pdf_doc):
+            self.current_page = len(self.pdf_doc) - 1
+        
         # Check if canvas is ready
         canvas_width = self.canvas.winfo_width()
         canvas_height = self.canvas.winfo_height()
         if canvas_width < 10 or canvas_height < 10:
             return
         
-        # Store current scroll position before page change (optimized)
+        if self.view_mode.get() == 'continuous_scroll':
+            self._show_continuous_scroll()
+        else:
+            self._show_single_page()
+        
+        # Update status
+        fname = self.pdf_doc.name if hasattr(self.pdf_doc, 'name') else ''
+        fit_mode_display = self.fit_mode.get().replace('_', ' ').title()
+        view_mode_display = 'Continuous' if self.view_mode.get() == 'continuous_scroll' else 'Single Page'
+        current_zoom = self._continuous_zoom if self.view_mode.get() == 'continuous_scroll' else self.zoom
+        self.status.config(text=f'{os.path.basename(fname)} | Page {self.current_page+1}/{len(self.pdf_doc)} | Zoom: {int(current_zoom*100)}% | {fit_mode_display} | {view_mode_display}')
+        
+        # Update page entry
+        if hasattr(self, 'page_entry_var') and self.pdf_doc and not self._page_entry_has_focus:
+            self.page_entry_var.set(str(self.current_page + 1))
+        
+        for idx, widget in enumerate(self.thumbnail_frame.winfo_children()):
+            self._update_thumbnail_highlight(widget, idx)
+    
+    def _show_single_page(self):
+        """Display single page view (original behavior)"""
+        canvas_width = self.canvas.winfo_width()
+        canvas_height = self.canvas.winfo_height()
+        
         try:
-            current_scroll_x = self.canvas.canvasx(0)
-            current_scroll_y = self.canvas.canvasy(0)
-        except:
-            current_scroll_x = current_scroll_y = 0
-        # Always reload the page from the PDF
-        page = self.pdf_doc.load_page(self.current_page)
-        page_rect = page.rect
-        if self.fit_to_window.get():
+            with MuPDFErrorSuppressor():
+                page = self.pdf_doc.load_page(self.current_page)
+                page_rect = page.rect
+        except Exception as e:
+            self.status.config(text=f'Error loading page {self.current_page + 1}: {str(e)}')
+            return
+        
+        # Calculate zoom based on fit mode
+        if self.fit_mode.get() == 'fit_page':
             zoom_x = canvas_width / page_rect.width
             zoom_y = canvas_height / page_rect.height
             zoom = min(zoom_x, zoom_y)
-            mat = fitz.Matrix(zoom, zoom)
-        else:
+        elif self.fit_mode.get() == 'fit_width':
+            zoom = canvas_width / page_rect.width
+        elif self.fit_mode.get() == 'fit_height':
+            zoom = canvas_height / page_rect.height
+        else:  # actual_size
             zoom = self.zoom
-            mat = fitz.Matrix(zoom, zoom)
+        
+        mat = fitz.Matrix(zoom, zoom)
         mat.prerotate(self.rotation)
         pix = page.get_pixmap(matrix=mat)
         img = Image.frombytes('RGB', [pix.width, pix.height], pix.samples)
-        if self.fit_to_window.get():
+        
+        self._pdf_scale = zoom
+        
+        if self.fit_mode.get() == 'fit_page':
             img_ratio = img.width / img.height
             canvas_ratio = canvas_width / canvas_height
             if img_ratio > canvas_ratio:
@@ -755,74 +1318,166 @@ class PDFReaderApp(tk.Tk):
                 new_height = canvas_height
                 new_width = int(canvas_height * img_ratio)
             img = img.resize((new_width, new_height), Image.LANCZOS)
-            self._pdf_scale = new_width / page_rect.width
-            self._pdf_offset_x = (canvas_width - new_width) // 2
-            self._pdf_offset_y = (canvas_height - new_height) // 2
             self._pdf_render_width = new_width
             self._pdf_render_height = new_height
-            self.images = [ImageTk.PhotoImage(img)]
             self.canvas.config(scrollregion=(0,0,new_width,new_height))
             self.canvas.delete('pdf_image')
             self.canvas.delete('annotation')
-            self.canvas.create_image(canvas_width//2, canvas_height//2, image=self.images[0], anchor='center', tags='pdf_image')
-            self.canvas.config(xscrollcommand=self.h_scroll.set, yscrollcommand=self.v_scroll.set)
+            self.canvas.delete('search_highlight')
+            # Create and store photo image reference BEFORE using it
+            photo = ImageTk.PhotoImage(img)
+            self.images = [photo]  # Keep reference to prevent garbage collection
+            self.canvas.create_image(canvas_width//2, canvas_height//2, image=photo, anchor='center', tags='pdf_image')
             self.h_scroll.grid_remove()
             self.v_scroll.grid_remove()
         else:
-            self._pdf_scale = zoom
-            # Calculate offsets for centering
-            self._pdf_offset_x = (canvas_width - img.width) // 2
-            self._pdf_offset_y = (canvas_height - img.height) // 2
             self._pdf_render_width = img.width
             self._pdf_render_height = img.height
-            self.images = [ImageTk.PhotoImage(img)]
-            
-            # Set scrollregion to include PDF content plus centering space
-            # This allows the PDF to be centered in the canvas
             scroll_width = max(img.width, canvas_width)
             scroll_height = max(img.height, canvas_height)
-            
-            # Add padding to center the PDF
             if img.width < canvas_width:
                 scroll_width = canvas_width
             if img.height < canvas_height:
                 scroll_height = canvas_height
-            
             self.canvas.config(scrollregion=(0, 0, scroll_width, scroll_height))
             self.canvas.delete('pdf_image')
             self.canvas.delete('annotation')
-            
-            # Position image at center of scroll region
+            self.canvas.delete('search_highlight')
             center_x = scroll_width // 2
             center_y = scroll_height // 2
-            self.canvas.create_image(center_x, center_y, image=self.images[0], anchor='center', tags='pdf_image')
-            
-            self.canvas.xview_moveto(0.0)
-            self.canvas.yview_moveto(0.0)
-            
+            # Create and store photo image reference BEFORE using it
+            photo = ImageTk.PhotoImage(img)
+            self.images = [photo]  # Keep reference to prevent garbage collection
+            self.canvas.create_image(center_x, center_y, image=photo, anchor='center', tags='pdf_image')
             self.h_scroll.grid()
             self.v_scroll.grid()
-        # Render annotations on the canvas
+        
+        # Update canvas configuration
+        self.canvas.config(xscrollcommand=self.h_scroll.set, yscrollcommand=self.v_scroll.set)
+        
+        # Force canvas update to ensure image is displayed
+        self.canvas.update_idletasks()
         self._render_annotations()
+    
+    def _show_continuous_scroll(self):
+        """Display continuous scroll view (browser-like)"""
+        canvas_width = self.canvas.winfo_width()
+        canvas_height = self.canvas.winfo_height()
+        if canvas_width < 10 or canvas_height < 10:
+            return
+
+        # Calculate zoom based on fit mode for width
+        try:
+            with MuPDFErrorSuppressor():
+                first_page = self.pdf_doc.load_page(0)
+                page_rect = first_page.rect
+        except Exception:
+            return
+
+        if self.fit_mode.get() == 'fit_width':
+            zoom = canvas_width / page_rect.width
+        elif self.fit_mode.get() == 'fit_page':
+            zoom = canvas_width / page_rect.width
+        elif self.fit_mode.get() == 'fit_height':
+            zoom = canvas_height / page_rect.height
+        else:  # actual_size
+            zoom = self.zoom
+
+        state = (canvas_width, canvas_height, self.fit_mode.get(), self.zoom, self.rotation, len(self.pdf_doc))
+        if self._continuous_render_state == state and self.images:
+            self._render_annotations_continuous()
+            if self._page_heights:
+                self._render_search_highlights()
+            self.after(100, self._update_page_from_scroll)
+            return
+
+        self._continuous_render_state = state
+        self._continuous_render_id += 1
+        render_id = self._continuous_render_id
+
+        self.canvas.delete('pdf_image')
+        self.canvas.delete('annotation')
+        self.canvas.delete('search_highlight')
+        self.status.config(text='Rendering pages...')
+        self._is_rendering = True
+
+        def worker():
+            images = []
+            page_heights = []
+            total_height = 0
+            for page_num in range(len(self.pdf_doc)):
+                try:
+                    with MuPDFErrorSuppressor():
+                        page = self.pdf_doc.load_page(page_num)
+                        mat = fitz.Matrix(zoom, zoom)
+                        mat.prerotate(self.rotation)
+                        pix = page.get_pixmap(matrix=mat)
+                        img = Image.frombytes('RGB', [pix.width, pix.height], pix.samples)
+                    images.append((page_num, img))
+                    page_heights.append(img.height)
+                    total_height += img.height + 10
+                except Exception:
+                    continue
+            if self._app_running:
+                try:
+                    self.after(0, lambda: self._apply_continuous_render(render_id, images, page_heights, total_height, zoom, page_rect.width))
+                except RuntimeError:
+                    pass
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_continuous_render(self, render_id, images, page_heights, total_height, zoom, page_width):
+        if render_id != self._continuous_render_id:
+            return
+        canvas_width = self.canvas.winfo_width()
+        self.canvas.delete('pdf_image')
+        self.canvas.delete('annotation')
+        self.canvas.delete('search_highlight')
+        self.images = []
+        y_offset = 0
+        for page_num, img in images:
+            photo = ImageTk.PhotoImage(img)
+            self.images.append(photo)
+            y_pos = y_offset + (img.height // 2)
+            self.canvas.create_image(canvas_width // 2, y_pos, image=photo, anchor='center',
+                                     tags=('pdf_image', f'page_{page_num}'))
+            if page_num < len(images) - 1:
+                line_y = y_offset + img.height
+                self.canvas.create_line(0, line_y, canvas_width, line_y, fill='#444', width=1, tags='pdf_image')
+            y_offset += img.height + 10
+
+        self._page_heights = page_heights
+        self._continuous_zoom = zoom
+        scroll_width = max(canvas_width, int(page_width * zoom))
+        self.canvas.config(scrollregion=(0, 0, scroll_width, max(total_height, 1)))
+        self.canvas.config(xscrollcommand=self.h_scroll.set, yscrollcommand=self.v_scroll.set)
+        self.h_scroll.grid()
+        self.v_scroll.grid()
+        self._render_annotations_continuous()
+        if self._page_heights:
+            self._render_search_highlights()
+        self.after(100, self._update_page_from_scroll)
+        self._is_rendering = False
+    
+    def _update_page_from_scroll(self):
+        """Update current_page based on scroll position in continuous mode"""
+        if self.view_mode.get() != 'continuous_scroll' or not hasattr(self, '_page_heights'):
+            return
         
-        # Reset scroll position tracking for new pages
-        self._last_scroll_x = 0
-        self._last_scroll_y = 0
-        
-        self.page_entry_var.set(str(self.current_page+1))
-        self.page_total_label.config(text=f'/ {len(self.pdf_doc)}')
-        fname = self.pdf_doc.name if hasattr(self.pdf_doc, 'name') else ''
-        # Get current focus widget for debugging
-        focused_widget = self.focus_get()
-        focus_info = f"Focus: {type(focused_widget).__name__}" if focused_widget else "Focus: None"
-        self.status.config(text=f'{os.path.basename(fname)} | Page {self.current_page+1}/{len(self.pdf_doc)} | Zoom: {int(self.zoom*100)}% | Rotation: {self.rotation}° | Fit: {"ON" if self.fit_to_window.get() else "OFF"} | {focus_info}')
-        
-        # Update page entry to reflect current page (only if not focused to avoid interference)
-        if hasattr(self, 'page_entry_var') and self.pdf_doc and not self._page_entry_has_focus:
-            self.page_entry_var.set(str(self.current_page + 1))
-        
-        for idx, widget in enumerate(self.thumbnail_frame.winfo_children()):
-            self._update_thumbnail_highlight(widget, idx)
+        try:
+            scroll_y = self.canvas.canvasy(0)
+            cumulative = 0
+            for i, height in enumerate(self._page_heights):
+                if scroll_y < cumulative + height:
+                    if self.current_page != i:
+                        self.current_page = i
+                        self.page_entry_var.set(str(i + 1))
+                        for idx, widget in enumerate(self.thumbnail_frame.winfo_children()):
+                            self._update_thumbnail_highlight(widget, idx)
+                    break
+                cumulative += height + 10
+        except:
+            pass
 
     def prev_page(self):
         if self.pdf_doc and self.current_page > 0:
@@ -901,12 +1556,36 @@ class PDFReaderApp(tk.Tk):
             self.after(500, lambda: self.page_entry.configure(bg='#2d3142'))
 
     def change_zoom(self, factor):
-        if self.pdf_doc:
-            if self.fit_to_window.get():
-                self.fit_to_window.set(False)
-            self.zoom *= factor
-            self.zoom = max(0.1, min(self.zoom, 10.0))
-            self.show_page()  # Always update page and mapping after zoom
+        if not self.pdf_doc:
+            return
+        # Switch to actual size for manual zoom
+        if self.fit_mode.get() != 'actual_size':
+            self.fit_mode.set('actual_size')
+            if hasattr(self, '_fit_mode_display'):
+                self._fit_mode_display.set('Actual Size')
+                if hasattr(self, 'fit_mode_menu'):
+                    self.fit_mode_menu.set('Actual Size')
+        self.zoom *= factor
+        self.zoom = max(0.1, min(self.zoom, 10.0))
+        self.show_page()  # Always update page and mapping after zoom
+
+    def _on_ctrl_mousewheel_zoom(self, event):
+        """Handle Ctrl+MouseWheel for zoom"""
+        if not self.pdf_doc:
+            return
+        if event.delta > 0 or (hasattr(event, 'num') and event.num == 4):
+            self.change_zoom(1.1)
+        elif event.delta < 0 or (hasattr(event, 'num') and event.num == 5):
+            self.change_zoom(0.9)
+    
+    def _on_ctrl_mousewheel_zoom(self, event):
+        """Handle Ctrl+MouseWheel for zoom"""
+        if not self.pdf_doc:
+            return
+        if event.delta > 0 or (hasattr(event, 'num') and event.num == 4):
+            self.change_zoom(1.1)
+        elif event.delta < 0 or (hasattr(event, 'num') and event.num == 5):
+            self.change_zoom(0.9)
 
     def rotate_page(self):
         if self.pdf_doc:
@@ -914,7 +1593,7 @@ class PDFReaderApp(tk.Tk):
             self.show_page()
 
     def annotate_placeholder(self):
-        messagebox.showinfo('Annotation', 'Annotation tools coming soon!')
+        SweetAlert2.info(self, 'Annotation tools coming soon!', 'Annotation')
 
     def _on_resize(self, event):
         # Debounce: only redraw after resizing stops for 200ms to reduce redraws
@@ -924,6 +1603,10 @@ class PDFReaderApp(tk.Tk):
 
     def _debounced_resize(self):
         self._resize_after_id = None
+        # Avoid heavy re-render during active rendering
+        if self._is_rendering:
+            self._resize_after_id = self.after(150, self._debounced_resize)
+            return
         self.show_page()
         self.thumbnail_canvas.configure(scrollregion=self.thumbnail_canvas.bbox('all'))
 
@@ -935,8 +1618,71 @@ class PDFReaderApp(tk.Tk):
             pass
 
     def toggle_fit(self):
-        self.fit_to_window.set(not self.fit_to_window.get())
+        # Toggle between fit_page and actual_size
+        if self.fit_mode.get() == 'fit_page':
+            self.fit_mode.set('actual_size')
+            if hasattr(self, '_fit_mode_display'):
+                self._fit_mode_display.set('Actual Size')
+                self.fit_mode_menu.set('Actual Size')
+        else:
+            self.fit_mode.set('fit_page')
+            if hasattr(self, '_fit_mode_display'):
+                self._fit_mode_display.set('Fit Page')
+                self.fit_mode_menu.set('Fit Page')
         self.show_page()  # Always update page and mapping after fit toggle
+    
+    def _on_fit_mode_change(self):
+        """Handle fit mode change from menu"""
+        # Map internal values to display values for combobox
+        internal_to_display = {
+            'fit_page': 'Fit Page',
+            'fit_width': 'Fit Width',
+            'fit_height': 'Fit Height',
+            'actual_size': 'Actual Size'
+        }
+        internal_value = self.fit_mode.get()
+        display_value = internal_to_display.get(internal_value, 'Fit Page')
+        self._fit_mode_display.set(display_value)
+        self.fit_mode_menu.set(display_value)
+        self.show_page()
+    
+    def _on_fit_mode_change_combo(self):
+        """Handle fit mode change from combobox"""
+        # Map combobox display values to internal values
+        display_to_internal = {
+            'Fit Page': 'fit_page',
+            'Fit Width': 'fit_width',
+            'Fit Height': 'fit_height',
+            'Actual Size': 'actual_size'
+        }
+        display_value = self._fit_mode_display.get()
+        internal_value = display_to_internal.get(display_value, 'fit_page')
+        self.fit_mode.set(internal_value)
+        self.show_page()
+    
+    def _toggle_view_mode(self):
+        """Toggle between single page and continuous scroll"""
+        if self.view_mode.get() == 'single_page':
+            self.view_mode.set('continuous_scroll')
+        else:
+            self.view_mode.set('single_page')
+        self.show_page()
+    
+    def _on_view_mode_change(self):
+        """Handle view mode change from menu"""
+        self.show_page()
+    
+    def _switch_sidebar_tab(self):
+        """Switch between thumbnails and bookmarks in sidebar"""
+        if self.sidebar_tab.get() == 'thumbnails':
+            self.thumbnails_container.pack(fill='both', expand=True)
+            self.bookmarks_container.pack_forget()
+        else:
+            self.thumbnails_container.pack_forget()
+            self.bookmarks_container.pack(fill='both', expand=True)
+            if not hasattr(self, '_bookmarks_loaded'):
+                self._load_bookmarks()
+                self._bookmarks_loaded = True
 
     def focus_page_entry(self):
         self._page_entry_has_focus = True
@@ -1028,24 +1774,24 @@ class PDFReaderApp(tk.Tk):
 
     def save_as(self):
         if not self.pdf_doc:
-            messagebox.showwarning('No PDF', 'No PDF loaded.')
+            SweetAlert2.warning(self, 'No PDF loaded.', 'No PDF')
             return
         file_path = filedialog.asksaveasfilename(defaultextension='.pdf', filetypes=[('PDF Files', '*.pdf')])
         if file_path:
             self.pdf_doc.save(file_path)
             self._current_pdf_path = file_path  # Update current file path
-            messagebox.showinfo('Saved', f'Saved as {file_path}')
+            SweetAlert2.success(self, f'Saved as:\n\n{file_path}', 'Saved')
 
     def export_image(self):
         if not self.pdf_doc:
-            messagebox.showwarning('No PDF', 'No PDF loaded.')
+            SweetAlert2.warning(self, 'No PDF loaded.', 'No PDF')
             return
         file_path = filedialog.asksaveasfilename(defaultextension='.png', filetypes=[('PNG Image', '*.png')])
         if file_path:
             page = self.pdf_doc.load_page(self.current_page)
             pix = page.get_pixmap()
             pix.save(file_path)
-            messagebox.showinfo('Exported', f'Page exported as {file_path}')
+            SweetAlert2.success(self, f'Page exported as:\n\n{file_path}', 'Exported')
 
     # Undo/redo methods removed as requested
 
@@ -1178,8 +1924,12 @@ class PDFReaderApp(tk.Tk):
         self.canvas.delete('annotation')
             
         try:
-            page = self.pdf_doc.load_page(self.current_page)
-            annotations = list(page.annots())  # Convert to list once for performance
+            with MuPDFErrorSuppressor():
+                page = self.pdf_doc.load_page(self.current_page)
+                annotations = list(page.annots())  # Convert to list once for performance
+        except Exception:
+            # Page might be corrupted, skip annotations
+            return
             
             # Limit annotations to prevent lag on pages with many annotations
             if len(annotations) > 50:
@@ -1245,6 +1995,9 @@ class PDFReaderApp(tk.Tk):
                 )
         except Exception:
             pass
+        
+        # Render search highlights after annotations
+        self._render_search_highlights()
 
     def set_annotation_mode(self, mode):
         """Set the current annotation mode and configure UI accordingly."""
@@ -1519,7 +2272,11 @@ class PDFReaderApp(tk.Tk):
 
     def _erase_annot(self, event):
         # Find and delete annotation under cursor (improved hit-test for ink)
-        page = self.pdf_doc.load_page(self.current_page)
+        try:
+            with MuPDFErrorSuppressor():
+                page = self.pdf_doc.load_page(self.current_page)
+        except Exception:
+            return
         try:
             x = self.canvas.canvasx(self.winfo_pointerx() - self.canvas.winfo_rootx())
             y = self.canvas.canvasy(self.winfo_pointery() - self.canvas.winfo_rooty())
@@ -1597,6 +2354,408 @@ class PDFReaderApp(tk.Tk):
         proj_x = x0 + t * dx
         proj_y = y0 + t * dy
         return hypot(px - proj_x, py - proj_y)
+    
+    # --- Search/Find Functionality ---
+    def show_find_dialog(self):
+        """Show find/search dialog"""
+        if not self.pdf_doc:
+            SweetAlert2.warning(self, 'No PDF loaded.', 'No PDF')
+            return
+        
+        if not hasattr(self, '_find_dialog') or self._find_dialog is None or not self._find_dialog.winfo_exists():
+            self._find_dialog = tk.Toplevel(self)
+            self._find_dialog.title('Find in PDF')
+            self._find_dialog.configure(bg=BG_COLOR)
+            self._find_dialog.resizable(False, False)
+            try:
+                self._find_dialog.iconbitmap(ICON_PATH)
+            except:
+                pass
+            
+            self._find_dialog.transient(self)
+            self._find_dialog.grab_set()
+            
+            # Size dialog based on content (avoid clipping)
+            self._find_dialog.update_idletasks()
+            self._find_dialog.minsize(420, 200)
+            
+            # Find input
+            find_frame = tk.Frame(self._find_dialog, bg=BG_COLOR)
+            find_frame.pack(padx=16, pady=16, fill='x')
+            
+            tk.Label(find_frame, text='Find:', bg=BG_COLOR, fg=FG_COLOR, font=FONT).pack(side='left', padx=(0, 8))
+            
+            self._find_entry_var = tk.StringVar()
+            self._find_entry = tk.Entry(find_frame, textvariable=self._find_entry_var, font=FONT, width=30,
+                                       bg=TOOLBAR_COLOR, fg=FG_COLOR, insertbackground=FG_COLOR)
+            self._find_entry.pack(side='left', fill='x', expand=True, padx=(0, 8))
+            self._find_entry.focus_set()
+            self._find_entry.bind('<Return>', lambda e: self._do_search())
+            self._find_entry.bind('<KeyRelease>', lambda e: self._on_find_text_change())
+            
+            # Search button
+            tk.Button(find_frame, text='Find', command=self._do_search, bg=ACCENT_COLOR, fg='white',
+                     font=FONT, relief='flat', padx=12).pack(side='left')
+            
+            # Result label
+            self._find_result_label = tk.Label(self._find_dialog, text='', bg=BG_COLOR, fg=ACCENT_COLOR, font=FONT_SMALL)
+            self._find_result_label.pack(padx=16, pady=(0, 8))
+            
+            # Navigation buttons
+            nav_frame = tk.Frame(self._find_dialog, bg=BG_COLOR)
+            nav_frame.pack(padx=16, pady=(0, 16))
+            
+            tk.Button(nav_frame, text='Previous', command=self.find_previous, bg=TOOLBAR_COLOR, fg=FG_COLOR,
+                     font=FONT_SMALL, relief='flat', padx=12).pack(side='left', padx=4)
+            tk.Button(nav_frame, text='Next', command=self.find_next, bg=TOOLBAR_COLOR, fg=FG_COLOR,
+                     font=FONT_SMALL, relief='flat', padx=12).pack(side='left', padx=4)
+            tk.Button(nav_frame, text='Close', command=self._find_dialog.destroy, bg=TOOLBAR_COLOR, fg=FG_COLOR,
+                     font=FONT_SMALL, relief='flat', padx=12).pack(side='left', padx=4)
+            
+            self._find_dialog.bind('<Escape>', lambda e: self._find_dialog.destroy())
+
+            # Final size and center
+            self._find_dialog.update_idletasks()
+            req_w = max(460, self._find_dialog.winfo_reqwidth())
+            req_h = max(240, self._find_dialog.winfo_reqheight())
+            screen_w = self._find_dialog.winfo_screenwidth()
+            screen_h = self._find_dialog.winfo_screenheight()
+            x = max(0, (screen_w // 2) - (req_w // 2))
+            y = max(0, (screen_h // 2) - (req_h // 2))
+            self._find_dialog.geometry(f'{req_w}x{req_h}+{x}+{y}')
+        else:
+            self._find_dialog.lift()
+            self._find_dialog.focus_set()
+            self._find_entry.focus_set()
+    
+    def _on_find_text_change(self):
+        """Handle text change in find dialog"""
+        self._search_results = []
+        self._current_search_index = -1
+        self.canvas.delete('search_highlight')
+    
+    def _do_search(self):
+        """Perform search in PDF"""
+        search_text = self._find_entry_var.get().strip()
+        if not search_text:
+            return
+        
+        self._search_results = []
+        self._current_search_index = -1
+        
+        # Search through all pages
+        for page_num in range(len(self.pdf_doc)):
+            try:
+                with MuPDFErrorSuppressor():
+                    page = self.pdf_doc.load_page(page_num)
+                    text_instances = page.search_for(search_text)
+            except Exception:
+                # Skip corrupted pages
+                continue
+            
+            for rect in text_instances:
+                self._search_results.append({
+                    'page': page_num,
+                    'rect': rect
+                })
+        
+        if self._search_results:
+            self._current_search_index = 0
+            self.find_next()
+            self._find_result_label.config(text=f'Found {len(self._search_results)} result(s)')
+        else:
+            self._find_result_label.config(text='No results found')
+            self.canvas.delete('search_highlight')
+    
+    def find_next(self):
+        """Navigate to next search result"""
+        if not self._search_results:
+            self._do_search()
+            return
+        
+        if self._current_search_index >= 0:
+            self._current_search_index = (self._current_search_index + 1) % len(self._search_results)
+        else:
+            self._current_search_index = 0
+        
+        self._navigate_to_search_result()
+    
+    def find_previous(self):
+        """Navigate to previous search result"""
+        if not self._search_results:
+            self._do_search()
+            return
+        
+        if self._current_search_index >= 0:
+            self._current_search_index = (self._current_search_index - 1) % len(self._search_results)
+        else:
+            self._current_search_index = len(self._search_results) - 1
+        
+        self._navigate_to_search_result()
+    
+    def _navigate_to_search_result(self):
+        """Navigate to current search result"""
+        if not self._search_results or self._current_search_index < 0:
+            return
+        
+        result = self._search_results[self._current_search_index]
+        page_num = result['page']
+        
+        # Go to page
+        if page_num != self.current_page:
+            self.current_page = page_num
+            self.show_page()
+        
+        # Highlight the result
+        self._render_search_highlights()
+        
+        # Scroll to result
+        rect = result['rect']
+        if self.view_mode.get() == 'continuous_scroll':
+            # Calculate Y position in continuous scroll
+            cumulative_height = sum(self._page_heights[:page_num]) + (page_num * 10)
+            result_y = cumulative_height + (rect.y0 * self._continuous_zoom)
+            canvas_height = self.canvas.winfo_height()
+            scroll_y = max(0, result_y - canvas_height // 2)
+            scroll_pos = scroll_y / max(1, self.canvas.cget('scrollregion').split()[3])
+            self.canvas.yview_moveto(scroll_pos)
+        else:
+            # Center the result in single page view
+            cx, cy = self.pdf_to_canvas(rect.x0 + (rect.x1 - rect.x0) / 2, rect.y0 + (rect.y1 - rect.y0) / 2)
+            canvas_height = self.canvas.winfo_height()
+            scroll_y = max(0, cy - canvas_height // 2)
+            self.canvas.yview_moveto(scroll_y / max(1, int(self.canvas.cget('scrollregion').split()[3])))
+        
+        # Update result label
+        if hasattr(self, '_find_result_label'):
+            self._find_result_label.config(text=f'Result {self._current_search_index + 1} of {len(self._search_results)}')
+    
+    def _render_search_highlights(self):
+        """Render search result highlights"""
+        self.canvas.delete('search_highlight')
+        
+        if not self._search_results:
+            return
+        
+        # Highlight all results in gray
+        for i, result in enumerate(self._search_results):
+            if result['page'] == self.current_page or (self.view_mode.get() == 'continuous_scroll'):
+                rect = result['rect']
+                page_num = result['page']
+                
+                if self.view_mode.get() == 'continuous_scroll':
+                    # Convert to canvas coordinates in continuous mode
+                    if not hasattr(self, '_page_heights') or page_num >= len(self._page_heights):
+                        continue
+                    try:
+                        page_rect = self.pdf_doc[page_num].rect
+                    except Exception:
+                        continue
+                    cumulative_height = sum(self._page_heights[:page_num]) + (page_num * 10)
+                    x0 = (self.canvas.winfo_width() // 2) - (rect.width * self._continuous_zoom / 2) + ((rect.x0 - page_rect.x0) * self._continuous_zoom)
+                    y0 = cumulative_height + ((rect.y0 - page_rect.y0) * self._continuous_zoom)
+                    x1 = x0 + (rect.width * self._continuous_zoom)
+                    y1 = y0 + (rect.height * self._continuous_zoom)
+                else:
+                    x0, y0 = self.pdf_to_canvas(rect.x0, rect.y0)
+                    x1, y1 = self.pdf_to_canvas(rect.x1, rect.y1)
+                
+                # Highlight current result differently
+                if i == self._current_search_index:
+                    outline_color = '#ffd400'  # Yellow for current
+                    width = 3
+                    fill_color = ''
+                    stipple = ''
+                else:
+                    outline_color = '#ffd400'
+                    width = 2
+                    fill_color = '#fff3a0'  # Light yellow
+                    stipple = 'gray25'
+                
+                self.canvas.create_rectangle(
+                    x0, y0, x1, y1,
+                    outline=outline_color,
+                    width=width,
+                    fill=fill_color,
+                    stipple=stipple,
+                    tags='search_highlight'
+                )
+    
+    # --- Bookmarks/Outline Functionality ---
+    def _load_bookmarks(self):
+        """Load PDF bookmarks/outline"""
+        for widget in self.bookmarks_frame.winfo_children():
+            widget.destroy()
+        
+        if not self.pdf_doc:
+            return
+        
+        try:
+            with MuPDFErrorSuppressor():
+                toc = self.pdf_doc.get_toc()
+            if not toc:
+                tk.Label(self.bookmarks_frame, text='No bookmarks available', bg=SIDEBAR_COLOR, 
+                        fg=FG_COLOR, font=FONT_SMALL).pack(pady=20)
+                return
+            
+            self._render_bookmark_items(toc, 0)
+            self.bookmarks_canvas.configure(scrollregion=self.bookmarks_canvas.bbox('all'))
+        except Exception:
+            tk.Label(self.bookmarks_frame, text='No bookmarks available', bg=SIDEBAR_COLOR, 
+                    fg=FG_COLOR, font=FONT_SMALL).pack(pady=20)
+    
+    def _render_bookmark_items(self, items, level, parent_frame=None):
+        """Recursively render bookmark items"""
+        frame = parent_frame if parent_frame else self.bookmarks_frame
+        
+        for item in items:
+            level_num, title, page_num = item
+            
+            # Create bookmark item
+            item_frame = tk.Frame(frame, bg=SIDEBAR_COLOR)
+            item_frame.pack(fill='x', padx=(level * 12, 4), pady=2)
+            
+            # Bookmark button
+            btn = tk.Label(item_frame, text=title, bg=SIDEBAR_COLOR, fg=FG_COLOR, 
+                          font=('Segoe UI', 9 if level == 1 else 8), anchor='w', cursor='hand2')
+            btn.pack(side='left', fill='x', expand=True, padx=4)
+            btn.bind('<Button-1>', lambda e, p=page_num-1: self.go_to_page(p))
+            btn.bind('<Button-3>', lambda e, item_ref=item: self._show_bookmark_context_menu(e, item_ref))  # Right-click
+            btn.bind('<Enter>', lambda e, b=btn: b.config(bg=BUTTON_ACTIVE))
+            btn.bind('<Leave>', lambda e, b=btn: b.config(bg=SIDEBAR_COLOR))
+            
+            # Page number
+            page_label = tk.Label(item_frame, text=str(page_num), bg=SIDEBAR_COLOR, 
+                                 fg=ACCENT_COLOR, font=('Segoe UI', 8))
+            page_label.pack(side='right', padx=4)
+            page_label.bind('<Button-1>', lambda e, p=page_num-1: self.go_to_page(p))
+            page_label.bind('<Button-3>', lambda e, item_ref=item: self._show_bookmark_context_menu(e, item_ref))
+            
+            # Handle nested items (if any)
+            if len(item) > 3 and isinstance(item[3], list):
+                self._render_bookmark_items(item[3], level + 1, item_frame)
+    
+    def _show_bookmark_context_menu(self, event, bookmark_item):
+        """Show context menu for bookmark (right-click)"""
+        menu = tk.Menu(self, tearoff=0, bg=TOOLBAR_COLOR, fg=FG_COLOR, 
+                      activebackground=BUTTON_ACTIVE, activeforeground=FG_COLOR)
+        menu.add_command(label='Go to Page', command=lambda: self.go_to_page(bookmark_item[2] - 1))
+        menu.add_command(label='Add Bookmark (Current Page)', command=self._add_bookmark)
+        menu.add_command(label='Delete Bookmark', command=lambda: self._delete_bookmark(bookmark_item))
+        menu.add_separator()
+        menu.add_command(label='Export Bookmarks...', command=self._export_bookmarks)
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+    
+    def _export_bookmarks(self):
+        """Export bookmarks to a text file"""
+        if not self.pdf_doc:
+            SweetAlert2.warning(self, 'No PDF loaded.', 'No PDF')
+            return
+        try:
+            file_path = filedialog.asksaveasfilename(
+                defaultextension='.txt',
+                filetypes=[('Text Files', '*.txt'), ('All Files', '*.*')],
+                title='Export Bookmarks'
+            )
+            if file_path:
+                with MuPDFErrorSuppressor():
+                    toc = self.pdf_doc.get_toc()
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    for item in toc:
+                        level, title, page = item
+                        indent = '  ' * (level - 1)
+                        f.write(f'{indent}{title} (Page {page})\n')
+                SweetAlert2.success(self, f'Bookmarks exported to:\n\n{file_path}', 'Export Successful')
+        except Exception as e:
+            SweetAlert2.error(self, f'Error exporting bookmarks:\n\n{str(e)}', 'Export Error')
+
+    def _add_bookmark(self):
+        """Add a bookmark for the current page."""
+        if not self.pdf_doc:
+            SweetAlert2.warning(self, 'No PDF loaded.', 'No PDF')
+            return
+        title = SweetAlert2.prompt(self, 'Enter bookmark title:', 'Add Bookmark', f'Page {self.current_page + 1}')
+        if not title:
+            return
+        try:
+            with MuPDFErrorSuppressor():
+                toc = self.pdf_doc.get_toc() or []
+                toc.append([1, title, self.current_page + 1])
+                self.pdf_doc.set_toc(toc)
+            self._save_pdf_safe(show_message=False)
+            self._load_bookmarks()
+            SweetAlert2.success(self, f'Bookmark added:\n\n{title}', 'Bookmark Added')
+        except Exception as e:
+            SweetAlert2.error(self, f'Error adding bookmark:\n\n{str(e)}', 'Bookmark Error')
+
+    def _delete_bookmark(self, bookmark_item):
+        """Delete a bookmark from the PDF."""
+        if not self.pdf_doc:
+            SweetAlert2.warning(self, 'No PDF loaded.', 'No PDF')
+            return
+        try:
+            with MuPDFErrorSuppressor():
+                toc = self.pdf_doc.get_toc() or []
+            new_toc = [item for item in toc if item != bookmark_item]
+            if len(new_toc) == len(toc):
+                SweetAlert2.warning(self, 'Bookmark not found.', 'Bookmark')
+                return
+            with MuPDFErrorSuppressor():
+                self.pdf_doc.set_toc(new_toc)
+            self._save_pdf_safe(show_message=False)
+            self._load_bookmarks()
+            SweetAlert2.success(self, 'Bookmark deleted.', 'Bookmark Deleted')
+        except Exception as e:
+            SweetAlert2.error(self, f'Error deleting bookmark:\n\n{str(e)}', 'Bookmark Error')
+    
+    def _render_annotations_continuous(self):
+        """Render annotations in continuous scroll mode"""
+        if not self.pdf_doc:
+            return
+        
+        # Render annotations for all visible pages (simplified - render all for now)
+        for page_num in range(len(self.pdf_doc)):
+            try:
+                with MuPDFErrorSuppressor():
+                    page = self.pdf_doc.load_page(page_num)
+                    annotations = list(page.annots())
+            except Exception:
+                # Skip corrupted pages
+                continue
+                
+                cumulative_height = sum(self._page_heights[:page_num]) + (page_num * 10)
+                page_top = cumulative_height - (self._page_heights[page_num] // 2)
+                
+                for annot in annotations[:20]:  # Limit for performance
+                    rect = annot.rect
+                    
+                    # Convert to canvas coordinates
+                    x0 = (self.canvas.winfo_width() // 2) - (rect.width * self._continuous_zoom / 2) + ((rect.x0 - page.rect.x0) * self._continuous_zoom)
+                    y0 = page_top + ((rect.y0 - page.rect.y0) * self._continuous_zoom)
+                    x1 = x0 + (rect.width * self._continuous_zoom)
+                    y1 = y0 + (rect.height * self._continuous_zoom)
+                    
+                    if annot.type[0] == fitz.PDF_ANNOT_INK:
+                        if hasattr(annot, 'stroke') and annot.stroke:
+                            canvas_points = []
+                            for stroke in annot.stroke[:1]:  # Limit for performance
+                                for point in stroke[::max(1, len(stroke)//50)]:
+                                    px = (self.canvas.winfo_width() // 2) - (rect.width * self._continuous_zoom / 2) + ((point.x - page.rect.x0) * self._continuous_zoom)
+                                    py = page_top + ((point.y - page.rect.y0) * self._continuous_zoom)
+                                    canvas_points.extend([px, py])
+                            if canvas_points:
+                                color = '#ff0000'
+                                if hasattr(annot, 'colors') and annot.colors:
+                                    stroke_color = annot.colors.get('stroke')
+                                    if stroke_color:
+                                        color = self._rgb01_to_hex(stroke_color)
+                                width = max(1, int(annot.border.get('width', 2) * self._continuous_zoom)) if hasattr(annot, 'border') and annot.border else 2
+                                self.canvas.create_line(canvas_points, fill=color, width=width, tags='annotation')
+            except:
+                pass
 
 
 
@@ -1762,9 +2921,14 @@ class PDFReaderApp(tk.Tk):
             ('Zoom In', 'Ctrl++, +, ='),
             ('Zoom Out', 'Ctrl+-, -'),
             ('Rotate', 'R'),
-            ('Fit to Window', 'F, Ctrl+F'),
+            ('Fit to Width', 'View > Fit to Width'),
+            ('Fit to Height', 'View > Fit to Height'),
+            ('Actual Size', 'View > Actual Size'),
             ('Go to Page', 'G, Enter'),
-            ('Toggle Sidebar', 'S, Ctrl+B, Esc'),
+            ('Toggle Sidebar', 'Ctrl+Shift+T'),
+            ('Find Text', 'Ctrl+F'),
+            ('Find Next', 'F3'),
+            ('Find Previous', 'Shift+F3'),
             # ('Highlight', 'Annotate > Highlight'),
             ('Draw', 'Annotate > Draw'),
             # ('Text Note', 'Annotate > Text Note'),
@@ -1795,50 +2959,141 @@ class PDFReaderApp(tk.Tk):
             tk.Label(scroll_frame, text=keys, bg=BG_COLOR, fg=ACCENT_COLOR, font=FONT_BOLD, anchor='e').grid(row=i, column=1, sticky='e', pady=2, padx=4)
         tk.Button(top, text='Close', command=top.destroy, bg=TOOLBAR_COLOR, fg=FG_COLOR, font=FONT, relief='flat').pack(pady=12)
 
+    def run_diagnostics(self):
+        """Run automated diagnostics for core functionality."""
+        results = []
+
+        def record(name, ok, details=''):
+            status = 'PASS' if ok else 'FAIL'
+            results.append(f"{status}: {name}{' - ' + details if details else ''}")
+
+        # Ensure a PDF is loaded (UI thread)
+        pdf_path = None
+        if not self.pdf_doc:
+            pdf_path = filedialog.askopenfilename(filetypes=[('PDF Files', '*.pdf')])
+            if not pdf_path:
+                SweetAlert2.warning(self, 'Diagnostics cancelled. No PDF selected.', 'Diagnostics')
+                return
+
+        SweetAlert2.info(self, 'Running diagnostics...\nThis may take a few seconds.', 'Diagnostics')
+
+        def worker():
+            try:
+                if not self.pdf_doc and pdf_path:
+                    try:
+                        self.open_pdf(pdf_path)
+                        record('Open PDF', True)
+                    except Exception as e:
+                        record('Open PDF', False, str(e))
+                        self.after(0, lambda: SweetAlert2.error(self, 'Diagnostics failed: PDF open error.', 'Diagnostics'))
+                        return
+
+                if not self.pdf_doc or len(self.pdf_doc) == 0:
+                    record('PDF Loaded', False, 'No readable pages')
+                    self.after(0, lambda: SweetAlert2.error(self, 'Diagnostics failed: No readable PDF pages.', 'Diagnostics'))
+                    return
+
+                # Background-safe checks (no UI calls)
+                try:
+                    with MuPDFErrorSuppressor():
+                        _ = self.pdf_doc.load_page(0)
+                    record('Load First Page', True)
+                except Exception as e:
+                    record('Load First Page', False, str(e))
+
+                try:
+                    with MuPDFErrorSuppressor():
+                        toc = self.pdf_doc.get_toc()
+                    record('Get Bookmarks', True if toc is not None else False)
+                except Exception as e:
+                    record('Get Bookmarks', False, str(e))
+
+                try:
+                    with MuPDFErrorSuppressor():
+                        page = self.pdf_doc.load_page(self.current_page)
+                        rects = page.search_for('the')
+                    record('Search Text', True if rects is not None else False)
+                except Exception as e:
+                    record('Search Text', False, str(e))
+
+                # Main-thread UI actions
+                def ui_tests():
+                    try:
+                        self._render_thumbnails()
+                        record('Render Thumbnails', True)
+                    except Exception as e:
+                        record('Render Thumbnails', False, str(e))
+
+                    try:
+                        self._load_bookmarks()
+                        record('Load Bookmarks (UI)', True)
+                    except Exception as e:
+                        record('Load Bookmarks (UI)', False, str(e))
+
+                    try:
+                        self._show_single_page()
+                        record('Show Single Page', True)
+                    except Exception as e:
+                        record('Show Single Page', False, str(e))
+
+                    try:
+                        self._show_continuous_scroll()
+                        record('Show Continuous Scroll', True)
+                    except Exception as e:
+                        record('Show Continuous Scroll', False, str(e))
+
+                    try:
+                        self.next_page()
+                        record('Next Page', True)
+                    except Exception as e:
+                        record('Next Page', False, str(e))
+
+                    try:
+                        self.prev_page()
+                        record('Previous Page', True)
+                    except Exception as e:
+                        record('Previous Page', False, str(e))
+
+                    try:
+                        self.change_zoom(1.25)
+                        record('Zoom In', True)
+                    except Exception as e:
+                        record('Zoom In', False, str(e))
+
+                    try:
+                        self.change_zoom(0.8)
+                        record('Zoom Out', True)
+                    except Exception as e:
+                        record('Zoom Out', False, str(e))
+
+                    try:
+                        self.rotate_page()
+                        record('Rotate Page', True)
+                    except Exception as e:
+                        record('Rotate Page', False, str(e))
+
+                    # Summary
+                    passed = sum(1 for r in results if r.startswith('PASS'))
+                    failed = sum(1 for r in results if r.startswith('FAIL'))
+                    summary = f"Diagnostics complete.\n\nPassed: {passed}\nFailed: {failed}\n\n" + "\n".join(results)
+
+                    if failed == 0:
+                        SweetAlert2.success(self, summary, 'Diagnostics')
+                    else:
+                        SweetAlert2.warning(self, summary, 'Diagnostics')
+
+                self.after(0, ui_tests)
+            except Exception as e:
+                self.after(0, lambda: SweetAlert2.error(self, f'Diagnostics error:\n\n{str(e)}', 'Diagnostics'))
+
+        threading.Thread(target=worker, daemon=True).start()
+
 
     def _on_close(self):
-        if pystray is None:
-            self.destroy()
-            import sys
-            sys.exit(0)
-        else:
-            self.withdraw()
-            def show_window(icon, item):
-                self.after(0, self._show_from_tray)
-            def quit_app(icon, item):
-                icon.stop()
-                try:
-                    # Only generate event if the window is still running
-                    if self.winfo_exists():
-                        self.event_generate('<<ReallyExit>>', when='tail')
-                except Exception as e:
-                    # Optionally log or ignore
-                    pass
-            try:
-                icon_img = PILImage.open(ICON_PATH)
-                # Resize to proper tray icon size
-                icon_img = icon_img.resize((64, 64), PILImage.Resampling.LANCZOS)
-            except Exception as e:
-                pass  # Tray icon failed
-                # Create a proper default icon
-                icon_img = PILImage.new('RGBA', (64, 64), color=(0, 100, 200, 255))
-                # Add a simple "P" text
-                from PIL import ImageDraw, ImageFont
-                draw = ImageDraw.Draw(icon_img)
-                try:
-                    font = ImageFont.truetype("arial.ttf", 40)
-                except:
-                    font = ImageFont.load_default()
-                draw.text((20, 12), "P", fill=(255, 255, 255, 255), font=font)
-            menu = pystray.Menu(
-                pystray.MenuItem('Show', show_window),
-                pystray.MenuItem('Exit', quit_app)
-            )
-            self.tray_icon = pystray.Icon('PDFReader', icon_img, 'PDF Reader', menu)
-            # Start the tray icon in a separate thread
-            tray_thread = threading.Thread(target=self.tray_icon.run, daemon=True)
-            tray_thread.start()
-            # System tray started
+        self._app_running = False
+        self.destroy()
+        import sys
+        sys.exit(0)
     def _show_from_tray(self):
         self.deiconify()
         if hasattr(self, 'tray_icon') and self.tray_icon:
@@ -1855,7 +3110,11 @@ class PDFReaderApp(tk.Tk):
     def _delete_annot_under_mouse(self, event):
         if not self.pdf_doc:
             return
-        page = self.pdf_doc.load_page(self.current_page)
+        try:
+            with MuPDFErrorSuppressor():
+                page = self.pdf_doc.load_page(self.current_page)
+        except Exception:
+            return
         try:
             x = self.canvas.canvasx(self.winfo_pointerx() - self.canvas.winfo_rootx())
             y = self.canvas.canvasy(self.winfo_pointery() - self.canvas.winfo_rooty())
@@ -1882,7 +3141,8 @@ class PDFReaderApp(tk.Tk):
                 import shutil
                 shutil.move(tmp_path, self.pdf_doc.name)
                 # Reload the document to reflect changes
-                self.pdf_doc = fitz.open(self.pdf_doc.name)
+                with MuPDFErrorSuppressor():
+                    self.pdf_doc = fitz.open(self.pdf_doc.name)
             self.show_page()
             self.status.config(text='Annotation deleted (Delete key).')
         else:
@@ -1901,7 +3161,6 @@ class PDFReaderApp(tk.Tk):
                 'page': page_num,
                 'zoom': self.zoom,
                 'rotation': self.rotation,
-                'fit_to_window': self.fit_to_window.get(),
                 'sidebar_visible': self.sidebar_visible,
                 'timestamp': time.time()
             }
@@ -1930,13 +3189,31 @@ class PDFReaderApp(tk.Tk):
             # Restore other settings
             self.zoom = data.get('zoom', 1.0)
             self.rotation = data.get('rotation', 0)
-            self.fit_to_window.set(data.get('fit_to_window', True))
+            fit_mode = data.get('fit_mode', 'fit_page')
+            self.fit_mode.set(fit_mode)
+            if hasattr(self, '_fit_mode_display'):
+                fit_mode_display_map = {
+                    'fit_page': 'Fit Page',
+                    'fit_width': 'Fit Width',
+                    'fit_height': 'Fit Height',
+                    'actual_size': 'Actual Size'
+                }
+                self._fit_mode_display.set(fit_mode_display_map.get(fit_mode, 'Fit Page'))
+                if hasattr(self, 'fit_mode_menu'):
+                    self.fit_mode_menu.set(fit_mode_display_map.get(fit_mode, 'Fit Page'))
+            view_mode = data.get('view_mode', 'single_page')
+            self.view_mode.set(view_mode)
             self.sidebar_visible = data.get('sidebar_visible', True)
             
             if file_path and os.path.exists(file_path):
-                # Restoring last session
-                self.open_pdf(file_path)
-                self.after(500, lambda: self.go_to_page(page_num))
+                # Restoring last session - suppress errors during load
+                try:
+                    with MuPDFErrorSuppressor():
+                        self.open_pdf(file_path)
+                        self.after(500, lambda: self.go_to_page(page_num))
+                except:
+                    # Session load failed, continue without it
+                    pass
         except Exception as e:
             pass  # Session load failed
 
@@ -1945,6 +3222,64 @@ class PDFReaderApp(tk.Tk):
         self.destroy()
         import sys
         sys.exit(0)
+
+    # --- Windows file association ---
+    def register_as_default_pdf_viewer(self):
+        """Register this app as the default PDF viewer (Windows)."""
+        if sys.platform != 'win32':
+            SweetAlert2.warning(self, 'This feature is only available on Windows.', 'Not Supported')
+            return
+        try:
+            import winreg
+            exe_path, open_cmd = self._get_open_command()
+            prog_id = 'AdvancedPDFReader.PDF'
+            app_name = 'Professional PDF Reader'
+            icon_path = ICON_PATH if os.path.exists(ICON_PATH) else exe_path
+
+            # .pdf association
+            with winreg.CreateKey(winreg.HKEY_CURRENT_USER, r'Software\Classes\.pdf') as key:
+                winreg.SetValueEx(key, '', 0, winreg.REG_SZ, prog_id)
+
+            # ProgID description
+            with winreg.CreateKey(winreg.HKEY_CURRENT_USER, fr'Software\Classes\{prog_id}') as key:
+                winreg.SetValueEx(key, '', 0, winreg.REG_SZ, app_name)
+
+            # ProgID icon
+            with winreg.CreateKey(winreg.HKEY_CURRENT_USER, fr'Software\Classes\{prog_id}\DefaultIcon') as key:
+                winreg.SetValueEx(key, '', 0, winreg.REG_SZ, icon_path)
+
+            # ProgID open command
+            with winreg.CreateKey(winreg.HKEY_CURRENT_USER, fr'Software\Classes\{prog_id}\shell\open\command') as key:
+                winreg.SetValueEx(key, '', 0, winreg.REG_SZ, open_cmd)
+
+            # "Open with" entry
+            exe_name = os.path.basename(exe_path)
+            with winreg.CreateKey(winreg.HKEY_CURRENT_USER, fr'Software\Classes\Applications\{exe_name}\shell\open\command') as key:
+                winreg.SetValueEx(key, '', 0, winreg.REG_SZ, open_cmd)
+
+            # Notify shell of association change
+            try:
+                from ctypes import windll
+                SHCNE_ASSOCCHANGED = 0x08000000
+                SHCNF_IDLIST = 0x0000
+                windll.shell32.SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, None, None)
+            except Exception:
+                pass
+
+            SweetAlert2.success(self, 'File association updated.\n\nYou can now open PDFs with this app by default.', 'Success')
+        except Exception as e:
+            SweetAlert2.error(self, f'Failed to register file association:\n\n{str(e)}', 'Error')
+
+    def _get_open_command(self):
+        """Return executable path and open command for file association."""
+        if getattr(sys, 'frozen', False):
+            exe_path = os.path.abspath(sys.argv[0])
+            open_cmd = f'"{exe_path}" "%1"'
+        else:
+            exe_path = os.path.abspath(sys.executable)
+            script_path = os.path.abspath(sys.argv[0])
+            open_cmd = f'"{exe_path}" "{script_path}" "%1"'
+        return exe_path, open_cmd
 
     def get_github_token(self):
         token = os.environ.get('GITHUB_TOKEN')
@@ -1988,18 +3323,18 @@ class PDFReaderApp(tk.Tk):
                         if chunk:
                             f.write(chunk)
             # On Windows, can't overwrite running exe; so schedule replace on next start
-            messagebox.showinfo("Update", f"Update downloaded to {tmp_path}. Please close the app and replace the old .exe with the new one.")
+            SweetAlert2.info(self, f"Update downloaded to:\n\n{tmp_path}\n\nPlease close the app and replace the old .exe with the new one.", "Update")
         except Exception as e:
-            messagebox.showerror("Update Failed", f"Failed to download update: {e}")
+            SweetAlert2.error(self, f"Failed to download update:\n\n{str(e)}", "Update Failed")
 
     def auto_update(self, manual=False):
         latest_version, download_url = self.check_for_update()
         if latest_version and download_url:
-            if messagebox.askyesno("Update Available", f"A new version ({latest_version}) is available. Download and update now?"):
+            if SweetAlert2.confirm(self, f"A new version ({latest_version}) is available.\n\nDownload and update now?", "Update Available"):
                 self.download_and_replace(download_url)
         else:
             if manual and threading.current_thread() is threading.main_thread():
-                messagebox.showinfo("No Update", "You are using the latest version.")
+                SweetAlert2.info(self, "You are using the latest version.", "No Update")
 
     def _on_canvas_mousewheel(self, event):
         # Main PDF scroll: much more responsive (20 units)
@@ -2032,6 +3367,24 @@ class PDFReaderApp(tk.Tk):
             self._last_scroll_y = self.canvas.canvasy(0)
         except:
             self._last_scroll_x = self._last_scroll_y = 0
+        
+        # Update page in continuous scroll mode
+        if self.view_mode.get() == 'continuous_scroll':
+            self.after(50, self._update_page_from_scroll)
+    
+    def _v_scroll_command(self, *args):
+        """Wrapper for vertical scrollbar command to track scrolling"""
+        if hasattr(self, '_original_v_scroll_command'):
+            self._original_v_scroll_command(*args)
+        else:
+            self.canvas.yview(*args)
+        if self.view_mode.get() == 'continuous_scroll':
+            self.after(50, self._update_page_from_scroll)
+    
+    def _on_canvas_scroll_update(self):
+        """Handle canvas scroll updates"""
+        if self.view_mode.get() == 'continuous_scroll':
+            self.after(100, self._update_page_from_scroll)
 
     def _on_canvas_key_scroll(self, direction, amount=20):
         """Handle keyboard scrolling of the main PDF canvas"""
@@ -2081,7 +3434,7 @@ class PDFReaderApp(tk.Tk):
         """Safe PDF save method that handles all edge cases."""
         if not self.pdf_doc or not self._current_pdf_path:
             if show_message:
-                messagebox.showwarning('No PDF', 'No PDF loaded to save.')
+                SweetAlert2.warning(self, 'No PDF loaded to save.', 'No PDF')
             return False
         
         try:
@@ -2090,7 +3443,7 @@ class PDFReaderApp(tk.Tk):
                 # PDF saved incrementally
             if show_message:
                 self.status.config(text=f'Saved: {os.path.basename(self._current_pdf_path)}')
-                messagebox.showinfo('Saved', f'PDF saved successfully:\n{os.path.basename(self._current_pdf_path)}')
+                SweetAlert2.success(self, f'PDF saved successfully:\n\n{os.path.basename(self._current_pdf_path)}', 'Saved')
             return True
         except Exception as e:
             # Incremental save failed, trying full save
@@ -2110,17 +3463,18 @@ class PDFReaderApp(tk.Tk):
                 shutil.move(tmp_path, self._current_pdf_path)
                 
                 # Reload the document to reflect changes
-                self.pdf_doc = fitz.open(self._current_pdf_path)
+                with MuPDFErrorSuppressor():
+                    self.pdf_doc = fitz.open(self._current_pdf_path)
                 
                 # PDF saved with full save
                 if show_message:
                     self.status.config(text=f'Saved: {os.path.basename(self._current_pdf_path)}')
-                    messagebox.showinfo('Saved', f'PDF saved successfully:\n{os.path.basename(self._current_pdf_path)}')
+                    SweetAlert2.success(self, f'PDF saved successfully:\n\n{os.path.basename(self._current_pdf_path)}', 'Saved')
                 return True
             except Exception as e2:
                 # Full save also failed
                 if show_message:
-                    messagebox.showerror('Save Error', f'Could not save PDF:\n{str(e2)}')
+                    SweetAlert2.error(self, f'Could not save PDF:\n\n{str(e2)}', 'Save Error')
                 return False
 
     def save_pdf(self):
@@ -2130,7 +3484,7 @@ class PDFReaderApp(tk.Tk):
     def save_pdf_as(self):
         """Save PDF to a new location (Save As)."""
         if not self.pdf_doc:
-            messagebox.showwarning('No PDF', 'No PDF loaded to save.')
+            SweetAlert2.warning(self, 'No PDF loaded to save.', 'No PDF')
             return
         
         # Ask user for save location
@@ -2154,10 +3508,10 @@ class PDFReaderApp(tk.Tk):
             self.pdf_doc.save(file_path, incremental=False, encryption=False)
             # PDF saved as
             self.status.config(text=f'Saved as: {os.path.basename(file_path)}')
-            messagebox.showinfo('Saved', f'PDF saved successfully as:\n{os.path.basename(file_path)}')
+            SweetAlert2.success(self, f'PDF saved successfully as:\n\n{os.path.basename(file_path)}', 'Saved')
         except Exception as e:
             # Save As failed
-            messagebox.showerror('Save Error', f'Could not save PDF:\n{str(e)}')
+            SweetAlert2.error(self, f'Could not save PDF:\n\n{str(e)}', 'Save Error')
 
     def _check_license(self):
         # Check license file for start date and license key
@@ -2181,11 +3535,13 @@ class PDFReaderApp(tk.Tk):
             return
         # After 7 days, require license
         if not license_key or not self._validate_license(license_key):
+            self._lock_ui(True)
             self._prompt_license()
+            self._lock_ui(False)
 
     def _validate_license(self, key):
         # Simple example: valid key is 'NEEDYAMIN-2025'
-        return key == 'NEEDYAMIN-2025'
+        return key == 'NEEDYAMIN-2026'
 
     def _prompt_license(self):
         import tkinter.messagebox as mb
@@ -2210,6 +3566,54 @@ class PDFReaderApp(tk.Tk):
         import sys
         self.destroy()
         sys.exit(1)
+
+    def _lock_ui(self, locked=True):
+        """Disable or enable all main UI interactions."""
+        state = 'disabled' if locked else 'normal'
+        try:
+            self.config(menu=None if locked else self.menu)
+        except Exception:
+            pass
+        for widget in [
+            getattr(self, 'toolbar', None),
+            getattr(self, 'sidebar', None),
+            getattr(self, 'canvas', None),
+            getattr(self, 'display_frame', None),
+            getattr(self, 'display_outer', None),
+        ]:
+            if widget:
+                try:
+                    widget.configure(state=state)
+                except Exception:
+                    pass
+        if locked:
+            # Create a transparent overlay to block input without unbinding events
+            try:
+                if not hasattr(self, '_lock_overlay') or self._lock_overlay is None:
+                    self._lock_overlay = tk.Toplevel(self)
+                    self._lock_overlay.overrideredirect(True)
+                    self._lock_overlay.attributes('-topmost', True)
+                    try:
+                        self._lock_overlay.attributes('-alpha', 0.01)
+                    except Exception:
+                        pass
+                    w = self.winfo_screenwidth()
+                    h = self.winfo_screenheight()
+                    self._lock_overlay.geometry(f'{w}x{h}+0+0')
+                    self._lock_overlay.grab_set()
+            except Exception:
+                pass
+        else:
+            try:
+                if hasattr(self, '_lock_overlay') and self._lock_overlay:
+                    try:
+                        self._lock_overlay.grab_release()
+                    except Exception:
+                        pass
+                    self._lock_overlay.destroy()
+                    self._lock_overlay = None
+            except Exception:
+                pass
 
     def _show_license_dialog(self):
         # Create a modal dialog with app icon for license entry
@@ -2295,7 +3699,7 @@ if __name__ == '__main__':
         except:
             pass
         
-        app = PDFReaderApp()
+        app = PDFReaderApp(initial_pdf=pdf_file_to_open)
         
         # Ensure window is visible and on top BEFORE loading PDF
         app.deiconify()  # Show window if minimized
@@ -2311,8 +3715,23 @@ if __name__ == '__main__':
         if pdf_file_to_open and os.path.exists(pdf_file_to_open):
             app.after(200, lambda: app.open_pdf(pdf_file_to_open))
         
-        app.mainloop()
+        try:
+            app.mainloop()
+        except KeyboardInterrupt:
+            try:
+                app.destroy()
+            except Exception:
+                pass
+            sys.exit(0)
 
     splash.after(1000, show_main)
-    splash.mainloop()
+    try:
+        splash.mainloop()
+    except KeyboardInterrupt:
+        # Allow clean exit when user stops the app from terminal
+        try:
+            splash.destroy()
+        except Exception:
+            pass
+        sys.exit(0)
 

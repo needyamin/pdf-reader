@@ -1,6 +1,6 @@
 
 #define MyAppName "Advanced PDF Reader"
-#define MyAppVersion "2.0.0"
+#define MyAppVersion "3.0.0"
 #define MyAppPublisher "YAMiN HOSSAIN"
 #define MyAppExeName "Advanced PDF Reader.exe"
 
@@ -12,7 +12,7 @@ AppVersion={#MyAppVersion}
 AppPublisher={#MyAppPublisher}
 DefaultDirName={autopf}\{#MyAppName}
 DefaultGroupName={#MyAppName}
-OutputDir=installer
+OutputDir=build
 OutputBaseFilename={#MyAppName}-Setup
 Compression=lzma
 SolidCompression=yes
@@ -23,9 +23,8 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 Name: "startmenuicon"; Description: "Create Start Menu shortcuts"; GroupDescription: "{cm:AdditionalIcons}"
 
 [Files]
-Source: "public\dist\Advanced PDF Reader.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "public\dist\assets\*"; DestDir: "{app}\assets"; Flags: ignoreversion recursesubdirs createallsubdirs
-
+; Source paths are auto-updated by cx_Freeze_build.py
+Source: "build\exe-3.0.0\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
 Name: "{commondesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
