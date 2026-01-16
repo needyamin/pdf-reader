@@ -636,7 +636,8 @@ class PDFReaderApp(tk.Tk):
                        background=SIDEBAR_COLOR, 
                        troughcolor=TOOLBAR_COLOR,
                        borderwidth=0,
-                       arrowcolor=FG_COLOR)
+                       arrowcolor=FG_COLOR,
+                       width=8)
         style.map('TScrollbar', 
                  background=[('active', ACCENT_COLOR)])
         
@@ -731,7 +732,7 @@ class PDFReaderApp(tk.Tk):
         self.paned.pack(side='top', fill='both', expand=True)
 
         # Sidebar for thumbnails and bookmarks
-        self.sidebar = tk.Frame(self.paned, bg=SIDEBAR_COLOR, width=200)
+        self.sidebar = tk.Frame(self.paned, bg=SIDEBAR_COLOR, width=220)
         self.sidebar.grid_propagate(False)
         
         # Sidebar tabs
@@ -767,12 +768,24 @@ class PDFReaderApp(tk.Tk):
         self.sidebar_header.pack(side='left', padx=8, pady=2)
         self.thumbnail_canvas = tk.Canvas(self.thumbnails_container, bg=SIDEBAR_COLOR, highlightthickness=0, bd=0)
         self.thumbnail_canvas.pack(side='left', fill='both', expand=True)
-        self.thumbnail_scrollbar = ttk.Scrollbar(self.thumbnails_container, orient='vertical', command=self.thumbnail_canvas.yview)
-        self.thumbnail_scrollbar.pack(side='right', fill='y')
+        self.thumbnail_scrollbar = tk.Scrollbar(
+            self.thumbnails_container,
+            orient='vertical',
+            command=self.thumbnail_canvas.yview,
+            width=10,
+            bg=BUTTON_ACTIVE,
+            troughcolor=SIDEBAR_HEADER_COLOR,
+            relief='flat',
+            activebackground=ACCENT_COLOR,
+            highlightthickness=0
+        )
+        self.thumbnail_scrollbar.pack(side='right', fill='y', padx=(0, 0))
         self.thumbnail_canvas.configure(yscrollcommand=self.thumbnail_scrollbar.set)
         # Configure for smooth scrolling
         self.thumbnail_canvas.configure(yscrollincrement=1)
         self.thumbnail_frame = tk.Frame(self.thumbnail_canvas, bg=SIDEBAR_COLOR)
+        # Don't constrain window width - let thumbnails be their natural size
+        # This allows highlight borders to show properly
         self.thumbnail_canvas.create_window((0, 0), window=self.thumbnail_frame, anchor='nw')
         self.thumbnail_frame.bind('<Configure>', lambda e: self.thumbnail_canvas.configure(scrollregion=self.thumbnail_canvas.bbox('all')))
         # Sidebar scrolling and keyboard navigation
@@ -797,8 +810,18 @@ class PDFReaderApp(tk.Tk):
         self.bookmarks_container = tk.Frame(self.sidebar_content, bg=SIDEBAR_COLOR)
         self.bookmarks_canvas = tk.Canvas(self.bookmarks_container, bg=SIDEBAR_COLOR, highlightthickness=0, bd=0)
         self.bookmarks_canvas.pack(side='left', fill='both', expand=True)
-        self.bookmarks_scrollbar = ttk.Scrollbar(self.bookmarks_container, orient='vertical', command=self.bookmarks_canvas.yview)
-        self.bookmarks_scrollbar.pack(side='right', fill='y')
+        self.bookmarks_scrollbar = tk.Scrollbar(
+            self.bookmarks_container,
+            orient='vertical',
+            command=self.bookmarks_canvas.yview,
+            width=10,
+            bg=BUTTON_ACTIVE,
+            troughcolor=SIDEBAR_HEADER_COLOR,
+            relief='flat',
+            activebackground=ACCENT_COLOR,
+            highlightthickness=0
+        )
+        self.bookmarks_scrollbar.pack(side='right', fill='y', padx=(2, 2))
         self.bookmarks_canvas.configure(yscrollcommand=self.bookmarks_scrollbar.set)
         self.bookmarks_frame = tk.Frame(self.bookmarks_canvas, bg=SIDEBAR_COLOR)
         self.bookmarks_canvas.create_window((0, 0), window=self.bookmarks_frame, anchor='nw')
@@ -823,7 +846,7 @@ class PDFReaderApp(tk.Tk):
         # Only bind <Configure> to the main window and debounce:
         self.bind('<Configure>', self._on_resize)
 
-        self.paned.add(self.sidebar, minsize=80)
+        self.paned.add(self.sidebar, minsize=180)
         self.paned.add(self.display_outer, minsize=200)
         self.paned.paneconfig(self.sidebar, stretch='never')
         self.paned.paneconfig(self.display_outer, stretch='always')
@@ -856,8 +879,6 @@ class PDFReaderApp(tk.Tk):
         self.canvas.bind('<Button-5>', self._on_canvas_mousewheel)           # Linux scroll down
         
         # Track scroll in continuous mode to update current page
-        # Store original scroll command
-        self._original_v_scroll_command = self.v_scroll['command']
         self.v_scroll.configure(command=self._v_scroll_command)
         
         # Keyboard scrolling for main PDF canvas
@@ -1107,8 +1128,8 @@ class PDFReaderApp(tk.Tk):
         
         def worker():
             images = []
-            max_thumb_width = 120
-            max_thumb_height = 160
+            max_thumb_width = 100
+            max_thumb_height = 140
             try:
                 for i in range(len(self.pdf_doc)):
                     try:
@@ -1137,14 +1158,21 @@ class PDFReaderApp(tk.Tk):
         for widget in self.thumbnail_frame.winfo_children():
             widget.destroy()
         self.thumbnails = []
-        max_thumb_width = 120
-        max_thumb_height = 160
+        max_thumb_width = 100
+        max_thumb_height = 140
+        border_width = 4  # Border width for active thumbnail
         for i, img in images:
             thumb = ImageTk.PhotoImage(img)
             self.thumbnails.append(thumb)
-            thumb_frame = tk.Frame(self.thumbnail_frame, bg=SIDEBAR_COLOR, bd=2, relief='solid',
-                                   highlightthickness=2, width=max_thumb_width, height=max_thumb_height)
-            thumb_frame.pack(pady=4, padx=6, fill='x')
+            # Outer wrapper frame for border (will be colored when active)
+            border_wrapper = tk.Frame(self.thumbnail_frame, bg=SIDEBAR_COLOR, width=max_thumb_width + (border_width * 2), 
+                                     height=max_thumb_height + (border_width * 2))
+            border_wrapper.pack(pady=4, padx=4)
+            border_wrapper.pack_propagate(False)
+            # Inner thumbnail frame
+            thumb_frame = tk.Frame(border_wrapper, bg=SIDEBAR_COLOR, bd=2, relief='solid',
+                                   highlightthickness=0, width=max_thumb_width, height=max_thumb_height)
+            thumb_frame.place(relx=0.5, rely=0.5, anchor='center')
             thumb_frame.pack_propagate(False)
             btn = tk.Label(thumb_frame, image=thumb, bg=SIDEBAR_COLOR, bd=0, highlightthickness=0)
             btn.place(relx=0.5, rely=0.5, anchor='center')
@@ -1152,20 +1180,25 @@ class PDFReaderApp(tk.Tk):
                                       font=('Segoe UI', 7, 'bold'), anchor='center',
                                       relief='raised', bd=1)
             page_num_label.place(relx=0.85, rely=0.05, width=20, height=16)
-            thumb_frame.bind('<Button-1>', lambda e, i=i: self.go_to_page(i))
-            thumb_frame.bind('<Button-3>', lambda e, i=i: self._show_thumbnail_context_menu(e, i))
-            thumb_frame.bind('<Enter>', lambda e, f=thumb_frame: f.configure(bg=BUTTON_ACTIVE))
-            thumb_frame.bind('<Leave>', lambda e, f=thumb_frame, idx=i: self._update_thumbnail_highlight(f, idx))
+            # Store reference to border_wrapper for highlighting
+            border_wrapper._thumb_frame = thumb_frame
+            border_wrapper._thumb_idx = i
+            # Bind events to both frames
+            for frame in [border_wrapper, thumb_frame]:
+                frame.bind('<Button-1>', lambda e, i=i: self.go_to_page(i))
+                frame.bind('<Button-3>', lambda e, i=i: self._show_thumbnail_context_menu(e, i))
+                frame.bind('<Enter>', lambda e, f=thumb_frame: f.configure(bg=BUTTON_ACTIVE))
+                frame.bind('<Leave>', lambda e, f=border_wrapper, idx=i: self._update_thumbnail_highlight(f, idx))
             btn.bind('<Button-1>', lambda e, i=i: self.go_to_page(i))
             btn.bind('<Button-3>', lambda e, i=i: self._show_thumbnail_context_menu(e, i))
             btn.bind('<Enter>', lambda e, f=thumb_frame: f.configure(bg=BUTTON_ACTIVE))
-            btn.bind('<Leave>', lambda e, f=thumb_frame, idx=i: self._update_thumbnail_highlight(f, idx))
+            btn.bind('<Leave>', lambda e, f=border_wrapper, idx=i: self._update_thumbnail_highlight(f, idx))
             page_num_label.bind('<Button-1>', lambda e, i=i: self.go_to_page(i))
             page_num_label.bind('<Button-3>', lambda e, i=i: self._show_thumbnail_context_menu(e, i))
             page_num_label.bind('<Enter>', lambda e, f=thumb_frame: f.configure(bg=BUTTON_ACTIVE))
-            page_num_label.bind('<Leave>', lambda e, f=thumb_frame, idx=i: self._update_thumbnail_highlight(f, idx))
-            self._update_thumbnail_highlight(thumb_frame, i)
-            self._propagate_mousewheel_to_canvas(thumb_frame, self.thumbnail_canvas)
+            page_num_label.bind('<Leave>', lambda e, f=border_wrapper, idx=i: self._update_thumbnail_highlight(f, idx))
+            self._update_thumbnail_highlight(border_wrapper, i)
+            self._propagate_mousewheel_to_canvas(border_wrapper, self.thumbnail_canvas)
         self.thumbnail_canvas.configure(scrollregion=self.thumbnail_canvas.bbox('all'))
         self.thumbnail_canvas.configure(yscrollincrement=1)
         self._show_sidebar_loading(False)
@@ -1214,19 +1247,34 @@ class PDFReaderApp(tk.Tk):
         except Exception as e:
             SweetAlert2.error(self, f'Error adding bookmark:\n\n{str(e)}', 'Bookmark Error')
 
-    def _update_thumbnail_highlight(self, btn, idx):
+    def _update_thumbnail_highlight(self, border_wrapper, idx):
+        """Update thumbnail highlighting using wrapper frame approach."""
+        # Get the inner thumbnail frame
+        thumb_frame = border_wrapper._thumb_frame if hasattr(border_wrapper, '_thumb_frame') else None
+        if not thumb_frame:
+            # Fallback: assume btn is the thumb_frame itself (old code compatibility)
+            thumb_frame = border_wrapper
+        
         if idx == self.current_page:
-            btn.configure(bg=HIGHLIGHT_COLOR, bd=3, relief='solid', highlightbackground=ACCENT_COLOR, highlightcolor=ACCENT_COLOR)
+            # Active thumbnail: color the wrapper frame background as border
+            border_wrapper.configure(bg=ACCENT_COLOR)  # Border color
+            if thumb_frame:
+                thumb_frame.configure(bg=HIGHLIGHT_COLOR, bd=2, relief='solid')
             # Update page number badge color for current page
-            for child in btn.winfo_children():
-                if isinstance(child, tk.Label) and child.cget('text').isdigit():
-                    child.configure(bg=FG_COLOR, fg=HIGHLIGHT_COLOR)
+            if thumb_frame:
+                for child in thumb_frame.winfo_children():
+                    if isinstance(child, tk.Label) and child.cget('text').isdigit():
+                        child.configure(bg=FG_COLOR, fg=HIGHLIGHT_COLOR)
         else:
-            btn.configure(bg=SIDEBAR_COLOR, bd=2, relief='solid', highlightbackground=SIDEBAR_COLOR, highlightcolor=SIDEBAR_COLOR)
+            # Inactive thumbnails: normal appearance
+            border_wrapper.configure(bg=SIDEBAR_COLOR)  # No border
+            if thumb_frame:
+                thumb_frame.configure(bg=SIDEBAR_COLOR, bd=2, relief='solid')
             # Update page number badge color for other pages
-            for child in btn.winfo_children():
-                if isinstance(child, tk.Label) and child.cget('text').isdigit():
-                    child.configure(bg=ACCENT_COLOR, fg=FG_COLOR)
+            if thumb_frame:
+                for child in thumb_frame.winfo_children():
+                    if isinstance(child, tk.Label) and child.cget('text').isdigit():
+                        child.configure(bg=ACCENT_COLOR, fg=FG_COLOR)
 
     def show_page(self):
         if not self.pdf_doc:
@@ -1273,8 +1321,14 @@ class PDFReaderApp(tk.Tk):
         if hasattr(self, 'page_entry_var') and self.pdf_doc and not self._page_entry_has_focus:
             self.page_entry_var.set(str(self.current_page + 1))
         
-        for idx, widget in enumerate(self.thumbnail_frame.winfo_children()):
-            self._update_thumbnail_highlight(widget, idx)
+        # Update thumbnail highlights - use stored index from wrapper
+        for widget in self.thumbnail_frame.winfo_children():
+            if hasattr(widget, '_thumb_idx'):
+                self._update_thumbnail_highlight(widget, widget._thumb_idx)
+            else:
+                # Fallback for old structure
+                idx = self.thumbnail_frame.winfo_children().index(widget)
+                self._update_thumbnail_highlight(widget, idx)
     
     def _show_single_page(self):
         """Display single page view (original behavior)"""
@@ -1472,8 +1526,14 @@ class PDFReaderApp(tk.Tk):
                     if self.current_page != i:
                         self.current_page = i
                         self.page_entry_var.set(str(i + 1))
-                        for idx, widget in enumerate(self.thumbnail_frame.winfo_children()):
-                            self._update_thumbnail_highlight(widget, idx)
+                        # Update thumbnail highlights - use stored index from wrapper
+                        for widget in self.thumbnail_frame.winfo_children():
+                            if hasattr(widget, '_thumb_idx'):
+                                self._update_thumbnail_highlight(widget, widget._thumb_idx)
+                            else:
+                                # Fallback for old structure
+                                idx = self.thumbnail_frame.winfo_children().index(widget)
+                                self._update_thumbnail_highlight(widget, idx)
                     break
                 cumulative += height + 10
         except:
@@ -3374,10 +3434,10 @@ class PDFReaderApp(tk.Tk):
     
     def _v_scroll_command(self, *args):
         """Wrapper for vertical scrollbar command to track scrolling"""
-        if hasattr(self, '_original_v_scroll_command'):
-            self._original_v_scroll_command(*args)
-        else:
+        try:
             self.canvas.yview(*args)
+        except Exception:
+            return
         if self.view_mode.get() == 'continuous_scroll':
             self.after(50, self._update_page_from_scroll)
     
