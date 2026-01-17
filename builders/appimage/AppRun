@@ -1,0 +1,13 @@
+#!/bin/bash
+HERE="$(dirname "$(readlink -f "${0}")")"
+# Dynamically find python version
+PYTHON_BIN=$(find "${HERE}/usr/python/bin" -name "python3.*" -type f | head -n 1)
+PYTHON_LIB_DIR=$(find "${HERE}/usr/python/lib" -name "python3.*" -type d | head -n 1)
+
+export PYTHONHOME="${HERE}/usr/python"
+export PATH="${HERE}/usr/python/bin:${HERE}/usr/bin:${PATH}"
+export LD_LIBRARY_PATH="${HERE}/usr/lib:${HERE}/usr/python/lib:${LD_LIBRARY_PATH}"
+export PYTHONPATH="${PYTHON_LIB_DIR}/site-packages:${PYTHONPATH}"
+
+# Ensure we use the bundled python
+exec "$PYTHON_BIN" "${HERE}/usr/bin/pdfReader.py" "$@"

@@ -89,28 +89,36 @@ pip install -r requirements.txt
 python pdfReader.py
 ```
 
-### Building Executable
-```bash
-# Build with cx_Freeze
-python cx_Freeze_build.py build
+### Building the Application
 
-# Executable will be in the 'build/exe.win-amd64-3.14' folder
+You can build the application using three different methods, located in the `builders` folder. All build outputs will be saved to the `dist` directory.
+
+#### 1. Nuitka Build (Recommended for Performance)
+Creates a highly optimized standalone executable.
+```bash
+python3 builders/nuitka/build_nutika.py
+# Output will be in: dist/nuitka/
 ```
 
-### Build Installer (Setup EXE)
+#### 2. cx_Freeze Build (Standard)
+Creates a standard executable folder (and installer if Inno Setup is available).
 ```bash
-# Requires Inno Setup 6 installed
-# ISCC.exe must be on PATH or in the default install folder
-python cx_Freeze_build.py build
+python3 builders/cx_freeze/cx_Freeze_build.py build
+# Output will be in: dist/cx_freeze/
+```
 
-# Setup EXE will be in the 'build' folder
+#### 3. AppImage (Linux Only)
+Creates a portable AppImage for Linux distributions.
+```bash
+./builders/appimage/build_appimage.sh
+# Output will be in: dist/appimage/
 ```
 
 ## 📋 System Requirements
 
 | Component | Minimum | Recommended |
 |-----------|---------|-------------|
-| **OS** | Windows 10 | Windows 11 |
+| **OS** | Windows 10/Linux | Windows 11/Ubuntu 22.04 |
 | **RAM** | 4GB | 8GB+ |
 | **Storage** | 100MB | 500MB+ |
 | **Display** | 1024x768 | 1920x1080+ |
@@ -144,7 +152,7 @@ python cx_Freeze_build.py build
 - **Framework**: Tkinter (Python's standard GUI library)
 - **PDF Engine**: PyMuPDF (fitz) for high-performance rendering
 - **Image Processing**: Pillow (PIL) for image manipulation
-- **Build System**: cx_Freeze + Inno Setup (installer)
+- **Build System**: Nuitka, cx_Freeze, AppImage
 
 ### Performance Optimizations
 - **Smart Caching**: Page and annotation caching for instant access
@@ -162,25 +170,34 @@ python cx_Freeze_build.py build
 
 ```
 pdf-reader/
-├── 📄 pdfReader.py                 # Main application file
-├── 🔧 cx_Freeze_build.py           # Build script (exe + installer)
-├── 📋 requirements.txt             # Python dependencies
-├── 📖 README.md                    # Project documentation
-├── 📁 assets/                      # Application assets
+├── 📄 pdfReader.py                         # Main application file
+├── 📋 requirements.txt                     # Python dependencies
+├── 📖 README.md                            # Project documentation
+├── 📁 assets/                              # Application assets
 │   ├── 🗂️ icons/
-│   │   └── icon.ico                # Application icon
+│   │   └── icon.ico                        # Application icon
 │   ├── 🖼️ images/
-│   │   ├── loading.png             # Splash screen image
-│   │   └── YAMiN_HOSSAIN.png       # About/branding image
+│   │   ├── loading.png                     # Splash screen image
+│   │   └── YAMiN_HOSSAIN.png               # About/branding image
 │   └── 📄 json/
-│       ├── last_session.json       # Session persistence (runtime-updated)
-│       └── license_info.json       # License information
-├── 📁 build/
-│   ├── exe.win-amd64-3.14/         # cx_Freeze output
-│   └── Advanced PDF Reader-Setup.exe  # Inno Setup output
-├── 📄 installer.iss                # Inno Setup script (optional)
-└── 📁 logs/                        # Application logs
-    └── (runtime log files)
+│       ├── last_session.json               # Session persistence
+│       └── license_info.json               # License information
+├── 📁 builders/                        # Build scripts
+│   ├── 📁 nuitka/
+│   │   └── build_nutika.py
+│   ├── 📁 cx_freeze/
+│   │   ├── cx_Freeze_build.py
+│   │   ├── installer.iss
+│   │   └── sitecustomize.py
+│   └── 📁 appimage/
+│       ├── build_appimage.sh
+│       └── pdf-reader.desktop
+├── 📁 dist/                            # Build Output Directory
+│   ├── 📁 nuitka/
+│   ├── 📁 cx_freeze/
+│   └── 📁 appimage/
+├── 📁 logs/                            # Application logs
+└── 📁 venv/                            # Virtual environment
 ```
 
 ## 🐛 Troubleshooting

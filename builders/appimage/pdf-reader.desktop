@@ -1,0 +1,7 @@
+[Desktop Entry]
+Name=PDF Reader
+Exec=pdf-reader
+Icon=pdf-reader
+Type=Application
+Categories=Utility;
+Terminal=false
