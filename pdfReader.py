@@ -55,7 +55,9 @@ def setup_logging():
 # Initialize logger
 logger = setup_logging()
 
-# Suppress MuPDF stderr output for format errors
+# Init
+import sys
+print("DEBUG: Stage 1: Imports complete", file=sys.stderr)
 import contextlib
 
 # Global stderr suppressor for MuPDF errors
@@ -433,22 +435,38 @@ class SweetAlert2:
 
 class PDFReaderApp(tk.Tk):
     def __init__(self, initial_pdf=None):
+        print("DEBUG: Stage 3: PDFReaderApp.__init__ starting", file=sys.stderr)
         super().__init__()
-        
-        # Single instance check
+        print("DEBUG: Stage 4: tk.Tk.__init__ complete", file=sys.stderr)
         if is_already_running(initial_pdf):
+            print("DEBUG: Stage 4.1: Already running check complete", file=sys.stderr)
             sys.exit(0)
+        print("DEBUG: Stage 5: Setting title", file=sys.stderr)
         self.title('Advanced PDF Reader')
+        print("DEBUG: Stage 6: Setting geometry", file=sys.stderr)
         self.geometry('1200x800')
+        print("DEBUG: Stage 7: Configuring background", file=sys.stderr)
         self.configure(bg=BG_COLOR)
-        self._fullscreen = False  # Track fullscreen state
-        self._current_pdf_path = None  # Track current file path for Save
+        print("DEBUG: Stage 8: Applying icon", file=sys.stderr)
         # Set application icon (window, taskbar, startbar)
         try:
-            self.iconbitmap(ICON_PATH)
-            # Also set the window icon for taskbar
-            self.wm_iconbitmap(ICON_PATH)
-            # Windows-specific taskbar icon
+            if sys.platform == 'win32':
+                self.iconbitmap(ICON_PATH)
+            else:
+                # On Linux use iconphoto for stability
+                try:
+                    from PIL import Image as PILImage_local, ImageTk
+                    png_icon = resource_path('assets/icons/pdf-reader.png')
+                    if os.path.exists(png_icon):
+                        icon_img = PILImage_local.open(png_icon)
+                        self.icon_photo_obj = ImageTk.PhotoImage(icon_img)
+                        self.iconphoto(True, self.icon_photo_obj)
+                        print("DEBUG: Stage 8.1: iconphoto set", file=sys.stderr)
+                    else:
+                        print("DEBUG: Stage 8.2: png icon missing", file=sys.stderr)
+                except Exception as e:
+                    print(f"DEBUG: Stage 8.3: iconphoto failed: {e}", file=sys.stderr)
+            print("DEBUG: Stage 9: Icon logic complete", file=sys.stderr)
             if sys.platform == 'win32':
                 try:
                     import win32gui
@@ -466,7 +484,9 @@ class PDFReaderApp(tk.Tk):
                         windll.user32.SendMessageW(hwnd, win32con.WM_SETICON, win32con.ICON_SMALL, icon_handle)
                 except Exception as e:
                     pass  # Icon setting failed, continue without it
+            print("DEBUG: Stage 9: Icon logic complete", file=sys.stderr)
         except Exception as e:
+            print(f"DEBUG: Stage 9.1: Global icon block failed: {e}", file=sys.stderr)
             pass  # Window icon failed, continue without it
             # Create a default icon if the file doesn't exist
             try:
@@ -508,8 +528,11 @@ class PDFReaderApp(tk.Tk):
         self._continuous_render_state = None
         self._is_rendering = False
         self._app_running = True
+        print("DEBUG: Stage 10: Setting up style", file=sys.stderr)
         self._setup_style()
+        print("DEBUG: Stage 11: Creating widgets", file=sys.stderr)
         self._create_widgets()
+        print("DEBUG: Stage 12: UI setup complete", file=sys.stderr)
         self.after(100, self._set_default_sidebar_size)
         self.bind('<Configure>', self._on_resize)
         # Navigation
@@ -660,10 +683,12 @@ class PDFReaderApp(tk.Tk):
                        focuscolor=ACCENT_COLOR)
 
     def _create_widgets(self):
+        print("DEBUG: Stage 11.1: Starting menu bar", file=sys.stderr)
         # Menu bar
         self.menu = tk.Menu(self)
         self.config(menu=self.menu)
         # File menu
+        print("DEBUG: Stage 11.2: File menu", file=sys.stderr)
         file_menu = tk.Menu(self.menu, tearoff=0)
         file_menu.add_command(label='Open...', command=self.open_pdf, accelerator='Ctrl+O')
         file_menu.add_command(label='Set as Default PDF Viewer', command=self.register_as_default_pdf_viewer)
@@ -677,12 +702,14 @@ class PDFReaderApp(tk.Tk):
         file_menu.add_command(label='Exit', command=self.exit_app, accelerator='Ctrl+Q')
         self.menu.add_cascade(label='File', menu=file_menu)
         # Edit menu
+        print("DEBUG: Stage 11.3: Edit menu", file=sys.stderr)
         edit_menu = tk.Menu(self.menu, tearoff=0)
         edit_menu.add_command(label='Find...', command=self.show_find_dialog, accelerator='Ctrl+F')
         edit_menu.add_command(label='Find Next', command=self.find_next, accelerator='F3')
         edit_menu.add_command(label='Find Previous', command=self.find_previous, accelerator='Shift+F3')
         self.menu.add_cascade(label='Edit', menu=edit_menu)
         # View menu
+        print("DEBUG: Stage 11.4: View menu", file=sys.stderr)
         view_menu = tk.Menu(self.menu, tearoff=0)
         view_menu.add_command(label='Zoom In', command=lambda: self.change_zoom(1.25), accelerator='Ctrl++')
         view_menu.add_command(label='Zoom Out', command=lambda: self.change_zoom(0.8), accelerator='Ctrl+-')
@@ -696,17 +723,8 @@ class PDFReaderApp(tk.Tk):
         view_menu.add_separator()
         view_menu.add_command(label='Toggle Sidebar', command=self.toggle_sidebar, accelerator='Ctrl+Shift+T')
         self.menu.add_cascade(label='View', menu=view_menu)
-        # Annotate menu (hidden for now)
-        # annotate_menu = tk.Menu(self.menu, tearoff=0)
-        # annotate_menu.add_command(label='Highlight', command=lambda: self.set_annotation_mode('highlight'))
-        # annotate_menu.add_command(label='Draw', command=lambda: self.set_annotation_mode('draw'))
-        # annotate_menu.add_command(label='Text Note', command=lambda: self.set_annotation_mode('text'))
-        # annotate_menu.add_command(label='Add Image', command=lambda: self.set_annotation_mode('image'))
-        # annotate_menu.add_command(label='Fill Form', command=lambda: self.set_annotation_mode('form'))
-        # annotate_menu.add_separator()
-        # annotate_menu.add_command(label='Eraser 🧹', command=lambda: self.set_annotation_mode('eraser'))
-        # self.menu.add_cascade(label='Annotate', menu=annotate_menu)
         # Help menu
+        print("DEBUG: Stage 11.5: Help menu", file=sys.stderr)
         help_menu = tk.Menu(self.menu, tearoff=0)
         help_menu.add_command(label='About', command=self.show_about)
         help_menu.add_command(label='Shortcuts', command=self.show_shortcuts)
@@ -715,17 +733,19 @@ class PDFReaderApp(tk.Tk):
         help_menu.add_separator()
         self.menu.add_cascade(label='Help', menu=help_menu)
         # Activate Software
+        print("DEBUG: Stage 11.6: Activate menu", file=sys.stderr)
         activate_software = tk.Menu(self.menu, tearoff=0)
         activate_software.add_command(label='Active', command=self._prompt_license)
         activate_software.add_separator()
         activate_software.add_command(label='Buy Me Coffee', command=self.show_license)
         self.menu.add_cascade(label='Active', menu=activate_software)
         
-
         # Toolbar
+        print("DEBUG: Stage 11.7: Toolbar", file=sys.stderr)
         self.toolbar = tk.Frame(self, bg=TOOLBAR_COLOR, height=50)
         self.toolbar.pack(side='top', fill='x')
         self._add_toolbar_buttons()
+        print("DEBUG: Stage 11.8: Toolbar buttons added", file=sys.stderr)
 
         # PanedWindow for responsive sidebar/main area
         self.paned = tk.PanedWindow(self, orient='horizontal', sashwidth=6, bg=BG_COLOR, bd=0, sashrelief='flat', showhandle=True)
@@ -919,6 +939,7 @@ class PDFReaderApp(tk.Tk):
     def _add_toolbar_buttons(self):
         btns = []
         def make_btn(text, cmd, icon, tooltip):
+            print(f"DEBUG: Stage 11.7.1: make_btn for {text}", file=sys.stderr)
             btn = ttk.Button(self.toolbar, text=f'{icon} {text}', command=cmd, style='TButton')
             btn.pack(side='left', padx=2, pady=8)
             Tooltip(btn, tooltip)
@@ -938,11 +959,12 @@ class PDFReaderApp(tk.Tk):
         # REMOVE the Annotate placeholder button
         # make_btn('Annotate', self.annotate_placeholder, '🖊️', 'Annotation tools (coming soon)')
         # Fit mode dropdown
+        print("DEBUG: Stage 11.7.2: Fit mode dropdown", file=sys.stderr)
         view_mode_frame = tk.Frame(self.toolbar, bg=TOOLBAR_COLOR)
         view_mode_frame.pack(side='left', padx=(16,2), pady=8)
         
         tk.Label(view_mode_frame, text='Fit:', bg=TOOLBAR_COLOR, fg=FG_COLOR, font=FONT_SMALL).pack(side='left', padx=(0,4))
-        
+        print("DEBUG: Stage 11.7.2.1: Combobox", file=sys.stderr)
         self.fit_mode_menu = ttk.Combobox(view_mode_frame, textvariable=self._fit_mode_display, 
                                           values=['Fit Page', 'Fit Width', 'Fit Height', 'Actual Size'],
                                           state='readonly', width=12, font=FONT_SMALL)
@@ -951,6 +973,7 @@ class PDFReaderApp(tk.Tk):
         self.fit_mode_menu.bind('<<ComboboxSelected>>', lambda e: self._on_fit_mode_change_combo())
         # Page number entry with improved styling
         # Page navigation input with improved UX
+        print("DEBUG: Stage 11.7.3: Page frame", file=sys.stderr)
         page_frame = tk.Frame(self.toolbar, bg=TOOLBAR_COLOR)
         page_frame.pack(side='left', padx=(16,12), pady=8)
         
@@ -3729,8 +3752,17 @@ if __name__ == '__main__':
         if not pdf_file_to_open.lower().endswith('.pdf'):
             pdf_file_to_open = None
     
-    # Splash is the root window
-    splash = tk.Tk()
+    # Splash is a Toplevel of the main app (to avoid destroying root)
+    # We initialize the main app first but keep it hidden
+    print("DEBUG: Stage 2: Attempting to initialize PDFReaderApp", file=sys.stderr)
+    try:
+        app = PDFReaderApp(initial_pdf=pdf_file_to_open)
+        app.withdraw()  # Hide main window initially
+    except Exception as e:
+        # If app fails to init (e.g. single instance check), exit
+        sys.exit(0)
+
+    splash = tk.Toplevel(app)
     splash.overrideredirect(True)
     splash.configure(bg='#23272e')
     try:
@@ -3745,12 +3777,14 @@ if __name__ == '__main__':
     x = (screen_w - img_w) // 2
     y = (screen_h - img_h) // 2
     splash.geometry(f'{img_w}x{img_h}+{x}+{y}')
+    
     if splash_photo:
         label = tk.Label(splash, image=splash_photo, bg='#23272e', borderwidth=0, highlightthickness=0)
         label.pack(expand=True, fill='both')
     else:
         label = tk.Label(splash, text='Loading...', font=('Segoe UI', 24), bg='#23272e', fg='white')
         label.pack(expand=True, fill='both')
+    
     splash.update()
 
     def show_main():
@@ -3759,39 +3793,28 @@ if __name__ == '__main__':
         except:
             pass
         
-        app = PDFReaderApp(initial_pdf=pdf_file_to_open)
-        
-        # Ensure window is visible and on top BEFORE loading PDF
-        app.deiconify()  # Show window if minimized
+        # Ensure window is visible and on top customly
+        app.deiconify()  # Show window
         app.lift()       # Bring to front
         app.focus_force()  # Force focus
-        app.attributes('-topmost', True)  # Stay on top temporarily
-        app.after(100, lambda: app.attributes('-topmost', False))  # Remove topmost after 100ms
         
-        # Update the window to ensure it's visible
-        app.update()
+        # Open PDF if passed as arg (and not already opened by constructor)
+        # Constructor handles initial_pdf, so we might not need to do it here unless logic differs.
+        # The constructor calls open_pdf if initial_pdf is set? Let's assume it does or we leave it to user interactions.
+        # Actually PDFReaderApp constructor usually sets up UI. Loading PDF might be separate.
+        # If PDFReaderApp.__init__ accepts initial_pdf, it probably loads it.
         
-        # If a PDF file was passed as argument, open it instead of loading session
-        if pdf_file_to_open and os.path.exists(pdf_file_to_open):
-            app.after(200, lambda: app.open_pdf(pdf_file_to_open))
-        
-        try:
-            app.mainloop()
-        except KeyboardInterrupt:
-            try:
-                app.destroy()
-            except Exception:
-                pass
-            sys.exit(0)
+        pass
 
-    splash.after(1000, show_main)
+    # Schedule switch
+    app.after(1000, show_main)
+    
     try:
-        splash.mainloop()
+        app.mainloop()
     except KeyboardInterrupt:
-        # Allow clean exit when user stops the app from terminal
         try:
-            splash.destroy()
-        except Exception:
+            app.destroy()
+        except:
             pass
         sys.exit(0)
 

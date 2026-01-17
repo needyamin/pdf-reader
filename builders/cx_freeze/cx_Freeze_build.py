@@ -5,6 +5,9 @@ import subprocess
 import time
 from cx_Freeze import setup, Executable
 
+# Change working directory to project root
+os.chdir(os.path.join(os.path.dirname(__file__), '..', '..'))
+
 APP_NAME = "Advanced PDF Reader"
 VERSION = "3.0.0"
 MAIN_SCRIPT = "pdfReader.py"
@@ -12,8 +15,8 @@ ICON_PATH = os.path.join("assets", "icons", "icon.ico")
 
 include_files = [
     ("assets", "assets"),
-    ("sitecustomize.py", "sitecustomize.py"),
-    ("sitecustomize.py", "lib/sitecustomize.py"),
+    (os.path.join("builders", "cx_freeze", "sitecustomize.py"), "sitecustomize.py"),
+    (os.path.join("builders", "cx_freeze", "sitecustomize.py"), "lib/sitecustomize.py"),
 ]
 
 packages = [
@@ -66,18 +69,21 @@ def _safe_rmtree(path, retries=3, delay=0.5):
     return False
 
 def _get_build_exe_dir():
-    base_dir = os.path.join("build", f"exe-{VERSION}")
-    if not os.path.exists(base_dir):
-        return base_dir
+    # Defined output directory
+    base_dir = os.path.join("dist", "cx_freeze")
+    
     # Try to clean existing dir
     if _safe_rmtree(base_dir):
         return base_dir
-    # Fallback to unique dir to avoid cleanup error
-    ts = time.strftime("%Y%m%d-%H%M%S")
-    return os.path.join("build", f"exe-{VERSION}-{ts}")
+    elif not os.path.exists(base_dir):
+        os.makedirs(base_dir, exist_ok=True)
+        return base_dir
+        
+    print(f"Warning: Could not clean {base_dir}, using it as is.")
+    return base_dir
 
 def _update_installer_paths(build_exe_dir):
-    iss_path = "installer.iss"
+    iss_path = os.path.join("builders", "cx_freeze", "installer.iss")
     if not os.path.exists(iss_path):
         return
     build_glob = os.path.join(build_exe_dir, "*").replace("/", "\\")
@@ -175,9 +181,8 @@ if sys.platform == "win32":
                     iscc_path = c
                     break
         if iscc_path:
-            subprocess.run([iscc_path, "installer.iss"], check=True)
+            subprocess.run([iscc_path, os.path.join("builders", "cx_freeze", "installer.iss")], check=True)
         else:
-            subprocess.run(["iscc", "installer.iss"], check=True)
+            subprocess.run(["iscc", os.path.join("builders", "cx_freeze", "installer.iss")], check=True)
     except Exception as e:
         print(f"[WARNING] Inno Setup build skipped or failed: {e}")
-

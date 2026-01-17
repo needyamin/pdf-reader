@@ -6,6 +6,9 @@ import subprocess
 import json
 import uuid
 
+# Change working directory to project root
+os.chdir(os.path.join(os.path.dirname(__file__), '..', '..'))
+
 # ---
 # To access bundled assets in your app, use this function:
 # (Copy this to your main app, e.g., pdfReader.py)
@@ -48,18 +51,21 @@ REQUIRED_PACKAGES = [
 
 # Build directory setup
 BUILD_DIR = "build"
-DIST_DIR = "dist"
+DIST_DIR = os.path.join("dist", "nuitka")
 ASSETS_DIR = "assets"
 
 def clean_directories():
     """Clean build and dist directories"""
     print("Cleaning build directories...")
-    for dir_path in [BUILD_DIR, DIST_DIR]:
-        if os.path.exists(dir_path):
-            shutil.rmtree(dir_path)
-            print(f"  [REMOVED] {dir_path}/")
-        else:
-            print(f"  [OK] {dir_path}/ - already clean")
+    # Clean output dir
+    if os.path.exists(DIST_DIR):
+        shutil.rmtree(DIST_DIR)
+        print(f"  [REMOVED] {DIST_DIR}/")
+    
+    # Clean temp build dir
+    if os.path.exists(BUILD_DIR):
+        shutil.rmtree(BUILD_DIR)
+        print(f"  [REMOVED] {BUILD_DIR}/")
 
 def copy_assets(target_root: str = None):
     """Copy assets to the specified output directory (defaults to DIST_DIR)."""
@@ -260,6 +266,7 @@ def build_executable():
         "--lto=no",  # Disabled LTO to fix MinGW compilation issues
         "--assume-yes-for-downloads",
         # Additional MinGW compatibility options
+        "--static-libpython=no",
         "--disable-dll-dependency-cache",
         "--no-prefer-source",
         # Production optimizations
@@ -365,26 +372,15 @@ def main():
         build_executable()
         print("[SUCCESS] Executable build completed!")
 
-        # Move dist folder to public folder after build
-        print("\n[STEP 4] Organizing build output...")
-        public_dir = "public"
-        dist_dir = DIST_DIR
-        public_dist = os.path.join(public_dir, dist_dir)
-        if not os.path.exists(public_dir):
-            os.makedirs(public_dir)
-            print(f"Created directory: {public_dir}")
-        if os.path.exists(public_dist):
-            shutil.rmtree(public_dist)
-            print(f"Removed existing: {public_dist}")
-        if os.path.exists(dist_dir):
-            shutil.move(dist_dir, public_dist)
-            print(f"Moved {dist_dir}/ to {public_dist}/")
+        # The output is directly in DIST_DIR now.
+        print(f"\n[STEP 4] Build output is in {DIST_DIR}")
 
         # Copy assets beside the executable for installer packaging and runtime access
-        print("\n[STEP 5] Copying assets to public/dist...")
-        copy_assets(target_root=public_dist)
+        print(f"\n[STEP 5] Copying assets to {DIST_DIR}...")
+        copy_assets(target_root=DIST_DIR)
         # Optional: optimize image assets to reduce installer size
-        optimize_images(target_root=public_dist)
+        optimize_images(target_root=DIST_DIR)
+        print(f"[SUCCESS] Assets prepared in {DIST_DIR}!")
         print("[SUCCESS] Assets prepared in public/dist!")
         
         # Create installer
@@ -397,7 +393,7 @@ def main():
         
         print("\n" + "=" * 60)
         print("SUCCESS: Production build completed successfully!")
-        print(f"Executable: {os.path.join(public_dist, APP_NAME + '.exe')}")
+        print(f"Executable: {os.path.join(DIST_DIR, APP_NAME + '.exe')}")
         if installer_ok:
             print(f"Installer: installer/{APP_NAME}-Setup.exe")
             print("Ready for deployment!")
