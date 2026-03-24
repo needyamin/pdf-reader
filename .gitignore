@@ -1,13 +1,10 @@
-# Build artifacts
+node_modules/
 dist/
-build/
-AppDir/
-*.AppImage
-version_info.txt
-installer.iss
-__pycache__/
-*.pyc
-*.spec
-venv/
-.idea/
-.vscode/
+out/
+*.js.map
+*.d.ts
+*.tsbuildinfo
+.env
+.DS_Store
+Thumbs.db
+*.log

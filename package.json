@@ -1,0 +1,91 @@
+{
+  "name": "advanced-pdf-reader",
+  "version": "1.0.0",
+  "description": "Advanced PDF Reader - Professional Document Viewer with Annotations & Form Filling",
+  "main": "dist/main.js",
+  "scripts": {
+    "build": "npx tsc",
+    "start": "npx tsc && set ELECTRON_RUN_AS_NODE=& electron .",
+    "dev": "npx tsc && set ELECTRON_RUN_AS_NODE=& electron .",
+    "pack": "electron-builder --dir",
+    "dist": "npx tsc && set CSC_IDENTITY_AUTO_DISCOVERY=false&& electron-builder --win --publish never"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/needyamin/pdf-reader.git"
+  },
+  "keywords": [
+    "pdf",
+    "reader",
+    "electron",
+    "typescript",
+    "annotations",
+    "form-filling"
+  ],
+  "author": "YAMiN HOSSAIN <needyamin@github.com>",
+  "license": "MIT",
+  "build": {
+    "appId": "com.needyamin.advanced-pdf-reader",
+    "productName": "Advanced PDF Reader",
+    "directories": {
+      "output": "out"
+    },
+    "files": [
+      "dist/**/*",
+      "renderer/**/*",
+      "node_modules/pdfjs-dist/**/*",
+      "node_modules/pdf-lib/**/*",
+      "assets/**/*"
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "assets/icon.ico",
+      "publisherName": "YAMiN HOSSAIN",
+      "signAndEditExecutable": false
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "installerIcon": "assets/icon.ico",
+      "uninstallerIcon": "assets/icon.ico",
+      "installerHeaderIcon": "assets/icon.ico",
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Advanced PDF Reader"
+    },
+    "fileAssociations": [
+      {
+        "ext": "pdf",
+        "name": "PDF Document",
+        "description": "PDF Document",
+        "role": "Viewer",
+        "icon": "assets/icon.ico"
+      }
+    ],
+    "publish": {
+      "provider": "github",
+      "owner": "needyamin",
+      "repo": "pdf-reader",
+      "releaseType": "release"
+    }
+  },
+  "dependencies": {
+    "electron-updater": "^6.8.3",
+    "pdf-lib": "^1.17.1",
+    "pdfjs-dist": "^3.11.174"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.9",
+    "concurrently": "^9.1.2",
+    "electron": "^34.2.0",
+    "electron-builder": "^25.1.8",
+    "typescript": "^5.8.2"
+  }
+}
