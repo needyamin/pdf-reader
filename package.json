@@ -8,7 +8,7 @@
     "start": "npx tsc && set ELECTRON_RUN_AS_NODE=& electron .",
     "dev": "npx tsc && set ELECTRON_RUN_AS_NODE=& electron .",
     "pack": "electron-builder --dir",
-    "dist": "npx tsc && set CSC_IDENTITY_AUTO_DISCOVERY=false&& electron-builder --win --publish never"
+    "dist": "npx tsc && node scripts/build.js"
   },
   "repository": {
     "type": "git",
@@ -47,7 +47,7 @@
         }
       ],
       "icon": "assets/icon.ico",
-      "publisherName": "YAMiN HOSSAIN",
+      "executableName": "Advanced PDF Reader",
       "signAndEditExecutable": false
     },
     "nsis": {
@@ -63,8 +63,8 @@
     "fileAssociations": [
       {
         "ext": "pdf",
-        "name": "PDF Document",
-        "description": "PDF Document",
+        "name": "Advanced PDF Reader",
+        "description": "Open with Advanced PDF Reader",
         "role": "Viewer",
         "icon": "assets/icon.ico"
       }
@@ -86,6 +86,7 @@
     "concurrently": "^9.1.2",
     "electron": "^34.2.0",
     "electron-builder": "^25.1.8",
+    "rcedit": "^5.0.2",
     "typescript": "^5.8.2"
   }
 }
