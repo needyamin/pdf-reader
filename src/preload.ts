@@ -14,6 +14,7 @@ const pdfjsBuildPath = path.join(pdfjsBasePath, 'build');
 
 contextBridge.exposeInMainWorld('electronAPI', {
     // File Operations
+    rendererReady: () => ipcRenderer.invoke('renderer-ready'),
     openFileDialog: () => ipcRenderer.invoke('open-file-dialog'),
     savePDF: (data: number[], filePath: string) => ipcRenderer.invoke('save-pdf', data, filePath),
     savePDFAs: (data: number[]) => ipcRenderer.invoke('save-pdf-as', data),

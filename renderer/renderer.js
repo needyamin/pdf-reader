@@ -99,7 +99,8 @@ async function initApp() {
     bindEvents();
     setupDragAndDrop();
     loadBookmarks();
-    setupKeyboardShortcuts();
+    updateRecentFiles(await api.getRecentFiles());
+    window.electronAPI.rendererReady();
 }
 
 function loadTheme() {
@@ -1836,7 +1837,7 @@ function showShortcutsModal() {
 function showAboutModal() {
     el.helpModalTitle.textContent = 'About Advanced PDF Reader';
     el.helpModalBody.innerHTML = `
-      <p style="margin-bottom:12px"><strong>Advanced PDF Reader</strong> v1.0.0</p>
+      <p style="margin-bottom:12px"><strong>Advanced PDF Reader</strong> v4.0.0</p>
       <p style="color:var(--text-secondary);font-size:12px;margin-bottom:8px">Professional PDF viewer with annotations, form filling, themes, and more.</p>
       <p style="color:var(--text-tertiary);font-size:11px">By YAMiN HOSSAIN &bull; <a href="https://github.com/needyamin/pdf-reader" style="color:var(--accent-primary)">GitHub</a></p>
     `;

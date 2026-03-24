@@ -19,14 +19,23 @@ app.on('second-instance', (_event, argv) => {
     if (mainWindow) {
         if (mainWindow.isMinimized()) mainWindow.restore();
         mainWindow.focus();
-        const pdfArg = argv.find(a => a.toLowerCase().endsWith('.pdf'));
-        if (pdfArg && fs.existsSync(pdfArg)) loadPDFFile(pdfArg);
+        const pdfArg = getPdfFromArgs(argv);
+        if (pdfArg) loadPDFFile(pdfArg);
     }
 });
 
+app.setAppUserModelId('com.needyamin.advanced-pdf-reader');
+
 function getPdfFromArgs(argv: string[]): string | null {
-    const arg = argv.find(a => a.toLowerCase().endsWith('.pdf'));
-    return (arg && fs.existsSync(arg)) ? arg : null;
+    // Look for any argument that is a valid PDF file path
+    // Skip the first argument as it's the executable on Windows
+    const args = process.env.ELECTRON_RUN_AS_NODE ? argv.slice(2) : argv.slice(1);
+    for (const arg of args) {
+        if (arg.toLowerCase().endsWith('.pdf') && fs.existsSync(arg)) {
+            return arg;
+        }
+    }
+    return null;
 }
 
 function loadRecentFiles(): void {
@@ -67,6 +76,7 @@ function createWindow(): void {
         frame: false,
         titleBarStyle: 'hidden',
         backgroundColor: '#0a0a0f',
+        title: 'Advanced PDF Reader',
         icon: path.join(__dirname, '..', 'assets', 'icon.ico'),
         webPreferences: {
             preload: path.join(__dirname, 'preload.js'),
@@ -83,10 +93,6 @@ function createWindow(): void {
     mainWindow.once('ready-to-show', () => {
         mainWindow?.show();
         mainWindow?.webContents.send('recent-files-updated', recentFiles);
-        if (pendingFilePath) {
-            loadPDFFile(pendingFilePath);
-            pendingFilePath = null;
-        }
     });
 
     mainWindow.webContents.on('console-message', (event, level, message, line, sourceId) => {
@@ -197,6 +203,13 @@ function loadPDFFile(filePath: string): void {
 }
 
 // IPC Handlers
+ipcMain.handle('renderer-ready', () => {
+    if (pendingFilePath) {
+        loadPDFFile(pendingFilePath);
+        pendingFilePath = null;
+    }
+});
+
 ipcMain.handle('open-file-dialog', async () => {
     await openFileDialog();
 });

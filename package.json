@@ -1,6 +1,6 @@
 {
   "name": "advanced-pdf-reader",
-  "version": "1.0.0",
+  "version": "4.0.0",
   "description": "Advanced PDF Reader - Professional Document Viewer with Annotations & Form Filling",
   "main": "dist/main.js",
   "scripts": {
@@ -8,7 +8,7 @@
     "start": "npx tsc && set ELECTRON_RUN_AS_NODE=& electron .",
     "dev": "npx tsc && set ELECTRON_RUN_AS_NODE=& electron .",
     "pack": "electron-builder --dir",
-    "dist": "npx tsc && node scripts/build.js"
+    "dist": "node scripts/build.js"
   },
   "repository": {
     "type": "git",
@@ -27,6 +27,7 @@
   "build": {
     "appId": "com.needyamin.advanced-pdf-reader",
     "productName": "Advanced PDF Reader",
+    "copyright": "Copyright © 2026 YAMiN HOSSAIN",
     "directories": {
       "output": "out"
     },
@@ -39,26 +40,24 @@
     ],
     "win": {
       "target": [
-        {
-          "target": "nsis",
-          "arch": [
-            "x64"
-          ]
-        }
+        "nsis"
       ],
       "icon": "assets/icon.ico",
       "executableName": "Advanced PDF Reader",
+      "publisherName": "YAMiN HOSSAIN",
       "signAndEditExecutable": false
     },
     "nsis": {
       "oneClick": false,
+      "perMachine": false,
       "allowToChangeInstallationDirectory": true,
       "installerIcon": "assets/icon.ico",
       "uninstallerIcon": "assets/icon.ico",
       "installerHeaderIcon": "assets/icon.ico",
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
-      "shortcutName": "Advanced PDF Reader"
+      "shortcutName": "Advanced PDF Reader",
+      "uninstallDisplayName": "Advanced PDF Reader"
     },
     "fileAssociations": [
       {

@@ -3,42 +3,75 @@ const { rcedit } = require('rcedit');
 const path = require('path');
 const fs = require('fs');
 
-process.env.CSC_IDENTITY_AUTO_DISCOVERY = 'false';
-const run = (cmd) => execSync(cmd, { stdio: 'inherit', cwd: path.join(__dirname, '..') });
 const root = path.join(__dirname, '..');
-const exePath = path.join(root, 'out', 'win-unpacked', 'Advanced PDF Reader.exe');
+const pkg = require(path.join(root, 'package.json'));
+const VER = pkg.version;
+const APP = pkg.build.productName;
+const exeName = `${APP}.exe`;
+const setupName = `${APP} Setup ${VER}.exe`;
+const outDir = path.join(root, 'out');
+const exePath = path.join(outDir, 'win-unpacked', exeName);
+const setupPath = path.join(outDir, setupName);
+const certPath = path.join(root, 'cert.pfx');
+const signScript = path.join(__dirname, 'sign.ps1');
 
-(async () => {
-    console.log('Step 1: Package app...');
-    run('npx electron-builder --win --dir');
+process.env.CSC_IDENTITY_AUTO_DISCOVERY = 'false';
 
-    console.log('Step 2: Patch exe with icon and metadata...');
-    await rcedit(exePath, {
+const run = (cmd) => execSync(cmd, { stdio: 'inherit', cwd: root });
+
+const sign = (filePath) => {
+    if (!fs.existsSync(certPath) || !fs.existsSync(filePath)) return;
+    try {
+        run(`powershell -ExecutionPolicy Bypass -File "${signScript}" -ExePath "${filePath}"`);
+        console.log(`  • signed: ${path.basename(filePath)}`);
+    } catch (e) {
+        console.log(`  • sign skipped: ${path.basename(filePath)}`);
+    }
+};
+
+const patch = async (filePath) => {
+    await rcedit(filePath, {
         icon: path.join(root, 'assets', 'icon.ico'),
-        'product-version': '1.0.0',
-        'file-version': '1.0.0',
+        'product-version': VER,
+        'file-version': VER,
         'version-string': {
-            ProductName: 'Advanced PDF Reader',
-            FileDescription: 'Advanced PDF Reader',
+            ProductName: APP,
+            FileDescription: APP,
             CompanyName: 'YAMiN HOSSAIN',
             LegalCopyright: 'Copyright (c) 2026 YAMiN HOSSAIN',
-            OriginalFilename: 'Advanced PDF Reader.exe',
+            OriginalFilename: exeName,
         }
     });
-    console.log('  • exe patched successfully');
+};
 
-    console.log('Step 3: Sign exe with certificate...');
-    const certPathAbs = path.join(root, 'cert.pfx');
+(async () => {
     try {
-        const psCmd = `$cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2('${certPathAbs.replace(/\\/g, '\\\\')}','PdfReader2026!'); Set-AuthenticodeSignature -FilePath '${exePath.replace(/\\/g, '\\\\')}' -Certificate $cert -TimestampServer 'http://timestamp.digicert.com'`;
-        run(`powershell -ExecutionPolicy Bypass -Command "${psCmd}"`);
-        console.log('  • exe signed successfully');
+        console.log(`\n  Building ${APP} v${VER}\n`);
+
+        // Clean old output
+        if (fs.existsSync(outDir)) {
+            console.log('Cleaning old build...');
+            fs.rmSync(outDir, { recursive: true, force: true });
+        }
+
+        console.log('Step 1/4: Compile & Build...');
+        run('npx tsc');
+        run('npx electron-builder --win --publish never');
+        console.log('  • done');
+
+        console.log('Step 2/4: Patch exe...');
+        await patch(exePath);
+        console.log('  • done');
+
+        console.log('Step 3/4: Sign exe...');
+        sign(exePath);
+
+        console.log('Step 4/4: Sign installer...');
+        sign(setupPath);
+
+        console.log(`\n  Done! ${setupName} ready in out/\n`);
     } catch (e) {
-        console.log('  • signing skipped (non-critical)');
+        console.error('\nBuild failed:', e.message);
+        process.exit(1);
     }
-
-    console.log('Step 4: Build installer...');
-    run('npx electron-builder --win nsis --publish never --prepackaged out/win-unpacked');
-
-    console.log('Done! Output: out/Advanced PDF Reader Setup 1.0.0.exe');
 })();
