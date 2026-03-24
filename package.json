@@ -38,6 +38,7 @@
       "node_modules/pdf-lib/**/*",
       "assets/**/*"
     ],
+    "afterPack": "scripts/afterPack.js",
     "win": {
       "target": [
         "nsis"
