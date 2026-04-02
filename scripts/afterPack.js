@@ -1,10 +1,10 @@
-const { rcedit } = require('rcedit');
 const fs = require('fs');
 const path = require('path');
 
 module.exports = async function(context) {
     const exePath = path.join(context.appOutDir, `${context.packager.appInfo.productFilename}.exe`);
     if (!fs.existsSync(exePath)) return; // Windows-only step; skip for Linux targets.
+    const { rcedit } = await import('rcedit'); // rcedit is ESM; load dynamically in CommonJS.
     const pkg = context.packager.appInfo;
     await rcedit(exePath, {
         icon: path.resolve(__dirname, '..', 'assets', 'icon.ico'),
