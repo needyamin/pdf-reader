@@ -14,6 +14,9 @@ const signScript = path.join(__dirname, 'sign.ps1');
 
 process.env.CSC_IDENTITY_AUTO_DISCOVERY = 'false';
 const run = (cmd) => execSync(cmd, { stdio: 'inherit', cwd: root });
+const args = process.argv.slice(2).map((a) => String(a).toLowerCase());
+const buildAppImage = args.includes('appimage') || args.includes('linux') || args.includes('appimage64');
+const electronBuilderTarget = buildAppImage ? '--linux appimage' : '--win';
 
 const sign = (filePath) => {
     if (!fs.existsSync(certPath) || !fs.existsSync(filePath)) return;
@@ -34,13 +37,17 @@ if (fs.existsSync(outDir)) {
 
 console.log('Step 1/3: Compile & Build...');
 run('npx tsc');
-run('npx electron-builder --win --publish never');
+run(`npx electron-builder ${electronBuilderTarget} --publish never`);
 console.log('  • done');
 
-console.log('Step 2/3: Sign exe...');
-sign(exePath);
+if (buildAppImage) {
+    console.log('\n  Done! AppImage ready in out/\n');
+} else {
+    console.log('Step 2/3: Sign exe...');
+    sign(exePath);
 
-console.log('Step 3/3: Sign installer...');
-sign(setupPath);
+    console.log('Step 3/3: Sign installer...');
+    sign(setupPath);
 
-console.log(`\n  Done! ${APP} Setup ${VER}.exe ready in out/\n`);
+    console.log(`\n  Done! ${APP} Setup ${VER}.exe ready in out/\n`);
+}

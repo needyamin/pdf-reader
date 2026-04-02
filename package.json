@@ -39,6 +39,12 @@
       "assets/**/*"
     ],
     "afterPack": "scripts/afterPack.js",
+    "linux": {
+      "target": [
+        "AppImage"
+      ],
+      "icon": "assets/icon.png"
+    },
     "win": {
       "target": [
         "nsis"
