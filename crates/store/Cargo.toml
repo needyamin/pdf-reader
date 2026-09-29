@@ -1,0 +1,18 @@
+[package]
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+name = "pdfreader-store"
+description = "Configuration, recent files, session and disk cache"
+publish = false
+
+[dependencies]
+pdfreader-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,16 @@
+# Workspace build configuration.
+#
+# Incremental compilation is disabled for every profile.
+#
+# This project can live on a drive where rustc's incremental cache hits
+# intermittent file-lock / file-copy errors ("Access is denied (os error 5)").
+# When the cache is left half-written, rustc can crash with an internal compiler
+# error (ICE) on the next build. Disabling incremental trades a little rebuild
+# speed for a build that reliably succeeds. See the note in the root Cargo.toml.
+[build]
+incremental = false
+
+# `cargo xtask <cmd>` is the documented build interface, so alias it here
+# rather than requiring `cargo run -p xtask -- <cmd>` everywhere.
+[alias]
+xtask = "run -p xtask --"

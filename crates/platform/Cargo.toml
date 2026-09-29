@@ -1,0 +1,15 @@
+[package]
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+name = "pdfreader-platform"
+description = "OS integration: dialogs, clipboard, printing, theme, file watching"
+publish = false
+
+[dependencies]
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,20 @@
+[package]
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+name = "xtask"
+description = "Build, packaging and release automation"
+publish = false
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+flate2 = "1"
+sha2 = "0.10"
+tar = "0.4"
+ureq = "3"
+
+[lints]
+workspace = true

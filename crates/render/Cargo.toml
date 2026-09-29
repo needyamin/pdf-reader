@@ -1,0 +1,16 @@
+[package]
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+name = "pdfreader-render"
+description = "Page layout, tile ladder, tile cache and text run geometry"
+publish = false
+
+[dependencies]
+pdfreader-core = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

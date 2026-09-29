@@ -1,0 +1,33 @@
+[package]
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+name = "pdfreader-app"
+description = "PDF Reader desktop application"
+publish = false
+
+[[bin]]
+name = "pdf-reader"
+path = "src/main.rs"
+
+[dependencies]
+pdfreader-core = { workspace = true }
+pdfreader-pdf = { workspace = true }
+pdfreader-render = { workspace = true }
+pdfreader-search = { workspace = true }
+pdfreader-ui = { workspace = true }
+crossbeam-channel = { workspace = true }
+eframe = { workspace = true }
+egui = { workspace = true }
+# Only the PNG encoder is needed (for the PDFREADER_SCREENSHOT debug capture).
+image = { version = "0.25", default-features = false, features = ["png"] }
+rfd = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[lints]
+workspace = true

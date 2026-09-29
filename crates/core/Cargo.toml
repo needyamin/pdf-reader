@@ -1,0 +1,15 @@
+[package]
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+name = "pdfreader-core"
+description = "Domain model, commands and application state for the PDF reader"
+publish = false
+
+[dependencies]
+serde = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,18 @@
+[package]
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+name = "pdfreader-pdf"
+description = "PDF engine abstraction and PDFium backend"
+publish = false
+
+[dependencies]
+pdfreader-core = { workspace = true }
+pdfium-render = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,16 @@
+//! egui widgets and theming for the PDF reader shell.
+//!
+//! This crate is presentation only: it draws the chrome and reports what the
+//! user did as [`pdfreader_core::Command`]s. The application crate owns the
+//! panels, the canvas and the engine, so it can inject live content (rendered
+//! pages, thumbnails) into the layout.
+
+pub mod chrome;
+pub mod theme;
+
+pub use chrome::{
+    MENUBAR_HEIGHT, SIDEBAR_TABS, STATUSBAR_HEIGHT, TABBAR_HEIGHT, TOOLBAR_HEIGHT,
+    TOOLS_RAIL_WIDTH, available_sidebar_tabs, forms_panel, menu_bar, outline_tree, sidebar_tabs,
+    status_bar, tab_bar, toolbar, tools_rail,
+};
+pub use theme::{Palette, Theme, apply as apply_theme};

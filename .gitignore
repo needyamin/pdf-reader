@@ -1,12 +1,14 @@
-node_modules/
-dist/
-out/
-*.js.map
-*.d.ts
-*.tsbuildinfo
-.env
+# Rust / Cargo
+/target
+
+# Session and tooling artifacts
+*.log
+.build_log.txt
+.clippy_log.txt
+.test_log.txt
+/.workbuddy-ai/
+
+# OS and editor noise
 .DS_Store
 Thumbs.db
-*.log
-cert.pfx
-*.pfx
+.env
