@@ -6,12 +6,12 @@
 
 use egui::{
     Align2, Color32, FontId, Id, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, Ui, Vec2,
-    ViewportCommand,
+    ViewportCommand, containers::menu::SubMenuButton,
 };
 use pdfreader_core::{
-    AnnotationId, AnnotationInfo, AnnotationKind, AppState, Command, DocumentId, FieldId,
-    FieldValue, FormFieldInfo, FormFieldType, FormInfo, ImageFormat, Outline, OutlineNode,
-    SidebarTab, Tab, ThemeId, Tool, ViewMode, ZoomMode,
+    AnnotationId, AnnotationInfo, AnnotationKind, AppState, Command, DocumentId, ExportTask,
+    FieldId, FieldValue, FormFieldInfo, FormFieldType, FormInfo, Outline, OutlineNode, SidebarTab,
+    Tab, ThemeId, Tool, ViewMode, ZoomMode,
 };
 
 use crate::theme::Palette;
@@ -112,11 +112,6 @@ fn file_menu(ui: &mut Ui, state: &AppState) -> Vec<Command> {
         }
 
         ui.separator();
-        ui.menu_button("Export", |ui| {
-            export_menu(ui, &mut commands);
-        });
-
-        ui.separator();
         if menu_item(ui, "Print…", "Ctrl+P").clicked() {
             commands.push(Command::Print);
             ui.close();
@@ -127,17 +122,15 @@ fn file_menu(ui: &mut Ui, state: &AppState) -> Vec<Command> {
         }
     });
 
-    // Composition needs no open document: the inputs are files the user picks
-    // and the result is a new file, so this is available from an empty window.
+    // Export is outside the block above: two of its five tasks work from files
+    // the user picks and need no open document, which is exactly when someone
+    // wants to merge two PDFs they have not opened. It carries the Ctrl+E hint
+    // on the submenu button itself, since the five tasks inside have no single
+    // shortcut of their own.
     ui.separator();
-    if menu_item(ui, "Create PDF from images…", "").clicked() {
-        commands.push(Command::ShowImagesToPdfDialog);
-        ui.close();
-    }
-    if menu_item(ui, "Merge PDFs…", "").clicked() {
-        commands.push(Command::ShowMergeDialog);
-        ui.close();
-    }
+    SubMenuButton::from_button(menu_item_button("Export", "Ctrl+E")).ui(ui, |ui| {
+        commands.extend(export_menu(ui, has_doc));
+    });
 
     ui.separator();
     ui.add_enabled_ui(has_tab, |ui| {
@@ -158,32 +151,29 @@ fn file_menu(ui: &mut Ui, state: &AppState) -> Vec<Command> {
     commands
 }
 
-/// The Export submenu. Everything here writes a *new* file rather than
-/// updating the open one, which is what separates it from Save.
+/// The Export submenu: one entry per task the export window can be opened on.
 ///
-/// The image entries are generated from [`ImageFormat::ALL`] so that adding a
-/// format in the domain model adds its menu entries here.
-fn export_menu(ui: &mut Ui, commands: &mut Vec<Command>) {
-    for format in ImageFormat::ALL {
-        if menu_item(ui, &format!("Page as {}…", format.label()), "").clicked() {
-            commands.push(Command::ShowExportImageDialog(format));
-            ui.close();
-        }
+/// All five are always listed, even when the window has no document to read.
+/// Hiding the ones that need a document would make the menu change shape as
+/// tabs open and close, and a disabled row that stays put is easier to learn
+/// than one that comes and goes.
+///
+/// The entries come from [`ExportTask::ALL`], so a new task in the domain model
+/// appears here without a change to the menu.
+fn export_menu(ui: &mut Ui, has_doc: bool) -> Vec<Command> {
+    let mut commands = Vec::new();
+
+    for task in ExportTask::ALL {
+        let enabled = !task.needs_document() || has_doc;
+        ui.add_enabled_ui(enabled, |ui| {
+            if menu_item(ui, task.label(), "").clicked() {
+                commands.push(Command::ShowExportWindow(task));
+                ui.close();
+            }
+        });
     }
 
-    ui.separator();
-    for format in ImageFormat::ALL {
-        if menu_item(ui, &format!("All pages as {}…", format.label()), "").clicked() {
-            commands.push(Command::ShowExportAllPagesDialog(format));
-            ui.close();
-        }
-    }
-
-    ui.separator();
-    if menu_item(ui, "Current page as PDF…", "").clicked() {
-        commands.push(Command::ShowExportPagesPdfDialog);
-        ui.close();
-    }
+    commands
 }
 
 /// Top-level application menu.

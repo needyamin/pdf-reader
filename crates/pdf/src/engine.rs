@@ -13,8 +13,8 @@ use std::path::{Path, PathBuf};
 
 use pdfium_render::prelude::*;
 use pdfreader_core::{
-    AnnotationId, AnnotationInfo, FormInfo, ImageFormat, NewAnnotation, Outline, OutlineNode,
-    PageGeometry, PageRange, Rotation,
+    AnnotationId, AnnotationInfo, FormInfo, ImageFormat, ImagePageSize, NewAnnotation, Outline,
+    OutlineNode, PageGeometry, PageRange, Rotation,
 };
 
 use crate::annot;
@@ -207,14 +207,15 @@ pub trait PdfEngine {
         job: &mut JobProgress<'_>,
     ) -> Result<u32>;
 
-    /// Build a PDF with one page per image, each page exactly the image's size.
+    /// Build a PDF with one page per image.
     ///
-    /// `scale` is points per pixel. Returns the number of pages written.
+    /// `size` decides whether each page is the image or a standard sheet with
+    /// the image fitted into it. Returns the number of pages written.
     fn images_to_pdf(
         &mut self,
         images: &[PathBuf],
         output: &Path,
-        scale: f32,
+        size: ImagePageSize,
         job: &mut JobProgress<'_>,
     ) -> Result<u32>;
 }
@@ -745,10 +746,10 @@ impl PdfEngine for PdfiumEngine {
         &mut self,
         images: &[PathBuf],
         output: &Path,
-        scale: f32,
+        size: ImagePageSize,
         job: &mut JobProgress<'_>,
     ) -> Result<u32> {
-        export::images_to_pdf(self.pdfium, images, output, scale, job)
+        export::images_to_pdf(self.pdfium, images, output, size, job)
     }
 }
 

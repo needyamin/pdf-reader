@@ -6,6 +6,7 @@
 
 mod canvas;
 mod engine_thread;
+mod export_window;
 mod print;
 
 use std::collections::HashMap;
@@ -16,8 +17,8 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 
 use egui::ViewportCommand;
 use pdfreader_core::{
-    Command, DocumentId, Effect, ExportTarget, FieldValue, FormFieldType, SidebarTab, Store, Tab,
-    ThemeId, Tool, ViewMode, ZoomMode,
+    Command, DocumentId, Effect, ExportTarget, ExportTask, FieldValue, FormFieldType, Rotation,
+    SidebarTab, Store, Tab, ThemeId, Tool, ViewMode, ZoomMode,
 };
 use pdfreader_pdf::engine::{DocumentHandle, PdfiumEngine};
 use pdfreader_search::SearchMatch;
@@ -30,6 +31,7 @@ use serde::{Deserialize, Serialize};
 
 use canvas::{Canvas, MARGIN, PendingThumb, PendingTile, SCROLLBAR_ALLOWANCE};
 use engine_thread::{EngineRequest, EngineResponse, EngineThread};
+use export_window::{ExportWindow, Field, OpenDocument};
 
 /// Application icon, embedded at compile time so the window is branded even
 /// when the exe is copied somewhere without `assets/` next to it.
@@ -242,21 +244,14 @@ enum DialogIntent {
     OpenPdf,
     /// Pick where to save the active document.
     SavePdf,
-    /// Pick where to save the current page as an image.
-    SavePageImage(pdfreader_core::ImageFormat),
-    /// Pick where to save the current page as a PDF.
-    SavePagePdf,
-    /// Pick a folder to write every page into as images.
-    PickImageFolder(pdfreader_core::ImageFormat),
-    /// Pick several images to compose into a PDF.
-    PickImages,
-    /// Pick several PDFs to merge.
-    PickPdfs,
-    /// Pick where to save a composed or merged document.
-    ///
-    /// Only ever the second half of a two-step job, which is why it reads its
-    /// inputs from `pending_sources` rather than carrying them.
-    SaveComposed,
+    /// Pick the export window's output file.
+    ExportOutputFile,
+    /// Pick the export window's output directory.
+    ExportOutputFolder,
+    /// Pick images to add to the export window's list.
+    ExportAddImages,
+    /// Pick PDFs to add to the export window's list.
+    ExportAddPdfs,
 }
 
 /// What a native dialog came back with.
@@ -267,14 +262,6 @@ enum DialogResult {
     Path(PathBuf),
     /// Several files, in the order the dialog returned them.
     Paths(Vec<PathBuf>),
-}
-
-/// Inputs for a job that is still waiting for its destination.
-enum PendingJob {
-    /// Images to place into a new PDF, one page each.
-    ImagesToPdf(Vec<PathBuf>),
-    /// Documents to concatenate, in order.
-    MergePdfs(Vec<PathBuf>),
 }
 
 /// Show one native dialog and normalise its answer.
@@ -305,46 +292,35 @@ fn run_dialog(intent: DialogIntent, default_name: Option<String>) -> DialogResul
         .save_file()
         .map_or(DialogResult::Cancelled, DialogResult::Path),
 
-        DialogIntent::SavePageImage(format) => with_name(
-            rfd::FileDialog::new()
-                .add_filter(format.label(), &[format.extension()])
-                .set_title("Save page as"),
-        )
-        .save_file()
-        .map_or(DialogResult::Cancelled, DialogResult::Path),
-
-        DialogIntent::SavePagePdf => with_name(
+        // The export window's own pickers. They stay native — an in-app file
+        // browser would be a worse file browser — but they feed the window
+        // rather than ending the interaction.
+        DialogIntent::ExportOutputFile => with_name(
             rfd::FileDialog::new()
                 .add_filter("PDF document", &["pdf"])
-                .set_title("Save page as PDF"),
+                .add_filter("PNG image", &["png"])
+                .add_filter("JPEG image", &["jpg", "jpeg"])
+                .set_title("Save as"),
         )
         .save_file()
         .map_or(DialogResult::Cancelled, DialogResult::Path),
 
-        DialogIntent::PickImageFolder(_) => rfd::FileDialog::new()
+        DialogIntent::ExportOutputFolder => rfd::FileDialog::new()
             .set_title("Choose a folder for the exported pages")
             .pick_folder()
             .map_or(DialogResult::Cancelled, DialogResult::Path),
 
-        DialogIntent::PickImages => rfd::FileDialog::new()
+        DialogIntent::ExportAddImages => rfd::FileDialog::new()
             .add_filter("Images", IMAGE_EXTENSIONS)
             .set_title("Choose images, one page each")
             .pick_files()
             .map_or(DialogResult::Cancelled, DialogResult::Paths),
 
-        DialogIntent::PickPdfs => rfd::FileDialog::new()
+        DialogIntent::ExportAddPdfs => rfd::FileDialog::new()
             .add_filter("PDF document", &["pdf"])
             .set_title("Choose PDFs to merge, in order")
             .pick_files()
             .map_or(DialogResult::Cancelled, DialogResult::Paths),
-
-        DialogIntent::SaveComposed => with_name(
-            rfd::FileDialog::new()
-                .add_filter("PDF document", &["pdf"])
-                .set_title("Save the new PDF as"),
-        )
-        .save_file()
-        .map_or(DialogResult::Cancelled, DialogResult::Path),
     }
 }
 
@@ -357,25 +333,34 @@ fn dialog_intent_for(command: &Command) -> Option<DialogIntent> {
     match command {
         Command::ShowOpenDialog => Some(DialogIntent::OpenPdf),
         Command::SaveDocumentAs => Some(DialogIntent::SavePdf),
-        Command::ShowExportImageDialog(format) => Some(DialogIntent::SavePageImage(*format)),
-        Command::ShowExportPagesPdfDialog => Some(DialogIntent::SavePagePdf),
-        Command::ShowExportAllPagesDialog(format) => Some(DialogIntent::PickImageFolder(*format)),
-        Command::ShowImagesToPdfDialog => Some(DialogIntent::PickImages),
-        Command::ShowMergeDialog => Some(DialogIntent::PickPdfs),
         _ => None,
     }
 }
 
-/// Default file name for a dialog that saves the page currently in view.
+/// The export-window field a picker fills in.
 ///
-/// One-based and zero-padded to match the names "all pages as images" writes,
-/// so a directory of mixed exports still sorts in page order.
-fn page_file_name(tab: &Tab, extension: &str) -> String {
-    let stem = tab
-        .document
-        .as_ref()
-        .map_or_else(|| "page".to_string(), |doc| doc.title.clone());
-    format!("{stem}-page-{:04}.{extension}", tab.view.current_page + 1)
+/// The export window asks for a picker by naming the field it wants filled, and
+/// this is the one place that knows which native dialog that means.
+fn dialog_intent_for_field(field: Field) -> DialogIntent {
+    match field {
+        Field::OutputFile => DialogIntent::ExportOutputFile,
+        Field::OutputFolder => DialogIntent::ExportOutputFolder,
+        Field::AddImages => DialogIntent::ExportAddImages,
+        Field::AddPdfs => DialogIntent::ExportAddPdfs,
+    }
+}
+
+/// Debug aid for `PDFREADER_EXPORT_WINDOW=<name>`.
+///
+/// Opening the window on a named task at launch is the only way to check that
+/// all five layouts draw without a human at the screen. The names are the ones
+/// a reader would guess from the menu; anything else is reported and ignored.
+fn export_task_from_name(name: &str) -> Option<ExportTask> {
+    let name = name.trim().to_ascii_lowercase();
+    ExportTask::ALL.into_iter().find(|task| {
+        // "Page to image" → "page-to-image", so the shell spelling is accepted.
+        task.label().to_ascii_lowercase().replace(' ', "-") == name
+    })
 }
 
 /// What a status message is telling the user, which decides how it looks.
@@ -449,12 +434,14 @@ struct App {
     /// What the open dialog is for, so its answer can be routed. `None` means
     /// no dialog is open.
     dialog_intent: Option<DialogIntent>,
-    /// Files the user picked for a job that still needs a destination.
+    /// The export window, when one is open.
     ///
-    /// The native dialog API has no "pick inputs and a destination at once", so
-    /// images→PDF and merge run in two steps and the inputs wait here while the
-    /// save dialog is open.
-    pending_sources: Option<PendingJob>,
+    /// At most one at a time: it is a modal, so a second one could only ever be
+    /// behind the first.
+    export_window: Option<ExportWindow>,
+    /// The export task the window was last opened on, so reopening it returns
+    /// to what the user was doing rather than to the first task every time.
+    last_export_task: ExportTask,
     /// Tab awaiting the unsaved-changes prompt.
     ///
     /// Set by `Effect::ConfirmClose`; the tab is not closed until the user
@@ -556,7 +543,8 @@ impl App {
             dialog_rx,
             dialog_tx,
             dialog_intent: None,
-            pending_sources: None,
+            export_window: None,
+            last_export_task: ExportTask::default(),
             pending_close: None,
             close_after_save: None,
             save_error: None,
@@ -590,6 +578,29 @@ impl App {
         if let Some(path) = initial {
             let effects = app.store.dispatch(Command::OpenPath(path));
             app.execute(effects);
+        }
+
+        // Debug: open the export window straight away so its layout can be
+        // exercised without a human clicking through the menu. The value is a
+        // task name from `ExportTask::label`, optionally followed by a
+        // comma-separated list of files to put in the window's list:
+        // `PDFREADER_EXPORT_WINDOW="merge-pdfs:a.pdf,b.pdf"`.
+        if let Ok(value) = std::env::var("PDFREADER_EXPORT_WINDOW") {
+            let (name, files) = value.split_once(':').unwrap_or((value.as_str(), ""));
+            if let Some(task) = export_task_from_name(name) {
+                app.open_export_window(task);
+                let files: Vec<PathBuf> = files
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|file| !file.is_empty())
+                    .map(PathBuf::from)
+                    .collect();
+                if let Some(window) = app.export_window.as_mut() {
+                    window.add_sources(files);
+                }
+            } else {
+                tracing::warn!("unknown PDFREADER_EXPORT_WINDOW task: {name}");
+            }
         }
 
         app
@@ -788,14 +799,14 @@ impl App {
                 Effect::ImagesToPdf {
                     images,
                     output,
-                    scale,
+                    size,
                 } => {
                     let label = format!("Building a PDF from {} images", images.len());
                     let (job, cancel) = self.begin_job(label);
                     self.engine.send(EngineRequest::ImagesToPdf {
                         images,
                         output,
-                        scale,
+                        size,
                         job,
                         cancel,
                     });
@@ -1396,6 +1407,16 @@ impl App {
                     commands.push(Command::Print);
                 }
             }
+            // Ctrl+E reopens the export window on whichever job was used last,
+            // so repeating an export does not mean walking the menu again. It
+            // is deliberately not gated on an open document: two of the jobs
+            // build a document from files and work fine on an empty window, and
+            // for the rest the window itself says a document is needed. An
+            // already-open window is left alone rather than reset, so a stray
+            // keypress cannot discard settings the user is part-way through.
+            if ctrl && input.key_pressed(egui::Key::E) && self.export_window.is_none() {
+                commands.push(Command::ShowExportWindow(self.last_export_task));
+            }
         });
 
         commands
@@ -1429,32 +1450,23 @@ impl App {
     }
 
     /// A sensible pre-filled file name for the dialog being opened.
+    ///
+    /// Only save dialogs take one, and only the two that save the document have
+    /// a name worth guessing: the export window's own suggestion is already
+    /// shown inside the window, so its picker opens unprefilled rather than
+    /// second-guessing what the user is about to type.
     fn dialog_default_name(&self, intent: DialogIntent) -> Option<String> {
-        let tab = self.store.state().active();
-
         match intent {
-            DialogIntent::OpenPdf
-            | DialogIntent::PickImages
-            | DialogIntent::PickPdfs
-            | DialogIntent::PickImageFolder(_) => None,
-
-            DialogIntent::SavePdf => tab.and_then(|tab| {
+            DialogIntent::SavePdf => self.store.state().active().and_then(|tab| {
                 tab.path
                     .file_name()
                     .map(|name| name.to_string_lossy().into_owned())
             }),
-
-            DialogIntent::SavePageImage(format) => Some(page_file_name(tab?, format.extension())),
-            DialogIntent::SavePagePdf => Some(page_file_name(tab?, "pdf")),
-
-            DialogIntent::SaveComposed => Some(
-                match self.pending_sources {
-                    Some(PendingJob::MergePdfs(_)) => "merged",
-                    _ => "images",
-                }
-                .to_string()
-                + ".pdf",
-            ),
+            DialogIntent::OpenPdf
+            | DialogIntent::ExportOutputFile
+            | DialogIntent::ExportOutputFolder
+            | DialogIntent::ExportAddImages
+            | DialogIntent::ExportAddPdfs => None,
         }
     }
 
@@ -1465,52 +1477,121 @@ impl App {
         intent: DialogIntent,
         result: DialogResult,
     ) {
-        match (intent, result) {
-            // Closing a dialog abandons a half-finished two-step job rather
-            // than leaving its inputs waiting for a destination forever.
-            (_, DialogResult::Cancelled) => self.pending_sources = None,
+        // The export window's pickers fill in the window rather than running
+        // anything: the user is still choosing, and the window is where they
+        // confirm. A cancelled picker changes nothing, which is why it needs no
+        // special case here.
+        if let Some(window) = self.export_window.as_mut() {
+            match (intent, &result) {
+                (
+                    DialogIntent::ExportOutputFile | DialogIntent::ExportOutputFolder,
+                    DialogResult::Path(path),
+                ) => {
+                    window.set_output(path.clone());
+                }
+                (
+                    DialogIntent::ExportAddImages | DialogIntent::ExportAddPdfs,
+                    DialogResult::Paths(paths),
+                ) => {
+                    window.add_sources(paths.clone());
+                }
+                _ => {}
+            }
+            if matches!(
+                intent,
+                DialogIntent::ExportOutputFile
+                    | DialogIntent::ExportOutputFolder
+                    | DialogIntent::ExportAddImages
+                    | DialogIntent::ExportAddPdfs
+            ) {
+                return;
+            }
+        }
 
+        match (intent, result) {
             (DialogIntent::OpenPdf, DialogResult::Path(path)) => {
                 self.apply(ctx, vec![Command::OpenPath(path)]);
             }
             (DialogIntent::SavePdf, DialogResult::Path(path)) => {
                 self.apply(ctx, vec![Command::SaveDocumentTo(path)]);
             }
-            (DialogIntent::SavePageImage(format), DialogResult::Path(path)) => {
-                self.apply(ctx, vec![Command::ExportPageImage { path, format }]);
-            }
-            (DialogIntent::SavePagePdf, DialogResult::Path(path)) => {
-                self.apply(ctx, vec![Command::ExportPagesPdf { path }]);
-            }
-            (DialogIntent::PickImageFolder(format), DialogResult::Path(dir)) => {
-                self.apply(ctx, vec![Command::ExportAllPages { dir, format }]);
-            }
+            // A cancelled dialog, or an intent/result pairing that cannot
+            // happen: nothing to do.
+            _ => {}
+        }
+    }
 
-            // Step one of a two-step job: remember the inputs and ask where the
-            // result should go.
-            (DialogIntent::PickImages, DialogResult::Paths(images)) if !images.is_empty() => {
-                self.pending_sources = Some(PendingJob::ImagesToPdf(images));
-                self.show_dialog(DialogIntent::SaveComposed);
-            }
-            (DialogIntent::PickPdfs, DialogResult::Paths(sources)) if !sources.is_empty() => {
-                self.pending_sources = Some(PendingJob::MergePdfs(sources));
-                self.show_dialog(DialogIntent::SaveComposed);
-            }
+    /// Open the export window on a task.
+    ///
+    /// A window that is already open is retargeted rather than replaced, so the
+    /// list of files the user has already added survives picking a different
+    /// task from the menu.
+    fn open_export_window(&mut self, task: ExportTask) {
+        self.last_export_task = task;
+        let doc = OpenDocument::snapshot(self.store.state().active());
 
-            // Step two: the inputs are known and the destination just arrived.
-            (DialogIntent::SaveComposed, DialogResult::Path(output)) => {
-                let command = match self.pending_sources.take() {
-                    Some(PendingJob::ImagesToPdf(images)) => Command::ImagesToPdf { images, output },
-                    Some(PendingJob::MergePdfs(sources)) => Command::MergePdfs { sources, output },
-                    // The inputs were dropped by an earlier cancellation.
-                    None => return,
-                };
-                self.apply(ctx, vec![command]);
-            }
+        match self.export_window.as_mut() {
+            Some(window) => window.set_task(task, &doc),
+            None => self.export_window = Some(ExportWindow::new(task, &doc)),
+        }
+    }
 
-            // A picker that came back empty, or an intent/result pairing that
-            // cannot happen: treat it as a cancellation.
-            _ => self.pending_sources = None,
+    /// Act on what the user did in the export window.
+    fn handle_export_action(&mut self, ctx: &egui::Context, action: export_window::Action) {
+        match action {
+            export_window::Action::None => {}
+            export_window::Action::Cancel => self.export_window = None,
+            export_window::Action::Browse(field) => {
+                // A picker needs the window still open to fill in, so it is not
+                // closed here; `handle_dialog_result` puts the answer back.
+                self.show_dialog(dialog_intent_for_field(field));
+            }
+            export_window::Action::Start(request) => {
+                self.export_window = None;
+                self.apply(ctx, vec![request.into_command()]);
+            }
+        }
+    }
+
+    /// Ask the engine for the page preview the export window shows.
+    ///
+    /// Only the document tasks have a page to show, and only the page in view:
+    /// the window is about to export what the user was looking at. Reuses the
+    /// sidebar's thumbnail cache, so opening the window on a page the strip has
+    /// already drawn costs nothing.
+    fn ensure_export_preview(&mut self, dpr: f32) {
+        let Some(window) = self.export_window.as_ref() else {
+            return;
+        };
+        if !window.task().needs_document() {
+            return;
+        }
+
+        let Some(tab) = self.store.state().active() else {
+            return;
+        };
+        let Some(document) = tab.document.as_ref() else {
+            return;
+        };
+        let page = tab.view.current_page;
+
+        // Already rasterized: nothing to ask for.
+        if self
+            .canvas
+            .thumbnail(document.id, tab.view.rotation, page)
+            .is_some()
+        {
+            return;
+        }
+
+        if let Some(thumb) = self.canvas.request_thumbnail(
+            document,
+            tab.view.rotation,
+            page,
+            export_window::PREVIEW_WIDTH,
+            dpr,
+        ) {
+            self.request_thumbnails(vec![thumb]);
         }
     }
 
@@ -1605,6 +1686,13 @@ impl App {
         for command in commands {
             if let Command::Search(query) = command {
                 self.start_search(query);
+                continue;
+            }
+            // The export window is drawn by the shell, so opening it is shell
+            // work exactly like a native dialog: the reducer has nothing to
+            // decide until the user commits to a set of settings.
+            if let Command::ShowExportWindow(task) = command {
+                self.open_export_window(task);
                 continue;
             }
             if let Some(intent) = dialog_intent_for(&command) {
@@ -2068,6 +2156,33 @@ impl eframe::App for App {
                 }
                 None => {}
             }
+        }
+
+        // The export window, drawn last so it sits above the panels. Its page
+        // preview comes from the thumbnail cache, which is why the request is
+        // issued here: one frame later the texture exists and the spinner is
+        // replaced by the page.
+        if self.export_window.is_some() {
+            self.ensure_export_preview(dpr);
+
+            let doc = OpenDocument::snapshot(self.store.state().active());
+            let rotation = self
+                .store
+                .state()
+                .active()
+                .map_or(Rotation::None, |tab| tab.view.rotation);
+            let preview = self
+                .store
+                .state()
+                .active()
+                .and_then(|tab| tab.document.as_ref().map(|document| document.id))
+                .and_then(|id| self.canvas.thumbnail(id, rotation, doc.current_page));
+
+            let action = match self.export_window.as_mut() {
+                Some(window) => window.show(&ctx, &palette, &doc, preview),
+                None => export_window::Action::None,
+            };
+            self.handle_export_action(&ctx, action);
         }
 
         // Status feedback: a failure, a job in progress, or a finished job.

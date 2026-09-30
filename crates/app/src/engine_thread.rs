@@ -17,7 +17,8 @@ use std::thread::JoinHandle;
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use pdfreader_core::{
-    Document, DocumentId, ExportTarget, FormInfo, ImageFormat, PageRange, Rotation, TabId,
+    Document, DocumentId, ExportTarget, FormInfo, ImageFormat, ImagePageSize, PageRange, Rotation,
+    TabId,
 };
 use pdfreader_pdf::engine::{DocumentHandle, PdfEngine, PdfiumEngine, TilePixels, TileRequest};
 use pdfreader_pdf::{DocumentInfo, EngineError, JobProgress};
@@ -221,8 +222,8 @@ pub enum EngineRequest {
         images: Vec<PathBuf>,
         /// Where to write the result.
         output: PathBuf,
-        /// Points per pixel for the page size.
-        scale: f32,
+        /// How each page is sized.
+        size: ImagePageSize,
         /// Job this belongs to.
         job: u64,
         /// Set by the shell to stop the job early.
@@ -858,7 +859,7 @@ fn run(
             EngineRequest::ImagesToPdf {
                 images,
                 output,
-                scale,
+                size,
                 job,
                 cancel,
             } => {
@@ -868,7 +869,7 @@ fn run(
                     &responses,
                     output.clone(),
                     ExportTarget::SaveFile,
-                    |progress| engine.images_to_pdf(&images, &output, scale, progress),
+                    |progress| engine.images_to_pdf(&images, &output, size, progress),
                 );
                 if !done {
                     return;

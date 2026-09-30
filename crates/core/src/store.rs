@@ -521,16 +521,16 @@ impl Store {
                 }]
             }
 
-            // Dialog-opening commands: the shell owns the native dialog and
-            // dispatches the resolved path back as a second command, exactly
-            // like `ShowOpenDialog`.
-            Command::ShowExportImageDialog(_)
-            | Command::ShowExportAllPagesDialog(_)
-            | Command::ShowExportPagesPdfDialog
-            | Command::ShowImagesToPdfDialog
-            | Command::ShowMergeDialog => Vec::new(),
+            // The export window is shell work: the reducer cannot draw one, and
+            // it must not invent a path the user never chose. Everything the
+            // window collects arrives later as one of the commands below.
+            Command::ShowExportWindow(_) => Vec::new(),
 
-            Command::ExportPageImage { path, format } => {
+            Command::ExportPageImage {
+                path,
+                format,
+                scale,
+            } => {
                 let Some(tab) = self.state.active() else {
                     return Vec::new();
                 };
@@ -541,13 +541,13 @@ impl Store {
                     doc,
                     page: tab.view.current_page,
                     rotation: tab.view.rotation,
-                    scale: crate::export::EXPORT_SCALE,
+                    scale,
                     format,
                     path,
                 }]
             }
 
-            Command::ExportAllPages { dir, format } => {
+            Command::ExportAllPages { dir, format, scale } => {
                 let Some(tab) = self.state.active() else {
                     return Vec::new();
                 };
@@ -562,15 +562,12 @@ impl Store {
                     // user which document a directory of pages came from.
                     stem: document.title.clone(),
                     rotation: tab.view.rotation,
-                    scale: crate::export::EXPORT_SCALE,
+                    scale,
                     format,
                 }]
             }
 
-            Command::ExportPagesPdf { path } => {
-                let Some(range) = self.current_page_range() else {
-                    return Vec::new();
-                };
+            Command::ExportPagesPdf { path, range } => {
                 let Some(doc) = self.active_document_id() else {
                     return Vec::new();
                 };
@@ -604,10 +601,14 @@ impl Store {
                 }]
             }
 
-            Command::ImagesToPdf { images, output } => vec![Effect::ImagesToPdf {
+            Command::ImagesToPdf {
                 images,
                 output,
-                scale: crate::export::IMAGE_POINTS_PER_PIXEL,
+                size,
+            } => vec![Effect::ImagesToPdf {
+                images,
+                output,
+                size,
             }],
 
             Command::MergePdfs { sources, output } => vec![Effect::MergePdfs { sources, output }],
@@ -1118,7 +1119,7 @@ impl AppState {
 mod tests {
     use super::*;
     use crate::document::{Document, Outline, PageGeometry, Rotation};
-    use crate::export::{ImageFormat, PageRange};
+    use crate::export::{ExportDpi, ExportTask, ImageFormat, ImagePageSize, PageRange};
     use crate::form::{FieldId, FieldValue, FormFieldInfo, FormFieldType, FormKind};
     use crate::rect::Rect;
     use crate::view::ViewMode;
@@ -1932,24 +1933,19 @@ mod tests {
 
     // --- export, print and composition ------------------------------------
 
-    /// Every dialog-opening command must be inert in the reducer: the native
-    /// dialog is shell work, and the reducer must not invent a path for it.
+    /// Opening the export window must be inert in the reducer: it is shell
+    /// work, and the reducer must not invent a path the user never chose.
     #[test]
-    fn export_dialog_commands_produce_no_effects() {
+    fn the_export_window_command_produces_no_effects() {
         let (mut s, _) = opened_store(3);
-        for command in [
-            Command::ShowExportImageDialog(ImageFormat::Png),
-            Command::ShowExportAllPagesDialog(ImageFormat::Jpeg),
-            Command::ShowExportPagesPdfDialog,
-            Command::ShowImagesToPdfDialog,
-            Command::ShowMergeDialog,
-        ] {
+        for task in ExportTask::ALL {
+            let command = Command::ShowExportWindow(task);
             assert!(s.dispatch(command.clone()).is_empty(), "got {command:?}");
         }
     }
 
     #[test]
-    fn exporting_a_page_image_uses_the_current_page_and_export_resolution() {
+    fn exporting_a_page_image_uses_the_current_page_and_the_chosen_resolution() {
         let (mut s, _) = opened_store(5);
         s.dispatch(Command::GoToPage(3));
         s.dispatch(Command::RotateCw);
@@ -1957,6 +1953,7 @@ mod tests {
         let effects = s.dispatch(Command::ExportPageImage {
             path: PathBuf::from("page.png"),
             format: ImageFormat::Jpeg,
+            scale: ExportDpi::Maximum.scale(),
         });
 
         assert_eq!(
@@ -1965,7 +1962,7 @@ mod tests {
                 doc: DocumentId::from_raw(1),
                 page: 3,
                 rotation: Rotation::Cw90,
-                scale: crate::export::EXPORT_SCALE,
+                scale: ExportDpi::Maximum.scale(),
                 format: ImageFormat::Jpeg,
                 path: PathBuf::from("page.png"),
             }]
@@ -1978,13 +1975,39 @@ mod tests {
         let effects = s.dispatch(Command::ExportAllPages {
             dir: PathBuf::from("out"),
             format: ImageFormat::Png,
+            scale: ExportDpi::Screen.scale(),
         });
 
-        let Effect::ExportAllPages { stem, dir, .. } = &effects[0] else {
+        let Effect::ExportAllPages {
+            stem, dir, scale, ..
+        } = &effects[0]
+        else {
             panic!("expected ExportAllPages, got {effects:?}");
         };
         assert_eq!(stem, "x", "the stem comes from the document's title");
         assert_eq!(dir, &PathBuf::from("out"));
+        assert!((scale - ExportDpi::Screen.scale()).abs() < f32::EPSILON);
+    }
+
+    /// The range is the user's choice in the window, so the reducer must pass
+    /// it through rather than substituting the page in view.
+    #[test]
+    fn exporting_pages_to_pdf_keeps_the_range_the_window_chose() {
+        let (mut s, _) = opened_store(9);
+        s.dispatch(Command::GoToPage(4));
+
+        let range = PageRange::new(2, 6);
+        assert_eq!(
+            s.dispatch(Command::ExportPagesPdf {
+                path: PathBuf::from("out.pdf"),
+                range,
+            }),
+            vec![Effect::ExportPages {
+                doc: DocumentId::from_raw(1),
+                range: Some(range),
+                path: PathBuf::from("out.pdf"),
+            }]
+        );
     }
 
     #[test]
@@ -2015,13 +2038,16 @@ mod tests {
             Command::ExportPageImage {
                 path: PathBuf::from("a.png"),
                 format: ImageFormat::Png,
+                scale: ExportDpi::Print.scale(),
             },
             Command::ExportAllPages {
                 dir: PathBuf::from("d"),
                 format: ImageFormat::Png,
+                scale: ExportDpi::Print.scale(),
             },
             Command::ExportPagesPdf {
                 path: PathBuf::from("a.pdf"),
+                range: PageRange::single(0),
             },
             Command::Print,
             Command::PrintCurrentPage,
@@ -2030,16 +2056,11 @@ mod tests {
         }
     }
 
-    /// A document with no pages has no current page to export.
+    /// A document with no pages has no current page, so the exports that read
+    /// one have nothing to do.
     #[test]
     fn an_empty_document_has_no_current_page_to_export() {
         let (mut s, _) = opened_store(0);
-        assert!(
-            s.dispatch(Command::ExportPagesPdf {
-                path: PathBuf::from("a.pdf"),
-            })
-            .is_empty()
-        );
         assert!(s.dispatch(Command::PrintCurrentPage).is_empty());
     }
 
@@ -2053,11 +2074,12 @@ mod tests {
             s.dispatch(Command::ImagesToPdf {
                 images: vec![PathBuf::from("a.png"), PathBuf::from("b.jpg")],
                 output: PathBuf::from("out.pdf"),
+                size: ImagePageSize::A4,
             }),
             vec![Effect::ImagesToPdf {
                 images: vec![PathBuf::from("a.png"), PathBuf::from("b.jpg")],
                 output: PathBuf::from("out.pdf"),
-                scale: crate::export::IMAGE_POINTS_PER_PIXEL,
+                size: ImagePageSize::A4,
             }]
         );
 

@@ -95,25 +95,50 @@ GPU renderer built for large documents.
 
 ### Export, print and compose
 
-- **Save a page as an image** — PNG or JPEG, rendered at 300 dpi rather than at
-  the on-screen zoom, so the file is the resolution the page deserves instead of
-  a thumbnail of whatever the view happened to be.
-- **Save every page as an image** — one file per page, named
-  `<document>-0001.png` and so on, into a directory you pick.
-- **Export the current page to PDF** — a new one-page document containing just
-  that page.
-- **Print** (`Ctrl+P`) the whole document, or the current page, by handing a
-  temporary PDF to the system print handler. There is no silent printing: the
-  shell always shows its own printer dialog.
-- **Create a PDF from images** — pick any number of PNG/JPEG files; each becomes
-  one page, sized so a 96 dpi image keeps the size it had on screen.
-- **Merge PDFs** — pick several documents and combine them into one, in the
-  order they are listed.
+Everything that turns a document into files lives in one window, reached from
+**File → Export** (or `Ctrl+E`). Picking a job from the menu opens the window
+already set to that job; the job can be changed from inside it, so you never have
+to close one dialog and open another. Five jobs are offered:
 
-All of these live under the File menu. Long jobs run on the engine thread and
-report progress in the status bar with a Cancel button. Every export refuses to
-start if it would have to render more than 100 megapixels, which is what stops
-an accidental 3200% zoom from allocating gigabytes before failing.
+- **Page to image** — the page on screen, as PNG or JPEG.
+- **Pages to images** — one file per page, named `<document>-0001.png` and so
+  on, into a directory you pick.
+- **Pages to PDF** — a new document containing the pages you name, not just the
+  one on screen.
+- **Images to PDF** — any number of PNG/JPEG files, one page each.
+- **Merge PDFs** — several documents combined into one, in the order listed.
+
+The window keeps one shape, so switching jobs does not make it jump around:
+
+- A **task strip** down the left lists the five jobs by name. The current job is
+  highlighted, jobs that need an open document are greyed out when there is
+  none, and the header repeats the current job's name with a one-line
+  explanation of what it does.
+- **Settings change with the job.** The two image jobs offer a format and a
+  resolution preset — 72, 150, 300 (the default) and 600 dpi — beside a readout
+  of the pixel size the chosen page will actually produce, so the cost of a
+  preset is visible before the export starts. The range job offers first/last
+  page fields, and Images-to-PDF offers a page size: the image's own size, or
+  A4/Letter with the image fitted inside a margin.
+- A **file list** appears for the jobs that read files. Rows can be reordered
+  with the up/down buttons and removed individually, because merge order is the
+  whole point of merging. A file already in the list is not added twice.
+- A **preview** shows the page the export will use, taken from the same
+  thumbnail cache the sidebar strip already draws from.
+- The **Export button is disabled until the job is ready**, and the line beside
+  it is the same check that gates the button — so it always names the next step
+  ("Open a document first…", "Add at least one image…") instead of failing after
+  the fact. Nothing is browsed until you press Browse, so cancelling a native
+  picker leaves the window exactly as it was.
+
+**Print** (`Ctrl+P`) stays in the File menu, for the whole document or the
+current page, by handing a temporary PDF to the system print handler. There is
+no silent printing: the shell always shows its own printer dialog.
+
+Long jobs run on the engine thread and report progress in the status bar with a
+Cancel button. Every export refuses to start if it would have to render more
+than 100 megapixels, which is what stops an accidental 3200% zoom from
+allocating gigabytes before failing.
 
 ### Appearance
 

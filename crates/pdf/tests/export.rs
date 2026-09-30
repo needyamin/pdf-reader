@@ -7,7 +7,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 
-use pdfreader_core::{ImageFormat, PageRange, Rotation};
+use pdfreader_core::{IMAGE_POINTS_PER_PIXEL, ImageFormat, ImagePageSize, PageRange, Rotation};
 use pdfreader_pdf::engine::{PdfEngine, PdfiumEngine};
 use pdfreader_pdf::{EngineError, JobProgress};
 
@@ -261,7 +261,12 @@ fn images_become_a_pdf_with_one_page_each() {
     let cancel = AtomicBool::new(false);
     let mut log = Vec::new();
     let pages = engine
-        .images_to_pdf(&images, &output, 1.0, &mut job!(&cancel, &mut log))
+        .images_to_pdf(
+            &images,
+            &output,
+            ImagePageSize::MatchImage,
+            &mut job!(&cancel, &mut log),
+        )
         .expect("images to PDF should succeed");
 
     assert_eq!(pages, 2);
@@ -270,19 +275,66 @@ fn images_become_a_pdf_with_one_page_each() {
     let (_handle, info) = engine.open(&output, None).expect("built PDF should open");
     assert_eq!(info.pages.len(), 2);
     for (page, (width, height)) in info.pages.iter().zip(sizes) {
+        // The page is the image at the assumed 96 dpi source resolution, so a
+        // 96-pixel-wide image becomes a one-inch (72 point) page.
+        let expected_width = f32::from(width) * IMAGE_POINTS_PER_PIXEL;
+        let expected_height = f32::from(height) * IMAGE_POINTS_PER_PIXEL;
         // A tenth of a point of slack: the page size round-trips through the
         // PDF's own units, so an exact comparison would be testing PDFium.
         assert!(
-            (page.width_pt - f32::from(width)).abs() < 0.1,
-            "page width {} should be the image's {width}",
+            (page.width_pt - expected_width).abs() < 0.1,
+            "page width {} should be the image's {expected_width}",
             page.width_pt
         );
         assert!(
-            (page.height_pt - f32::from(height)).abs() < 0.1,
-            "page height {} should be the image's {height}",
+            (page.height_pt - expected_height).abs() < 0.1,
+            "page height {} should be the image's {expected_height}",
             page.height_pt
         );
     }
+}
+
+/// A sheet layout must produce real paper, and must not stretch the image to
+/// fill it: the page is A4 and the image keeps its own aspect ratio.
+#[test]
+fn images_land_on_standard_sheets_without_being_stretched() {
+    let Some(mut engine) = engine() else { return };
+    let dir = output_dir("images-to-a4");
+
+    // A wide image on a portrait sheet: limited by the width, so a layout that
+    // stretched it would produce a page-tall image and be obvious here.
+    let path = dir.join("wide.png");
+    image::RgbaImage::new(1600, 900)
+        .save(&path)
+        .expect("test image should save");
+
+    let output = dir.join("a4.pdf");
+    let cancel = AtomicBool::new(false);
+    let mut log = Vec::new();
+    engine
+        .images_to_pdf(
+            std::slice::from_ref(&path),
+            &output,
+            ImagePageSize::A4,
+            &mut job!(&cancel, &mut log),
+        )
+        .expect("images to PDF should succeed");
+
+    let (_handle, info) = engine.open(&output, None).expect("built PDF should open");
+    assert_eq!(info.pages.len(), 1);
+
+    let (sheet_width, sheet_height) = ImagePageSize::A4.sheet().expect("A4 has a sheet");
+    let page = &info.pages[0];
+    assert!(
+        (page.width_pt - sheet_width).abs() < 0.1,
+        "page width {} should be A4's {sheet_width}",
+        page.width_pt
+    );
+    assert!(
+        (page.height_pt - sheet_height).abs() < 0.1,
+        "page height {} should be A4's {sheet_height}",
+        page.height_pt
+    );
 }
 
 #[test]
@@ -481,7 +533,7 @@ fn a_missing_image_is_reported_against_its_path() {
         .images_to_pdf(
             std::slice::from_ref(&missing),
             &dir.join("out.pdf"),
-            1.0,
+            ImagePageSize::MatchImage,
             &mut job!(&cancel, &mut log),
         )
         .expect_err("a missing image must fail the job");

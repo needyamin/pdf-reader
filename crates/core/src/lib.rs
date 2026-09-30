@@ -16,7 +16,10 @@ pub mod view;
 pub use annotation::{AnnotationId, AnnotationInfo, AnnotationKind, NewAnnotation, Tool};
 pub use command::{Command, Effect, SidebarTab, TabId};
 pub use document::{Document, DocumentId, Outline, OutlineNode, PageGeometry, Rotation};
-pub use export::{ExportTarget, ImageFormat, PageRange};
+pub use export::{
+    EXPORT_SCALE, ExportDpi, ExportTarget, ExportTask, IMAGE_POINTS_PER_PIXEL, IMAGE_SOURCE_DPI,
+    ImageFormat, ImagePageSize, PageRange, pixel_size,
+};
 pub use form::{
     FieldId, FieldOption, FieldValue, FormFieldInfo, FormFieldType, FormInfo, FormKind,
 };

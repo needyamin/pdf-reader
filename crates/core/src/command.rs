@@ -270,25 +270,29 @@ pub enum Command {
         doc: crate::document::DocumentId,
     },
 
-    /// Ask the shell to pick a destination, then write the current page out as
-    /// an image.
-    ShowExportImageDialog(crate::export::ImageFormat),
+    /// Open the export window, set up for one kind of export.
+    ///
+    /// One command for all five tasks: the window is where the options live,
+    /// and the reducer has nothing to decide about a window that is only
+    /// collecting settings. The shell intercepts it, exactly like
+    /// `ShowOpenDialog`.
+    ShowExportWindow(crate::export::ExportTask),
 
     /// Write the active document's current page out as an image file.
     ///
-    /// The page, rotation and resolution come from the reducer rather than the
-    /// caller: the shell would otherwise have to duplicate the resolution rule,
-    /// and a dialog that runs a few frames after the menu click must export the
-    /// page the user was looking at when they clicked.
+    /// The page and rotation come from the reducer rather than the caller: the
+    /// window is open for as long as the user is choosing options, and the page
+    /// it exports must be the one they were looking at, not whichever page the
+    /// view drifted to while the window was up. The format and resolution are
+    /// the user's choices, so they are carried through.
     ExportPageImage {
         /// Destination file, chosen by the user.
         path: PathBuf,
         /// Format to write.
         format: crate::export::ImageFormat,
+        /// Device pixels per PDF point.
+        scale: f32,
     },
-
-    /// Ask the shell to pick a directory, then write every page out as images.
-    ShowExportAllPagesDialog(crate::export::ImageFormat),
 
     /// Write every page of the active document out as image files.
     ExportAllPages {
@@ -296,16 +300,16 @@ pub enum Command {
         dir: PathBuf,
         /// Format to write.
         format: crate::export::ImageFormat,
+        /// Device pixels per PDF point.
+        scale: f32,
     },
 
-    /// Ask the shell to pick a destination, then write the current page out as
-    /// a standalone PDF.
-    ShowExportPagesPdfDialog,
-
-    /// Write the active document's current page out as a standalone PDF.
+    /// Write a page range of the active document out as a standalone PDF.
     ExportPagesPdf {
         /// Destination file, chosen by the user.
         path: PathBuf,
+        /// Pages to include.
+        range: crate::export::PageRange,
     },
 
     /// Print the active document. The operating system's dialog chooses the
@@ -315,21 +319,15 @@ pub enum Command {
     /// Print only the page currently in view.
     PrintCurrentPage,
 
-    /// Ask the shell to pick images, and then a destination, before building a
-    /// PDF out of them.
-    ShowImagesToPdfDialog,
-
-    /// Build a PDF with one page per image, each page sized to its image.
+    /// Build a PDF with one page per image.
     ImagesToPdf {
         /// Images to place, one page each.
         images: Vec<PathBuf>,
         /// Destination file, chosen by the user.
         output: PathBuf,
+        /// How each page is sized.
+        size: crate::export::ImagePageSize,
     },
-
-    /// Ask the shell to pick documents, and then a destination, before merging
-    /// them into one PDF.
-    ShowMergeDialog,
 
     /// Concatenate documents into one, in the order given.
     MergePdfs {
@@ -512,14 +510,14 @@ pub enum Effect {
         range: Option<crate::export::PageRange>,
     },
 
-    /// Build a PDF with one page per image, each page sized to its image.
+    /// Build a PDF with one page per image.
     ImagesToPdf {
         /// Images to place, one page each.
         images: Vec<PathBuf>,
         /// Destination file.
         output: PathBuf,
-        /// Points per pixel for the page size.
-        scale: f32,
+        /// How each page is sized.
+        size: crate::export::ImagePageSize,
     },
 
     /// Concatenate documents into one, in the order given.

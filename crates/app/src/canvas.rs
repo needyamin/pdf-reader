@@ -467,6 +467,59 @@ impl Canvas {
         }
     }
 
+    /// The cached thumbnail for a page, if one has been rasterized.
+    ///
+    /// Shared with the export window so its preview is the same texture the
+    /// sidebar strip already drew, rather than a second copy of the same page.
+    pub fn thumbnail(
+        &self,
+        doc: DocumentId,
+        rotation: Rotation,
+        page: u32,
+    ) -> Option<&TextureHandle> {
+        self.thumbs.get(&(doc, rotation, page))
+    }
+
+    /// Ask for a page's thumbnail, unless it is cached, in flight or failed.
+    ///
+    /// The scale is derived from a target width in points so a caller can ask
+    /// for a bigger picture than the sidebar strip uses without knowing the
+    /// page's own size. `None` means the request would be a duplicate.
+    pub fn request_thumbnail(
+        &mut self,
+        doc: &Document,
+        rotation: Rotation,
+        page: u32,
+        target_width: f32,
+        dpr: f32,
+    ) -> Option<PendingThumb> {
+        let key = (doc.id, rotation, page);
+        if self.thumbs.contains_key(&key)
+            || self.thumb_inflight.contains(&key)
+            || self.thumb_failed.contains(&key)
+        {
+            return None;
+        }
+
+        let width_pt = doc
+            .pages
+            .get(usize::try_from(page).unwrap_or(usize::MAX))
+            .map_or(0.0, |page| page.width_pt);
+        let scale = if width_pt > 0.0 {
+            (target_width * dpr / width_pt).clamp(0.02, 4.0)
+        } else {
+            0.2
+        };
+
+        self.thumb_inflight.insert(key);
+        Some(PendingThumb {
+            doc: doc.id,
+            page,
+            rotation,
+            scale,
+        })
+    }
+
     /// Drop every texture belonging to a document (called when its tab closes).
     pub fn forget_document(&mut self, doc: DocumentId) {
         self.pending.retain(|s| s.doc != doc);
@@ -1227,21 +1280,10 @@ impl Canvas {
                             .image(tex.id(), img_rect, uv_full(), Color32::WHITE);
                     } else {
                         ui.painter().rect_filled(img_rect, 2.0, Color32::WHITE);
-                        if !self.thumb_inflight.contains(&(doc.id, rotation, index))
-                            && !self.thumb_failed.contains(&(doc.id, rotation, index))
+                        if let Some(thumb) =
+                            self.request_thumbnail(doc, rotation, index, THUMB_WIDTH, dpr)
                         {
-                            self.thumb_inflight.insert((doc.id, rotation, index));
-                            let scale = if w_pt > 0.0 {
-                                (THUMB_WIDTH * dpr / w_pt).clamp(0.02, 4.0)
-                            } else {
-                                0.2
-                            };
-                            result.requests.push(PendingThumb {
-                                doc: doc.id,
-                                page: index,
-                                rotation,
-                                scale,
-                            });
+                            result.requests.push(thumb);
                         }
                     }
 

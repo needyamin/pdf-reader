@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use image::codecs::jpeg::JpegEncoder;
 use pdfium_render::prelude::*;
-use pdfreader_core::{ImageFormat, PageRange};
+use pdfreader_core::{IMAGE_POINTS_PER_PIXEL, ImageFormat, ImagePageSize, PageRange};
 
 use crate::Result;
 use crate::engine::TilePixels;
@@ -221,16 +221,18 @@ pub(crate) fn merge_pdfs(
     Ok(pages)
 }
 
-/// Build a PDF with one page per image, each page sized to its image.
+/// Build a PDF with one page per image.
 ///
-/// `scale` is points per pixel. The page is sized with `new_custom` rather than
-/// `from_points`, because the latter snaps to the nearest standard paper size
-/// and "the page is the image" has to be exact.
+/// With [`ImagePageSize::MatchImage`] each page is sized to its own image with
+/// `new_custom` rather than `from_points`, because the latter snaps to the
+/// nearest standard paper size and "the page is the image" has to be exact. For
+/// a standard sheet the page is the sheet and the image is scaled to fit inside
+/// a margin and centred, which is what someone printing a photo expects.
 pub(crate) fn images_to_pdf(
     pdfium: &Pdfium,
     images: &[PathBuf],
     output: &Path,
-    scale: f32,
+    size: ImagePageSize,
     job: &mut JobProgress<'_>,
 ) -> Result<u32> {
     let mut out = pdfium.create_new_pdf().map_err(pdfium_error)?;
@@ -244,24 +246,26 @@ pub(crate) fn images_to_pdf(
             reason: error.to_string(),
         })?;
 
-        let width = points(image.width(), scale);
-        let height = points(image.height(), scale);
+        let layout = page_layout(size, image.width(), image.height());
 
         // The page handle is a handle plus a `PhantomData`, so it does not
         // borrow the document: the mutable borrow taken by `pages_mut` ends
         // with this statement, leaving `out` free to be serialised below.
         let mut page = out
             .pages_mut()
-            .create_page_at_end(PdfPagePaperSize::new_custom(width, height))
+            .create_page_at_end(PdfPagePaperSize::new_custom(
+                PdfPoints::new(layout.page_width),
+                PdfPoints::new(layout.page_height),
+            ))
             .map_err(pdfium_error)?;
 
         page.objects_mut()
             .create_image_object(
-                PdfPoints::ZERO,
-                PdfPoints::ZERO,
+                PdfPoints::new(layout.left),
+                PdfPoints::new(layout.bottom),
                 &image,
-                Some(width),
-                Some(height),
+                Some(PdfPoints::new(layout.image_width)),
+                Some(PdfPoints::new(layout.image_height)),
             )
             .map_err(pdfium_error)?;
 
@@ -270,6 +274,82 @@ pub(crate) fn images_to_pdf(
 
     save_to_file(&out, output)?;
     Ok(total)
+}
+
+/// Margin left around an image placed on a standard sheet, in points.
+///
+/// About 12.7 mm, which is a printer's default and leaves the image clear of
+/// the non-printable edge that most inkjets have.
+const SHEET_MARGIN_PT: f32 = 36.0;
+
+/// Where an image lands on its page.
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct PageLayout {
+    /// Page width in points.
+    page_width: f32,
+    /// Page height in points.
+    page_height: f32,
+    /// Distance from the page's left edge to the image's left edge.
+    left: f32,
+    /// Distance from the page's bottom edge to the image's bottom edge.
+    bottom: f32,
+    /// Width to draw the image at.
+    image_width: f32,
+    /// Height to draw the image at.
+    image_height: f32,
+}
+
+/// Work out the page and the image rectangle for one image.
+///
+/// Pure, so the fit maths can be checked without a `PDFium` instance — which
+/// matters, because "the photo is cropped" and "the photo has a huge margin"
+/// are both one arithmetic slip away and neither is obvious from a passing
+/// end-to-end test.
+fn page_layout(size: ImagePageSize, pixels_wide: u32, pixels_high: u32) -> PageLayout {
+    let (pixels_wide, pixels_high) = (points_of(pixels_wide), points_of(pixels_high));
+
+    let Some((sheet_width, sheet_height)) = size.sheet() else {
+        // The page is the image, at the assumed source resolution.
+        let width = pixels_wide * IMAGE_POINTS_PER_PIXEL;
+        let height = pixels_high * IMAGE_POINTS_PER_PIXEL;
+        return PageLayout {
+            page_width: width,
+            page_height: height,
+            left: 0.0,
+            bottom: 0.0,
+            image_width: width,
+            image_height: height,
+        };
+    };
+
+    let usable_width = (sheet_width - 2.0 * SHEET_MARGIN_PT).max(1.0);
+    let usable_height = (sheet_height - 2.0 * SHEET_MARGIN_PT).max(1.0);
+
+    // A single factor for both axes: scaling them independently would stretch
+    // the image, and a distorted photo is worse than a small one.
+    let fit = (usable_width / pixels_wide).min(usable_height / pixels_high);
+    let image_width = pixels_wide * fit;
+    let image_height = pixels_high * fit;
+
+    PageLayout {
+        page_width: sheet_width,
+        page_height: sheet_height,
+        left: (sheet_width - image_width) / 2.0,
+        // PDFium's origin is bottom-left, so centring vertically is the same
+        // arithmetic as centring horizontally.
+        bottom: (sheet_height - image_height) / 2.0,
+        image_width,
+        image_height,
+    }
+}
+
+/// An image dimension as `f32`.
+///
+/// `u32` to `f32` is lossy in principle, but an image wider than 2^24 pixels
+/// cannot be decoded in the first place, and PDF points are `f32` throughout.
+#[allow(clippy::cast_precision_loss)]
+fn points_of(pixels: u32) -> f32 {
+    pixels as f32
 }
 
 /// Open one input of a multi-file job, naming the file in any failure.
@@ -324,15 +404,6 @@ fn write_file(path: &Path, bytes: &[u8]) -> Result<()> {
 #[allow(clippy::needless_pass_by_value)]
 fn pdfium_error(error: PdfiumError) -> EngineError {
     EngineError::Pdfium(error.to_string())
-}
-
-/// An image dimension in PDF points, at `scale` points per pixel.
-///
-/// `u32` to `f32` is lossy in principle, but PDF points are `f32` throughout
-/// and an image wider than 2^24 pixels cannot be decoded in the first place.
-#[allow(clippy::cast_precision_loss)]
-fn points(pixels: u32, scale: f32) -> PdfPoints {
-    PdfPoints::new(pixels as f32 * scale)
 }
 
 /// Map a document-load failure onto a message the user can act on.
@@ -424,5 +495,75 @@ mod tests {
         }
 
         assert_eq!(reported, vec![(1, 3)]);
+    }
+
+    #[test]
+    fn matching_the_image_makes_the_page_exactly_the_image() {
+        // 960x540 pixels at 96 dpi is 720x405 points, a 10x5.6 inch page.
+        let layout = page_layout(ImagePageSize::MatchImage, 960, 540);
+
+        assert!((layout.page_width - 720.0).abs() < 0.01, "{layout:?}");
+        assert!((layout.page_height - 405.0).abs() < 0.01, "{layout:?}");
+        // Exactly zero, but compared as a magnitude: `clippy::float_cmp` is
+        // right that an equality test on a float is a trap even when the value
+        // is produced by a branch that returns a literal.
+        assert!(layout.left.abs() < f32::EPSILON, "{layout:?}");
+        assert!(layout.bottom.abs() < f32::EPSILON, "{layout:?}");
+        assert!((layout.image_width - layout.page_width).abs() < f32::EPSILON);
+        assert!((layout.image_height - layout.page_height).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn a_sheet_page_is_the_paper_size_and_the_image_keeps_its_shape() {
+        // A landscape image on A4 portrait: it must be limited by the width.
+        let layout = page_layout(ImagePageSize::A4, 1600, 900);
+
+        let (sheet_width, sheet_height) = ImagePageSize::A4.sheet().expect("A4 has a sheet");
+        assert!((layout.page_width - sheet_width).abs() < 0.01);
+        assert!((layout.page_height - sheet_height).abs() < 0.01);
+
+        // The aspect ratio survives: this is the check that catches a fit
+        // factor applied to one axis and not the other.
+        let source = 1600.0 / 900.0;
+        let placed = layout.image_width / layout.image_height;
+        assert!((placed - source).abs() < 0.000_1, "got {placed}");
+
+        // It fits inside the printable area, margins included.
+        assert!(layout.image_width <= sheet_width - 2.0 * SHEET_MARGIN_PT + 0.01);
+        assert!(layout.image_height <= sheet_height - 2.0 * SHEET_MARGIN_PT + 0.01);
+
+        // And it is centred on both axes.
+        assert!((layout.left - (sheet_width - layout.image_width) / 2.0).abs() < f32::EPSILON);
+        assert!((layout.bottom - (sheet_height - layout.image_height) / 2.0).abs() < f32::EPSILON);
+        assert!(layout.left > 0.0 && layout.bottom > 0.0);
+    }
+
+    #[test]
+    fn a_tall_image_on_a_sheet_is_limited_by_the_height() {
+        let layout = page_layout(ImagePageSize::Letter, 600, 2400);
+        let (_, sheet_height) = ImagePageSize::Letter.sheet().expect("Letter has a sheet");
+
+        assert!(
+            (layout.image_height - (sheet_height - 2.0 * SHEET_MARGIN_PT)).abs() < 0.01,
+            "a 1:4 image must fill the height, got {layout:?}"
+        );
+        assert!(layout.image_width < layout.image_height);
+    }
+
+    /// A one-pixel image must still produce a page, not a division by zero.
+    #[test]
+    fn a_degenerate_image_does_not_produce_a_broken_layout() {
+        for size in ImagePageSize::ALL {
+            let layout = page_layout(size, 1, 1);
+            assert!(
+                layout.page_width > 0.0 && layout.page_height > 0.0,
+                "{layout:?}"
+            );
+            assert!(
+                layout.image_width > 0.0 && layout.image_height > 0.0,
+                "{layout:?}"
+            );
+            assert!(layout.left >= 0.0 && layout.bottom >= 0.0, "{layout:?}");
+        }
     }
 }
