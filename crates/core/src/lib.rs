@@ -4,6 +4,7 @@
 //! UI toolkit. It owns: what a document is, what a tab is, what commands exist,
 //! and how state changes in response to them.
 
+pub mod annotation;
 pub mod command;
 pub mod document;
 pub mod form;
@@ -11,6 +12,7 @@ pub mod rect;
 pub mod store;
 pub mod view;
 
+pub use annotation::{AnnotationId, AnnotationInfo, AnnotationKind, NewAnnotation, Tool};
 pub use command::{Command, Effect, SidebarTab, TabId};
 pub use document::{Document, DocumentId, Outline, OutlineNode, PageGeometry, Rotation};
 pub use form::{

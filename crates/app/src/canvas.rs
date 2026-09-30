@@ -17,7 +17,10 @@ use egui::{
     Color32, ColorImage, Context, Rect, Sense, Stroke, StrokeKind, TextureHandle, TextureOptions,
     Ui, Vec2, pos2, vec2,
 };
-use pdfreader_core::{Document, DocumentId, FieldId, FormInfo, Rotation, ViewMode, ViewState};
+use pdfreader_core::{
+    AnnotationKind, Command, Document, DocumentId, FieldId, FieldValue, FormFieldType, FormInfo,
+    NewAnnotation, Rect as PdfSpaceRect, Rotation, Tool, ViewMode, ViewState,
+};
 use pdfreader_pdf::engine::{TilePixels, TileRequest};
 use pdfreader_render::{
     PageBox, PageSpace, TILE_SIZE, TileKey, level_scale, tile_grid, tile_pixel_rect, zoom_level,
@@ -57,6 +60,27 @@ const MAX_INFLIGHT: usize = 96;
 type TileCacheKey = (DocumentId, Rotation, TileKey);
 /// Cache key for a thumbnail texture.
 type ThumbCacheKey = (DocumentId, Rotation, u32);
+
+/// A just-drawn annotation echoed on screen until the re-rendered page tiles
+/// arrive.
+///
+/// Creating an annotation is asynchronous: the command goes to the engine
+/// thread, PDFium regenerates the page, and fresh tiles round-trip back. For
+/// the couple of frames that takes, the echo is what the user sees — without
+/// it the shape they just drew would blink out and reappear.
+#[derive(Clone, Copy, Debug)]
+struct PendingEcho {
+    /// Document the shape belongs to.
+    doc: DocumentId,
+    /// Page the shape sits on.
+    page: u32,
+    /// What kind of shape it is, for colours.
+    kind: AnnotationKind,
+    /// Layout-space rectangle for drag-created shapes.
+    rect: Option<Rect>,
+    /// Layout-space anchor for click-placed notes.
+    point: Option<(f32, f32)>,
+}
 
 /// A tile the caller should forward to the engine thread.
 pub struct PendingTile {
@@ -144,6 +168,30 @@ pub struct Canvas {
     /// form field, a link, an annotation — needs document state the canvas does
     /// not have. The shell takes it and resolves it.
     clicked_at: Option<(f32, f32)>,
+    /// In-progress text for the field being edited on the page.
+    ///
+    /// Committing per keystroke would round-trip every character through the
+    /// engine thread and re-rasterize the page, so the text is held here and
+    /// written on Enter or when the editor loses focus.
+    field_drafts: HashMap<FieldId, String>,
+    /// Field whose on-page editor was opened most recently, so the text caret
+    /// is placed there exactly once instead of stolen every frame.
+    open_editor: Option<FieldId>,
+    /// Edit commands produced by on-page editors, taken by the shell.
+    edits: Vec<Command>,
+    /// Layout-space start point of an in-progress annotation drag.
+    draw_start: Option<(f32, f32)>,
+    /// Page the drag started on, so the annotation lands on one page even if
+    /// the pointer drifts over a neighbouring one.
+    draw_page: Option<u32>,
+    /// Tiles whose pixels predate an edit (annotation/field change) and must be
+    /// re-rasterized. The old texture stays visible until the fresh one
+    /// arrives, so an edit updates the page in place instead of flashing.
+    stale_tiles: HashSet<TileCacheKey>,
+    /// Thumbnails in the same stale state.
+    stale_thumbs: HashSet<ThumbCacheKey>,
+    /// Shapes echoed on screen while their real pixels render.
+    pending: Vec<PendingEcho>,
 }
 
 impl Default for Canvas {
@@ -176,6 +224,14 @@ impl Canvas {
             panning: false,
             page_spaces: Vec::new(),
             clicked_at: None,
+            field_drafts: HashMap::new(),
+            open_editor: None,
+            edits: Vec::new(),
+            draw_start: None,
+            draw_page: None,
+            stale_tiles: HashSet::new(),
+            stale_thumbs: HashSet::new(),
+            pending: Vec::new(),
         }
     }
 
@@ -196,9 +252,39 @@ impl Canvas {
         self.clicked_at.take()
     }
 
+    /// Take the edit commands produced by on-page field editors.
+    pub fn take_edits(&mut self) -> Vec<Command> {
+        std::mem::take(&mut self.edits)
+    }
+
+    /// Forget per-document editing state (drafts and the open editor).
+    ///
+    /// Called on document switch: a draft typed into one file must never leak
+    /// into another that happens to reuse the same field ids.
+    pub fn forget_edits(&mut self) {
+        self.field_drafts.clear();
+        self.open_editor = None;
+        self.edits.clear();
+        // A drag in progress when the document switched must not commit onto
+        // the new document: the start point is in the old document's space.
+        self.draw_start = None;
+        self.draw_page = None;
+        self.pending.clear();
+    }
+
+    /// Drop the echoes for one document, e.g. when their creation failed.
+    pub fn cancel_pending(&mut self, doc: DocumentId) {
+        self.pending.retain(|s| s.doc != doc);
+    }
+
     /// Scroll offset from the last draw, in document coordinates.
     pub fn scroll_offset(&self) -> Vec2 {
         self.scroll_offset
+    }
+
+    /// The document the canvas is currently laid out for.
+    pub fn active_document(&self) -> Option<DocumentId> {
+        self.active_document
     }
 
     /// Whether the hand tool is currently engaged.
@@ -242,6 +328,51 @@ impl Canvas {
         self.failed.clear();
     }
 
+    /// Mark one page's bitmaps as stale after an edit changed its appearance.
+    ///
+    /// Annotation and form edits do not change tile **keys** — same document,
+    /// rotation, zoom level, column and row — so the usual invalidation paths
+    /// (which work by making the old keys irrelevant) leave the old textures in
+    /// place and the draw loop keeps serving them forever.
+    ///
+    /// Evicting outright would fix that but flash: every visible tile would go
+    /// blank until its replacement arrives. Marking instead keeps the old
+    /// pixels on screen, re-requests the page's tiles, and swaps in fresh ones
+    /// as they land — the page updates in place.
+    pub fn invalidate_page(&mut self, doc: DocumentId, page: u32) {
+        let keys: Vec<TileCacheKey> = self
+            .tiles
+            .keys()
+            .filter(|(d, _, key)| *d == doc && key.page == page)
+            .copied()
+            .collect();
+        for key in keys {
+            self.stale_tiles.insert(key);
+        }
+        // A request already in flight was rendered *before* the edit, so its
+        // result would resurrect old pixels; drop it and let the draw loop ask
+        // again. The engine's generation counter also discards those requests
+        // server-side when InvalidateTiles runs.
+        self.inflight
+            .retain(|(d, _, key)| !(*d == doc && key.page == page));
+        self.failed
+            .retain(|(d, _, key)| !(*d == doc && key.page == page));
+
+        let thumb_keys: Vec<ThumbCacheKey> = self
+            .thumbs
+            .keys()
+            .filter(|(d, _, p)| *d == doc && *p == page)
+            .copied()
+            .collect();
+        for key in thumb_keys {
+            self.stale_thumbs.insert(key);
+        }
+        self.thumb_inflight
+            .retain(|(d, _, p)| !(*d == doc && *p == page));
+        self.thumb_failed
+            .retain(|(d, _, p)| !(*d == doc && *p == page));
+    }
+
     /// Store a rasterized tile, evicting the oldest if the cache is full.
     pub fn insert_tile(
         &mut self,
@@ -253,6 +384,8 @@ impl Canvas {
     ) {
         let cache_key = (doc, rotation, key);
         self.inflight.remove(&cache_key);
+        self.stale_tiles.remove(&cache_key);
+        self.pending.retain(|s| !(s.doc == doc && s.page == key.page));
 
         let image = bgra_to_color_image(pixels.width, pixels.height, &pixels.data);
         let name = format!(
@@ -301,6 +434,7 @@ impl Canvas {
     ) {
         let cache_key = (doc, rotation, page);
         self.thumb_inflight.remove(&cache_key);
+        self.stale_thumbs.remove(&cache_key);
         let image = bgra_to_color_image(pixels.width, pixels.height, &pixels.data);
         let name = format!("thumb-{}-{}-{}", doc.raw(), rotation.quarter_turns(), page);
         let handle = ctx.load_texture(name, image, TextureOptions::LINEAR);
@@ -316,6 +450,9 @@ impl Canvas {
 
     /// Drop every texture belonging to a document (called when its tab closes).
     pub fn forget_document(&mut self, doc: DocumentId) {
+        self.pending.retain(|s| s.doc != doc);
+        self.stale_tiles.retain(|(d, _, _)| *d != doc);
+        self.stale_thumbs.retain(|(d, _, _)| *d != doc);
         self.tiles.retain(|(d, _, _), _| *d != doc);
         self.order.retain(|(d, _, _)| *d != doc);
         self.inflight.retain(|(d, _, _)| *d != doc);
@@ -360,6 +497,7 @@ impl Canvas {
         form: Option<&FormInfo>,
         selected: Option<FieldId>,
         accent: Color32,
+        tool: Tool,
     ) -> Vec<PendingTile> {
         let mut candidates: Vec<(f32, PendingTile)> = Vec::new();
         let rotation = view.rotation;
@@ -477,7 +615,7 @@ impl Canvas {
             // translate only at paint time.
             let content_origin = ui.min_rect().min;
             let (_, page_area) = ui.allocate_exact_size(content, Sense::click_and_drag());
-            let painter = ui.painter();
+            let painter = ui.painter().clone();
 
             // Record the click in *document layout* space, not screen space:
             // the content Ui is already translated by the scroll offset, so
@@ -486,6 +624,145 @@ impl Canvas {
             if page_area.clicked() {
                 if let Some(pos) = page_area.interact_pointer_pos() {
                     self.clicked_at = Some((pos.x - content_origin.x, pos.y - content_origin.y));
+                }
+            }
+
+            // Annotation tools: drag draws (with a live rubber band), and the
+            // sticky-note tool places on click. Coordinates go through
+            // PageSpace::to_page so the annotation lands where it looks.
+            if let Some(kind) = tool.annotation_kind() {
+                if page_area.drag_started() {
+                    if let Some(pos) = page_area.interact_pointer_pos() {
+                        let local = (pos.x - content_origin.x, pos.y - content_origin.y);
+                        self.draw_start = Some(local);
+                        self.draw_page = page_spaces
+                            .iter()
+                            .find(|space| {
+                                local.0 >= space.origin.0
+                                    && local.0 <= space.origin.0 + space.size.0
+                                    && local.1 >= space.origin.1
+                                    && local.1 <= space.origin.1 + space.size.1
+                            })
+                            .map(|space| space.index);
+                    }
+                }
+
+                let dragging = page_area.dragged() && self.draw_start.is_some();
+                let mut pointer_now = None;
+                if dragging || page_area.drag_stopped() {
+                    pointer_now = page_area.interact_pointer_pos();
+                }
+
+                // Live preview while the drag is in progress.
+                if dragging {
+                    if let (Some(start), Some(end)) = (self.draw_start, pointer_now) {
+                        let end = (end.x - content_origin.x, end.y - content_origin.y);
+                        let min_x = start.0.min(end.0);
+                        let min_y = start.1.min(end.1);
+                        painter.rect_stroke(
+                            Rect::from_min_size(
+                                pos2(min_x, min_y),
+                                vec2((end.0 - min_x).abs(), (end.1 - min_y).abs()),
+                            )
+                            .translate(content_origin.to_vec2()),
+                            2.0,
+                            Stroke::new(1.5, accent),
+                            StrokeKind::Outside,
+                        );
+                    }
+                }
+
+                if page_area.drag_stopped() {
+                    if let (Some(start), Some(page), Some(end)) =
+                        (self.draw_start, self.draw_page, pointer_now)
+                    {
+                        let end = (end.x - content_origin.x, end.y - content_origin.y);
+                        // A near-zero drag on a click-placed tool is a placement.
+                        let dragged = (end.0 - start.0).abs() > 3.0 || (end.1 - start.1).abs() > 3.0;
+                        let new = match kind {
+                            AnnotationKind::StickyNote if !dragged => page_spaces
+                                .iter()
+                                .find(|space| space.index == page)
+                                .map(|space| {
+                                    // Keep the anchor on the page even if the
+                                    // click somehow lands a hair past the edge.
+                                    let (px, py) = space.to_page(end);
+                                    let (w, h) = space.geom.oriented(space.rotation);
+                                    NewAnnotation::StickyNote((
+                                        px.clamp(0.0, w),
+                                        py.clamp(0.0, h),
+                                    ))
+                                }),
+                            AnnotationKind::StickyNote => None,
+                            _ if dragged => {
+                                page_spaces
+                                    .iter()
+                                    .find(|space| space.index == page)
+                                    .and_then(|space| {
+                                        let (sx, sy) = space.to_page(start);
+                                        let (ex, ey) = space.to_page(end);
+                                        let rect =
+                                            PdfSpaceRect::from_corners((sx, sy), (ex, ey));
+                                        // A drag that ends over another page (or
+                                        // past the edge) converts through the
+                                        // start page's transform; clamp the
+                                        // result to the page so a highlight can
+                                        // never extend beyond it. A degenerate
+                                        // result (the whole drag was off-page)
+                                        // simply creates nothing.
+                                        let (w, h) = space.geom.oriented(space.rotation);
+                                        let page_bounds =
+                                            PdfSpaceRect::from_xywh(0.0, 0.0, w, h);
+                                        let rect = page_bounds.intersection(rect)?;
+                                        match kind {
+                                            AnnotationKind::Highlight => {
+                                                Some(NewAnnotation::Highlight(rect))
+                                            }
+                                            AnnotationKind::Underline => {
+                                                Some(NewAnnotation::Underline(rect))
+                                            }
+                                            AnnotationKind::StrikeOut => {
+                                                Some(NewAnnotation::StrikeOut(rect))
+                                            }
+                                            AnnotationKind::Squiggly => {
+                                                Some(NewAnnotation::Squiggly(rect))
+                                            }
+                                            AnnotationKind::Square => {
+                                                Some(NewAnnotation::Square(rect))
+                                            }
+                                            AnnotationKind::FreeText => Some(
+                                                NewAnnotation::FreeText(rect, "Text".into()),
+                                            ),
+                                            _ => None,
+                                        }
+                                    })
+                            }
+                            _ => None,
+                        };
+                        if let Some(new) = new {
+                            // Capture the echo data first: `new` moves into
+                            // the command below.
+                            let echo_has_rect = new.rect().is_some();
+                            let rect = Rect::from_min_max(
+                                pos2(start.0.min(end.0), start.1.min(end.1)),
+                                pos2(start.0.max(end.0), start.1.max(end.1)),
+                            );
+                            self.edits
+                                .push(Command::AddAnnotation { page, new });
+                            // Echo the shape now: the real pixels are one
+                            // engine round-trip away, and the thing just drawn
+                            // must not blink out in between.
+                            self.pending.push(PendingEcho {
+                                doc: doc.id,
+                                page,
+                                kind,
+                                rect: echo_has_rect.then_some(rect),
+                                point: (!echo_has_rect).then_some(end),
+                            });
+                        }
+                    }
+                    self.draw_start = None;
+                    self.draw_page = None;
                 }
             }
             painter.rect_filled(ui.clip_rect(), 0.0, background);
@@ -533,10 +810,16 @@ impl Canvas {
                         }
                         let rect = rect_local.translate(content_origin.to_vec2());
 
-                        if let Some(tex) = self.tiles.get(&(doc.id, rotation, key)) {
+                        let cache_key = (doc.id, rotation, key);
+                        let is_stale = self.stale_tiles.contains(&cache_key);
+                        if let Some(tex) = self.tiles.get(&cache_key) {
+                            // A stale texture keeps showing the pre-edit pixels
+                            // until its replacement lands: no flash.
                             painter.image(tex.id(), rect, uv_full(), Color32::WHITE);
-                        } else if !self.inflight.contains(&(doc.id, rotation, key))
-                            && !self.failed.contains(&(doc.id, rotation, key))
+                        }
+                        if (is_stale || self.tiles.get(&cache_key).is_none())
+                            && !self.inflight.contains(&cache_key)
+                            && !self.failed.contains(&cache_key)
                         {
                             let dist = rect.center().distance(center);
                             candidates.push((
@@ -564,18 +847,61 @@ impl Canvas {
             // Form field overlay, drawn after the tiles so it sits on top of
             // them. PDFium has already rasterized each widget's appearance into
             // the tiles; what egui adds is the interactive layer — an outline
-            // showing which regions are fields at all, and a stronger marker on
-            // the one the user selected.
+            // showing which regions are fields at all, a stronger marker on
+            // the one the user selected, and an editor on the selected field.
             if let Some(form) = form {
-                draw_form_overlay(
-                    &painter,
+                for space in &page_spaces {
+                    for field in form.fields.iter().filter(|f| f.id.page == space.index) {
+                        let screen = space.to_screen(field.rect);
+                        let rect = Rect::from_min_size(
+                            pos2(screen.x, screen.y),
+                            vec2(screen.w.max(1.0), screen.h.max(1.0)),
+                        )
+                        .translate(content_origin.to_vec2());
+
+                        // Skip fields scrolled out of sight: a form can have
+                        // hundreds of widgets and only a few are ever on screen.
+                        if !painter.clip_rect().intersects(rect) {
+                            continue;
+                        }
+
+                        let is_selected = selected == Some(field.id);
+                        if is_selected {
+                            painter.rect_filled(rect.expand(1.0), 2.0, accent.gamma_multiply(0.22));
+                            painter.rect_stroke(
+                                rect.expand(1.0),
+                                2.0,
+                                Stroke::new(2.0, accent),
+                                StrokeKind::Outside,
+                            );
+                        } else if field.is_editable() {
+                            // Faint outline so fillable regions are discoverable
+                            // without turning the page into a wireframe.
+                            painter.rect_stroke(
+                                rect,
+                                1.0,
+                                Stroke::new(1.0, accent.gamma_multiply(0.45)),
+                                StrokeKind::Outside,
+                            );
+                        }
+                    }
+                }
+
+                draw_field_editor(
+                    ui,
                     form,
                     selected,
+                    doc.id,
                     &page_spaces,
                     content_origin,
-                    accent,
+                    &mut self.edits,
                 );
             }
+
+            // Echoes of shapes the user just drew, drawn last so they sit on
+            // top of everything. They disappear on their own when the page's
+            // fresh tiles land.
+            draw_pending_echoes(&painter, &self.pending, doc.id, &page_spaces, content_origin);
         });
 
         self.scroll_offset = output.state.offset;
@@ -587,7 +913,10 @@ impl Canvas {
         // "the app is stuck" on a trackpad.
         let (panning, pan_delta) = ui.input(|input| {
             let pointer = &input.pointer;
-            let wants_pan = pointer.middle_down() || (self.pan_tool && pointer.primary_down());
+            // A draw tool owns the primary button; the middle button always
+            // pans, which is what every other viewer binds it to.
+            let wants_pan = pointer.middle_down()
+                || (self.pan_tool && pointer.primary_down() && tool.annotation_kind().is_none());
             (
                 wants_pan && pointer.is_decidedly_dragging(),
                 pointer.delta(),
@@ -775,59 +1104,206 @@ impl Canvas {
     }
 }
 
-/// Draw the interactive layer over form fields.
+/// Draw the just-drawn shapes that are still waiting for their real pixels.
 ///
-/// Field rectangles arrive in unrotated PDF space with y pointing up, so every
-/// one goes through [`PageSpace::to_screen`]: that is the single place that
-/// knows about the y flip and the rotation transposition. Doing the conversion
-/// by hand here is what would put a field on the wrong side of the page.
-fn draw_form_overlay(
+/// Colours approximate what PDFium will render for each kind, so the echo
+/// blends into the final appearance instead of popping.
+fn draw_pending_echoes(
     painter: &egui::Painter,
-    form: &FormInfo,
-    selected: Option<FieldId>,
+    pending: &[PendingEcho],
+    doc: DocumentId,
     page_spaces: &[PageSpace],
     content_origin: egui::Pos2,
-    accent: Color32,
 ) {
+    if pending.is_empty() {
+        return;
+    }
     let painter = painter.with_clip_rect(painter.clip_rect());
 
-    for space in page_spaces {
-        let page = space.index;
-        for field in form.fields.iter().filter(|f| f.id.page == page) {
-            let screen = space.to_screen(field.rect);
-            let rect = Rect::from_min_size(
-                pos2(screen.x, screen.y),
-                vec2(screen.w.max(1.0), screen.h.max(1.0)),
-            )
-            .translate(content_origin.to_vec2());
+    for shape in pending.iter().filter(|s| s.doc == doc) {
+        let Some(space) = page_spaces.iter().find(|sp| sp.index == shape.page) else {
+            continue;
+        };
+        let _ = space;
 
-            // Skip fields scrolled out of sight: a form can have hundreds of
-            // widgets and only a handful are ever on screen.
-            if !painter.clip_rect().intersects(rect) {
-                continue;
-            }
-
-            let is_selected = selected == Some(field.id);
-            if is_selected {
-                painter.rect_filled(rect.expand(1.0), 2.0, accent.gamma_multiply(0.22));
-                painter.rect_stroke(
-                    rect.expand(1.0),
-                    2.0,
-                    Stroke::new(2.0, accent),
-                    StrokeKind::Outside,
+        match shape.point {
+            // A sticky note echoes as its icon: a small yellow tag.
+            Some((x, y)) => {
+                let rect = Rect::from_center_size(
+                    pos2(x + content_origin.x, y + content_origin.y),
+                    vec2(18.0, 18.0),
                 );
-            } else if field.is_editable() {
-                // Faint outline so fillable regions are discoverable without
-                // turning the page into a wireframe.
+                painter.rect_filled(rect, 3.0, Color32::from_rgb(255, 213, 79));
                 painter.rect_stroke(
                     rect,
-                    1.0,
-                    Stroke::new(1.0, accent.gamma_multiply(0.45)),
+                    3.0,
+                    Stroke::new(1.0, Color32::from_rgb(140, 110, 0)),
                     StrokeKind::Outside,
                 );
+            }
+            // Everything else echoes as its rectangle.
+            None => {
+                let Some(rect) = shape.rect else { continue };
+                let rect = rect.translate(content_origin.to_vec2());
+                let (fill, stroke_color) = match shape.kind {
+                    AnnotationKind::Highlight => (
+                        Color32::from_rgba_unmultiplied(255, 235, 59, 70),
+                        Color32::from_rgb(212, 180, 0),
+                    ),
+                    AnnotationKind::StrikeOut => (
+                        Color32::TRANSPARENT,
+                        Color32::from_rgb(211, 47, 47),
+                    ),
+                    AnnotationKind::Squiggly => (
+                        Color32::TRANSPARENT,
+                        Color32::from_rgb(67, 160, 71),
+                    ),
+                    AnnotationKind::Square => (
+                        Color32::TRANSPARENT,
+                        Color32::from_rgb(211, 47, 47),
+                    ),
+                    AnnotationKind::FreeText => (
+                        Color32::from_rgba_unmultiplied(255, 255, 255, 140),
+                        Color32::from_rgb(80, 80, 80),
+                    ),
+                    _ => (Color32::TRANSPARENT, Color32::from_rgb(80, 80, 80)),
+                };
+                if fill != Color32::TRANSPARENT {
+                    painter.rect_filled(rect, 1.0, fill);
+                }
+                painter.rect_stroke(rect, 1.0, Stroke::new(1.5, stroke_color), StrokeKind::Inside);
             }
         }
     }
+}
+
+/// Place an editor over the selected field, if its type has one.
+///
+/// The editor is an egui `Area` pinned to the field's on-screen rectangle, so
+/// it follows the page exactly like the outlines drawn next to it. It sits
+/// above the page area in egui's hit-test order, so clicking inside it does not
+/// also register as a page click (which would deselect the field).
+///
+/// Text commits on Enter or blur and is buffered in egui memory meanwhile;
+/// every keystroke would otherwise round-trip through the engine thread and
+/// re-rasterize the page. Dropdowns commit on selection, which is discrete.
+fn draw_field_editor(
+    ui: &mut Ui,
+    form: &FormInfo,
+    selected: Option<FieldId>,
+    doc: DocumentId,
+    page_spaces: &[PageSpace],
+    content_origin: egui::Pos2,
+    edits: &mut Vec<Command>,
+) {
+    let Some(field_id) = selected else {
+        return;
+    };
+    let Some(space) = page_spaces.iter().find(|space| space.index == field_id.page) else {
+        return;
+    };
+    let Some(field) = form.fields.iter().find(|f| f.id == field_id) else {
+        return;
+    };
+    if !field.is_editable() {
+        return;
+    }
+
+    let screen = space.to_screen(field.rect);
+    let rect = Rect::from_min_size(
+        pos2(screen.x, screen.y),
+        vec2(screen.w.max(32.0), screen.h.max(18.0)),
+    )
+    .translate(content_origin.to_vec2());
+
+    let editor_id = egui::Id::new(("form-editor", doc.raw(), field_id.page, field_id.annot_index));
+    // Focus the editor exactly once when it opens, so selecting a text field
+    // by clicking it is enough to start typing. Re-requesting every frame
+    // would fight the user's own focus changes.
+    let just_opened =
+        ui.ctx().memory(|mem| mem.data.get_temp::<FieldId>(editor_owner_key(doc))) != Some(field_id);
+
+    let mut editor = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(rect)
+            .id_salt(("form-editor", doc.raw(), field_id.page, field_id.annot_index)),
+    );
+
+    let response = match field.kind {
+        FormFieldType::Text => {
+            let mut draft = editor
+                .ctx()
+                .memory(|mem| mem.data.get_temp::<String>(editor_id))
+                .unwrap_or_else(|| field.value.as_text());
+
+            let inner = editor.add(
+                egui::TextEdit::singleline(&mut draft)
+                    .desired_width(rect.width())
+                    .frame(egui::Frame::NONE)
+                    .font(egui::TextStyle::Monospace),
+            );
+
+            let changed = draft != field.value.as_text();
+            let submit = inner.lost_focus()
+                || (inner.has_focus() && editor.input(|i| i.key_pressed(egui::Key::Enter)));
+            if submit && changed {
+                edits.push(Command::SetFormFieldValue {
+                    id: field.id,
+                    value: FieldValue::Text(draft.clone()),
+                });
+                editor
+                    .ctx()
+                    .memory_mut(|mem| mem.data.remove::<String>(editor_id));
+            } else if changed {
+                editor
+                    .ctx()
+                    .memory_mut(|mem| mem.data.insert_temp(editor_id, draft));
+            }
+            Some(inner)
+        }
+        FormFieldType::ComboBox | FormFieldType::ListBox => {
+            let current = field.value.as_text();
+            egui::ComboBox::new(editor_id, "")
+                .selected_text(if current.is_empty() {
+                    "—".to_string()
+                } else {
+                    current
+                })
+                .width(rect.width())
+                .show_ui(&mut editor, |ui| {
+                    for option in &field.options {
+                        if ui.selectable_label(option.selected, option.label.as_str()).clicked() {
+                            edits.push(Command::SetFormFieldValue {
+                                id: field.id,
+                                value: FieldValue::Choice(Some(option.label.clone())),
+                            });
+                        }
+                    }
+                });
+            None
+        }
+        // Checkboxes and radios are toggled by clicking their rects on the
+        // page, which the shell resolves from the canvas click. Push buttons
+        // and signature fields have nothing to edit.
+        FormFieldType::CheckBox
+        | FormFieldType::RadioButton
+        | FormFieldType::PushButton
+        | FormFieldType::Signature
+        | FormFieldType::Unknown => None,
+    };
+
+    if just_opened {
+        if let Some(response) = response {
+            response.request_focus();
+        }
+        ui.ctx()
+            .memory_mut(|mem| mem.data.insert_temp(editor_owner_key(doc), field_id));
+    }
+}
+
+/// Memory key recording which field owns the open on-page editor.
+fn editor_owner_key(doc: DocumentId) -> egui::Id {
+    egui::Id::new(("form-editor-owner", doc.raw()))
 }
 
 /// Lay pages out in document space (logical points).
@@ -1056,6 +1532,7 @@ mod tests {
                     None,
                     None,
                     Color32::TRANSPARENT,
+                    Tool::Select,
                 );
             });
             out.textures_delta.clear();
@@ -1115,6 +1592,7 @@ mod tests {
                     None,
                     None,
                     Color32::TRANSPARENT,
+                    Tool::Select,
                 );
             });
             out.textures_delta.clear();
@@ -1161,6 +1639,7 @@ mod tests {
                 None,
                 None,
                 Color32::TRANSPARENT,
+                Tool::Select,
             );
         });
         // The GPU backend would normally apply these; clear them so dropping the
@@ -1216,6 +1695,7 @@ mod tests {
                 None,
                 None,
                 Color32::TRANSPARENT,
+                Tool::Select,
             );
         });
         out.textures_delta.clear();
@@ -1246,6 +1726,7 @@ mod tests {
                 None,
                 None,
                 Color32::TRANSPARENT,
+                Tool::Select,
             );
         });
         out2.textures_delta.clear();
@@ -1286,6 +1767,7 @@ mod tests {
                     None,
                     None,
                     Color32::TRANSPARENT,
+                    Tool::Select,
                 );
             });
             out.textures_delta.clear();
@@ -1342,6 +1824,7 @@ mod tests {
                         None,
                         None,
                         Color32::TRANSPARENT,
+                        Tool::Select,
                     );
                 });
                 output.textures_delta.clear();
@@ -1448,6 +1931,7 @@ mod tests {
                                     None,
                                     None,
                                     Color32::TRANSPARENT,
+                    Tool::Select,
                 );
                 if !jumping_now {
                     center = canvas.center_page();
@@ -1602,6 +2086,7 @@ mod tests {
                     None,
                     None,
                     Color32::TRANSPARENT,
+                    Tool::Select,
                 );
             });
             out.textures_delta.clear();
@@ -1634,6 +2119,7 @@ mod tests {
                     None,
                     None,
                     Color32::TRANSPARENT,
+                    Tool::Select,
                 );
             });
             out2.textures_delta.clear();
@@ -1934,5 +2420,116 @@ mod tests {
         let (at_one, _) = layout_pages(&d, &view, 1.0, 0.0);
         let (at_two, _) = layout_pages(&d, &view, 2.0, 0.0);
         assert!((at_two[0].w - at_one[0].w * 2.0).abs() < 1e-2);
+    }
+
+    /// An edited page's bitmaps must be marked stale (so they re-render) while
+    /// the old pixels keep showing — other pages and documents untouched. A
+    /// fresh render clears the stale flag; that is the no-flash contract.
+    #[test]
+    fn invalidate_page_marks_stale_and_a_fresh_tile_clears_it() {
+        let mut canvas = Canvas::new();
+        let ctx = egui::Context::default();
+        let texture = ctx.load_texture(
+            "test",
+            egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]),
+            egui::TextureOptions::default(),
+        );
+
+        let doc_a = DocumentId::from_raw(1);
+        let doc_b = DocumentId::from_raw(2);
+        let key_page0 = (doc_a, Rotation::None, TileKey::new(0, 0, 0, 0));
+        let key_page1 = (doc_a, Rotation::None, TileKey::new(1, 0, 0, 0));
+        let key_docb = (doc_b, Rotation::None, TileKey::new(0, 0, 0, 0));
+        canvas.tiles.insert(key_page0, texture.clone());
+        canvas.tiles.insert(key_page1, texture.clone());
+        canvas.tiles.insert(key_docb, texture.clone());
+        canvas
+            .thumbs
+            .insert((doc_a, Rotation::None, 0), texture);
+
+        canvas.invalidate_page(doc_a, 0);
+
+        assert!(canvas.stale_tiles.contains(&key_page0), "edited page stale");
+        assert!(!canvas.stale_tiles.contains(&key_page1), "other pages untouched");
+        assert!(!canvas.stale_tiles.contains(&key_docb), "other docs untouched");
+        assert!(
+            canvas.stale_thumbs.contains(&(doc_a, Rotation::None, 0)),
+            "the page's thumbnail is stale too"
+        );
+        // Marking is not eviction: the old pixels stay visible.
+        assert!(canvas.tiles.get(&key_page0).is_some());
+        assert!(canvas.thumbs.get(&(doc_a, Rotation::None, 0)).is_some());
+
+        // Fresh pixels clear the flag and replace the texture in place.
+        canvas.insert_tile(
+            &ctx,
+            doc_a,
+            Rotation::None,
+            TileKey::new(0, 0, 0, 0),
+            &pdfreader_pdf::engine::TilePixels {
+                width: 1,
+                height: 1,
+                data: vec![255, 255, 255, 255],
+            },
+        );
+        assert!(
+            !canvas.stale_tiles.contains(&key_page0),
+            "a fresh tile is no longer stale"
+        );
+    }
+
+    /// The echo of a just-drawn shape lives exactly until fresh pixels for its
+    /// page land, then disappears — the hand-off must be seamless.
+    #[test]
+    fn pending_echo_survives_until_the_pages_fresh_tile_arrives() {
+        let mut canvas = Canvas::new();
+        let ctx = egui::Context::default();
+        let doc = DocumentId::from_raw(7);
+        canvas.pending.push(PendingEcho {
+            doc,
+            page: 0,
+            kind: AnnotationKind::Highlight,
+            rect: Some(Rect::from_min_max(pos2(10.0, 10.0), pos2(50.0, 30.0))),
+            point: None,
+        });
+
+        // An unrelated document's tile must not dismiss the echo.
+        canvas.insert_tile(
+            &ctx,
+            DocumentId::from_raw(8),
+            Rotation::None,
+            TileKey::new(0, 0, 0, 0),
+            &pdfreader_pdf::engine::TilePixels {
+                width: 1,
+                height: 1,
+                data: vec![255, 255, 255, 255],
+            },
+        );
+        assert_eq!(canvas.pending.len(), 1, "other documents keep the echo");
+
+        // Fresh pixels for the echo's page hand off to the real render.
+        canvas.insert_tile(
+            &ctx,
+            doc,
+            Rotation::None,
+            TileKey::new(0, 0, 0, 0),
+            &pdfreader_pdf::engine::TilePixels {
+                width: 1,
+                height: 1,
+                data: vec![255, 255, 255, 255],
+            },
+        );
+        assert!(canvas.pending.is_empty(), "the echo handed off");
+
+        // A failed creation cancels the echo explicitly.
+        canvas.pending.push(PendingEcho {
+            doc,
+            page: 0,
+            kind: AnnotationKind::StickyNote,
+            rect: None,
+            point: Some((20.0, 20.0)),
+        });
+        canvas.cancel_pending(doc);
+        assert!(canvas.pending.is_empty(), "failed creation drops the echo");
     }
 }

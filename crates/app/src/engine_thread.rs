@@ -75,6 +75,64 @@ pub enum EngineRequest {
         /// Document to read from.
         handle: DocumentHandle,
     },
+    /// Write a value into one form field of the open document.
+    SetField {
+        /// Document holding the field.
+        doc: DocumentId,
+        /// Document to write to.
+        handle: DocumentHandle,
+        /// Which widget to change.
+        id: pdfreader_core::FieldId,
+        /// The new value.
+        value: pdfreader_core::FieldValue,
+    },
+    /// Serialise a document, optionally flattening first.
+    SaveDocument {
+        /// Document to write.
+        doc: DocumentId,
+        /// Document to serialise.
+        handle: DocumentHandle,
+        /// Whether to bake annotations and field values into page content.
+        flatten: bool,
+    },
+    /// Enumerate a document's annotations.
+    ListAnnotations {
+        /// Document the annotations belong to.
+        doc: DocumentId,
+        /// Document to read from.
+        handle: DocumentHandle,
+    },
+    /// Create an annotation.
+    AddAnnotation {
+        /// Document to edit.
+        doc: DocumentId,
+        /// Document to edit.
+        handle: DocumentHandle,
+        /// Page to draw on.
+        page: u32,
+        /// What to create and where.
+        new: pdfreader_core::NewAnnotation,
+    },
+    /// Delete an annotation.
+    DeleteAnnotation {
+        /// Document to edit.
+        doc: DocumentId,
+        /// Document to edit.
+        handle: DocumentHandle,
+        /// Which annotation.
+        id: pdfreader_core::AnnotationId,
+    },
+    /// Rewrite an annotation's contents.
+    SetAnnotationContents {
+        /// Document to edit.
+        doc: DocumentId,
+        /// Document to edit.
+        handle: DocumentHandle,
+        /// Which annotation.
+        id: pdfreader_core::AnnotationId,
+        /// The new text.
+        contents: String,
+    },
     /// Extract and search all pages of a document on the engine thread.
     Search {
         /// Document the results belong to.
@@ -157,6 +215,46 @@ pub enum EngineResponse {
         doc: DocumentId,
         /// The form, empty when the document has no interactive fields.
         form: FormInfo,
+    },
+    /// A form field write finished.
+    FieldSet {
+        /// Document that was written to.
+        doc: DocumentId,
+        /// Which widget was targeted.
+        id: pdfreader_core::FieldId,
+        /// Whether the value was written. `false` means the widget vanished,
+        /// is read-only, or its type cannot be written.
+        written: bool,
+        /// Why the write failed, when it did.
+        error: Option<String>,
+    },
+    /// A document was serialised successfully.
+    Saved {
+        /// Document that was written.
+        doc: DocumentId,
+        /// The PDF bytes to write to disk.
+        bytes: Vec<u8>,
+    },
+    /// A document could not be serialised.
+    SaveFailed {
+        /// Document that failed.
+        doc: DocumentId,
+        /// Human-readable reason.
+        reason: String,
+    },
+    /// The current annotation list, also the answer to every mutation.
+    Annotations {
+        /// Document the annotations belong to.
+        doc: DocumentId,
+        /// Every non-widget annotation, in page order.
+        annotations: Vec<pdfreader_core::AnnotationInfo>,
+    },
+    /// An annotation operation failed.
+    AnnotationsFailed {
+        /// Document that was being edited.
+        doc: DocumentId,
+        /// Human-readable reason.
+        reason: String,
     },
     /// Search results for one query.
     SearchResults {
@@ -361,6 +459,124 @@ fn run(
                 // thread. A document without a form simply reports an empty one.
                 let form = engine.form_fields(handle).unwrap_or_default();
                 if responses.send(EngineResponse::FormFields { doc, form }).is_err() {
+                    return;
+                }
+            }
+            EngineRequest::SetField {
+                doc,
+                handle,
+                id,
+                value,
+            } => {
+                let (written, error) = match engine.set_field_value(handle, id, value) {
+                    Ok(true) => (true, None),
+                    Ok(false) => (
+                        false,
+                        Some("the field is read-only or no longer exists".to_string()),
+                    ),
+                    Err(error) => (false, Some(error.to_string())),
+                };
+                if responses
+                    .send(EngineResponse::FieldSet {
+                        doc,
+                        id,
+                        written,
+                        error,
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            EngineRequest::SaveDocument {
+                doc,
+                handle,
+                flatten,
+            } => {
+                let response = match engine.save_to_bytes(handle, flatten) {
+                    Ok(bytes) => EngineResponse::Saved { doc, bytes },
+                    Err(error) => EngineResponse::SaveFailed {
+                        doc,
+                        reason: error.to_string(),
+                    },
+                };
+                if responses.send(response).is_err() {
+                    return;
+                }
+            }
+            EngineRequest::ListAnnotations { doc, handle } => {
+                let response = match engine.annotations(handle) {
+                    Ok(annotations) => EngineResponse::Annotations { doc, annotations },
+                    Err(error) => EngineResponse::AnnotationsFailed {
+                        doc,
+                        reason: error.to_string(),
+                    },
+                };
+                if responses.send(response).is_err() {
+                    return;
+                }
+            }
+            EngineRequest::AddAnnotation {
+                doc,
+                handle,
+                page,
+                new,
+            } => {
+                let response = match engine.add_annotation(handle, page, new) {
+                    Ok(()) => match engine.annotations(handle) {
+                        Ok(annotations) => EngineResponse::Annotations { doc, annotations },
+                        Err(error) => EngineResponse::AnnotationsFailed {
+                            doc,
+                            reason: error.to_string(),
+                        },
+                    },
+                    Err(error) => EngineResponse::AnnotationsFailed {
+                        doc,
+                        reason: error.to_string(),
+                    },
+                };
+                if responses.send(response).is_err() {
+                    return;
+                }
+            }
+            EngineRequest::DeleteAnnotation { doc, handle, id } => {
+                let response = match engine.delete_annotation(handle, id) {
+                    Ok(_) => match engine.annotations(handle) {
+                        Ok(annotations) => EngineResponse::Annotations { doc, annotations },
+                        Err(error) => EngineResponse::AnnotationsFailed {
+                            doc,
+                            reason: error.to_string(),
+                        },
+                    },
+                    Err(error) => EngineResponse::AnnotationsFailed {
+                        doc,
+                        reason: error.to_string(),
+                    },
+                };
+                if responses.send(response).is_err() {
+                    return;
+                }
+            }
+            EngineRequest::SetAnnotationContents {
+                doc,
+                handle,
+                id,
+                contents,
+            } => {
+                let response = match engine.set_annotation_contents(handle, id, &contents) {
+                    Ok(()) => match engine.annotations(handle) {
+                        Ok(annotations) => EngineResponse::Annotations { doc, annotations },
+                        Err(error) => EngineResponse::AnnotationsFailed {
+                            doc,
+                            reason: error.to_string(),
+                        },
+                    },
+                    Err(error) => EngineResponse::AnnotationsFailed {
+                        doc,
+                        reason: error.to_string(),
+                    },
+                };
+                if responses.send(response).is_err() {
                     return;
                 }
             }

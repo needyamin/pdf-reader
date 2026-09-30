@@ -4,6 +4,7 @@
 //! PDFium directly. That keeps the render and UI layers portable if the engine
 //! is ever swapped, and it keeps every piece of FFI behind one audited seam.
 
+pub mod annot;
 pub mod engine;
 pub mod error;
 pub mod form;
@@ -12,11 +13,9 @@ pub mod text;
 
 pub use engine::{DocumentHandle, PdfEngine, TilePixels, TileRequest};
 pub use error::EngineError;
-// The form domain types live in `core` so the UI can use them without PDFium;
-// this crate only converts PDFium's widget tree into them.
-pub use pdfreader_core::{
-    FieldId, FieldOption, FieldValue, FormFieldInfo, FormFieldType, FormInfo, FormKind,
-};
+// The annotation and form domain types live in `core` so the UI can use them
+// without PDFium; this crate only converts PDFium's objects into them.
+pub use pdfreader_core::{AnnotationId, AnnotationInfo, AnnotationKind, NewAnnotation};
 pub use geometry::Rect;
 pub use text::{CharBox, Line, Span, TextPage};
 

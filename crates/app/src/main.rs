@@ -13,18 +13,66 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 
 use egui::ViewportCommand;
 use pdfreader_core::{
-    Command, DocumentId, Effect, SidebarTab, Store, Tab, ThemeId, ViewMode, ZoomMode,
+    Command, DocumentId, Effect, FieldValue, FormFieldType, SidebarTab, Store, Tab, ThemeId, Tool,
+    ViewMode, ZoomMode,
 };
 use pdfreader_pdf::engine::{DocumentHandle, PdfiumEngine};
 use pdfreader_search::SearchMatch;
 use pdfreader_ui::{
-    MENUBAR_HEIGHT, STATUSBAR_HEIGHT, TABBAR_HEIGHT, TOOLBAR_HEIGHT, TOOLS_RAIL_WIDTH, forms_panel,
-    menu_bar, outline_tree, sidebar_tabs, status_bar, tab_bar, toolbar, tools_rail,
+    ANNOTATION_BAR_HEIGHT, MENUBAR_HEIGHT, STATUSBAR_HEIGHT, TABBAR_HEIGHT, TOOLBAR_HEIGHT,
+    TOOLS_RAIL_WIDTH, annotation_bar, comments_panel, forms_panel, menu_bar, outline_tree,
+    sidebar_tabs, status_bar, tab_bar, toolbar, tools_rail,
 };
 use serde::{Deserialize, Serialize};
 
 use canvas::{Canvas, MARGIN, PendingThumb, PendingTile, SCROLLBAR_ALLOWANCE};
 use engine_thread::{EngineRequest, EngineResponse, EngineThread};
+
+/// Write PDF bytes to `path` atomically.
+///
+/// PDFium cannot save over a file it holds open, and a half-written PDF is
+/// worse than an unwritten one, so the bytes land in a temp file in the same
+/// directory (same filesystem, so the rename is atomic) and are then renamed
+/// over the destination.
+fn write_pdf_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    let directory = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map_or_else(|| std::path::PathBuf::from("."), std::path::Path::to_path_buf);
+    let file_name = path
+        .file_name()
+        .map_or_else(|| std::ffi::OsString::from("document.pdf"), std::ffi::OsString::from);
+
+    let mut temp = directory.join(format!(
+        ".{}.tmp-{}",
+        file_name.to_string_lossy(),
+        std::process::id()
+    ));
+
+    // A stale temp file from a crashed run must not be silently truncated into
+    // a second writer's path; nudge the name until it is free.
+    let mut bump = 0u32;
+    while temp.exists() {
+        bump += 1;
+        temp = directory.join(format!(
+            ".{}.tmp-{}-{}",
+            file_name.to_string_lossy(),
+            std::process::id(),
+            bump
+        ));
+    }
+
+    std::fs::write(&temp, bytes)?;
+    match std::fs::rename(&temp, path) {
+        Ok(()) => Ok(()),
+        // Windows can refuse to clobber a read-only destination; clean up
+        // rather than leave a hidden temp file behind.
+        Err(error) => {
+            let _ = std::fs::remove_file(&temp);
+            Err(error)
+        }
+    }
+}
 
 fn main() {
     init_tracing();
@@ -158,6 +206,31 @@ struct App {
     dialog_tx: Sender<Option<PathBuf>>,
     /// Whether a dialog is already open, so we do not stack them.
     dialog_open: bool,
+    /// Receives the result of the save-as dialog.
+    save_dialog_rx: Receiver<Option<PathBuf>>,
+    /// Sends save-as dialog results.
+    save_dialog_tx: Sender<Option<PathBuf>>,
+    /// Whether a save-as dialog is already open.
+    save_dialog_open: bool,
+    /// Tab awaiting the unsaved-changes prompt.
+    ///
+    /// Set by `Effect::ConfirmClose`; the tab is not closed until the user
+    /// picks an option in the modal, which dispatches `ConfirmCloseTab`.
+    pending_close: Option<pdfreader_core::TabId>,
+    /// Tab to close as soon as its save finishes writing.
+    close_after_save: Option<pdfreader_core::TabId>,
+    /// Whether the last save failed, so the user is not left assuming a write
+    /// succeeded when the disk rejected it.
+    save_error: Option<String>,
+    /// Destination for the save currently in flight, so the serialised bytes
+    /// land where the user asked rather than where the file was opened from.
+    save_target: Option<PathBuf>,
+    /// Whether the window was maximized when fullscreen was entered, so
+    /// leaving fullscreen can put it back. Borderless fullscreen from a
+    /// maximized window is a known egui-winit conflict on Windows: entering
+    /// without un-maximizing first can fail to cover the taskbar, and leaving
+    /// without restoring leaves a small floating window.
+    pre_fullscreen_maximized: Option<bool>,
     /// Passphrase prompts for encrypted documents, keyed by tab. Several
     /// encrypted documents can fail at once; a single slot would silently
     /// discard the passphrase a user is halfway through typing.
@@ -200,6 +273,7 @@ impl App {
     /// Build the application.
     fn new(engine: EngineThread, initial: Option<PathBuf>) -> Self {
         let (dialog_tx, dialog_rx) = channel();
+        let (save_dialog_tx, save_dialog_rx) = channel();
         let settings = load_settings();
 
         let mut store = Store::new();
@@ -229,6 +303,14 @@ impl App {
             dialog_rx,
             dialog_tx,
             dialog_open: false,
+            save_dialog_rx,
+            save_dialog_tx,
+            save_dialog_open: false,
+            pending_close: None,
+            close_after_save: None,
+            save_error: None,
+            save_target: None,
+            pre_fullscreen_maximized: None,
             password_prompts: HashMap::new(),
             search_query: seeded_query.unwrap_or_default(),
             search_results: Vec::new(),
@@ -305,6 +387,68 @@ impl App {
                 Effect::PersistSession => {
                     self.persist();
                 }
+                Effect::SetField { doc, id, value } => {
+                    if let Some(handle) = self.handles.get(&doc).copied() {
+                        self.engine.send(EngineRequest::SetField {
+                            doc,
+                            handle,
+                            id,
+                            value,
+                        });
+                    }
+                }
+                Effect::SaveDocument { doc, path, flatten } => {
+                    if let Some(handle) = self.handles.get(&doc).copied() {
+                        self.save_target = Some(path.clone());
+                        self.engine.send(EngineRequest::SaveDocument {
+                            doc,
+                            handle,
+                            flatten,
+                        });
+                    }
+                }
+                Effect::ConfirmClose { tab } => {
+                    self.pending_close = Some(tab);
+                }
+                Effect::LoadAnnotations { doc } => {
+                    if let Some(handle) = self.handles.get(&doc).copied() {
+                        self.engine
+                            .send(EngineRequest::ListAnnotations { doc, handle });
+                    }
+                }
+                Effect::AddAnnotation { doc, page, new } => {
+                    tracing::info!(?doc, page, kind = ?new.kind(), "annotation create requested");
+                    if let Some(handle) = self.handles.get(&doc).copied() {
+                        self.engine.send(EngineRequest::AddAnnotation {
+                            doc,
+                            handle,
+                            page,
+                            new,
+                        });
+                    }
+                    // InvalidateTiles alone cannot refresh the page: tile keys
+                    // are unchanged by an annotation edit, so the cached
+                    // textures would keep being served. Marking the page's
+                    // bitmaps stale re-renders it without a flash.
+                    self.canvas.invalidate_page(doc, page);
+                }
+                Effect::DeleteAnnotation { doc, id } => {
+                    if let Some(handle) = self.handles.get(&doc).copied() {
+                        self.engine.send(EngineRequest::DeleteAnnotation { doc, handle, id });
+                    }
+                    self.canvas.invalidate_page(doc, id.page);
+                }
+                Effect::SetAnnotationContents { doc, id, contents } => {
+                    if let Some(handle) = self.handles.get(&doc).copied() {
+                        self.engine.send(EngineRequest::SetAnnotationContents {
+                            doc,
+                            handle,
+                            id,
+                            contents,
+                        });
+                    }
+                    self.canvas.invalidate_page(doc, id.page);
+                }
             }
         }
     }
@@ -345,6 +489,14 @@ impl App {
             self.dialog_open = false;
             if let Some(path) = picked {
                 let effects = self.store.dispatch(Command::OpenPath(path));
+                self.execute(effects);
+            }
+        }
+
+        if let Ok(picked) = self.save_dialog_rx.try_recv() {
+            self.save_dialog_open = false;
+            if let Some(path) = picked {
+                let effects = self.store.dispatch(Command::SaveDocumentTo(path));
                 self.execute(effects);
             }
         }
@@ -461,12 +613,14 @@ impl App {
                         .map(|d| d.id);
                     if let Some(id) = assigned {
                         self.handles.insert(id, handle);
-                        // Read the form now that the handle exists. Sent here
-                        // rather than as a reducer effect because the engine
-                        // answers in terms of a document id the store only
-                        // assigns during the dispatch above.
+                        // Read the form and the annotations now that the handle
+                        // exists. Sent here rather than as reducer effects
+                        // because the engine answers in terms of a document id
+                        // the store only assigns during the dispatch above.
                         self.engine
                             .send(EngineRequest::LoadForm { doc: id, handle });
+                        self.engine
+                            .send(EngineRequest::ListAnnotations { doc: id, handle });
                     } else {
                         // A tab can be closed while PDFium is still opening the
                         // file. The reducer then ignores the late response, so
@@ -482,6 +636,76 @@ impl App {
                         .store
                         .dispatch(Command::FormFieldsLoaded { doc, form });
                     self.execute(effects);
+                }
+                EngineResponse::FieldSet {
+                    doc,
+                    id,
+                    written,
+                    error,
+                } => {
+                    if !written {
+                        // The reducer already applied the value optimistically;
+                        // a failed write means the document will not actually
+                        // hold it, so say so rather than let a save silently
+                        // drop the user's input.
+                        tracing::warn!(
+                            "form field {id:?} in document {doc:?} was not written: {}",
+                            error.as_deref().unwrap_or("unknown reason")
+                        );
+                        self.save_error = Some(format!(
+                            "Could not write field: {}",
+                            error.as_deref().unwrap_or("unknown reason")
+                        ));
+                    }
+                }
+                EngineResponse::Saved { doc, bytes } => {
+                    if let Some(path) = self.save_target.take() {
+                        match write_pdf_atomically(&path, &bytes) {
+                            Ok(()) => {
+                                self.save_error = None;
+                                let effects =
+                                    self.store.dispatch(Command::DocumentSaved { doc });
+                                self.execute(effects);
+                                // A "save and close" prompt finishes here, once
+                                // the bytes are actually on disk.
+                                if let Some(tab) = self.close_after_save.take() {
+                                    let effects =
+                                        self.store.dispatch(Command::ConfirmCloseTab(tab));
+                                    self.execute(effects);
+                                }
+                            }
+                            Err(error) => {
+                                tracing::error!("could not write {}: {error}", path.display());
+                                self.save_error =
+                                    Some(format!("Could not save {}: {error}", path.display()));
+                                // The close is cancelled so the user keeps both
+                                // the document and their unsaved edits.
+                                self.close_after_save = None;
+                            }
+                        }
+                    }
+                }
+                EngineResponse::SaveFailed { doc, reason } => {
+                    tracing::error!("could not serialise document {doc:?}: {reason}");
+                    self.save_error = Some(reason);
+                }
+                EngineResponse::Annotations { doc, annotations } => {
+                    let effects = self
+                        .store
+                        .dispatch(Command::AnnotationsLoaded { doc, annotations });
+                    self.execute(effects);
+                }
+                EngineResponse::AnnotationsFailed { doc, reason } => {
+                    tracing::warn!("annotation operation failed on {doc:?}: {reason}");
+                    self.save_error = Some(format!("Annotation failed: {reason}"));
+                    // If the list was never read, un-stick the Comments panel.
+                    let effects = self
+                        .store
+                        .dispatch(Command::AnnotationsLoadFailed { doc });
+                    self.execute(effects);
+                    // An echoed shape whose creation failed must not haunt the
+                    // page until the next re-render.
+                    self.canvas.cancel_pending(doc);
                 }
                 EngineResponse::Failed { tab, reason } => {
                     tracing::warn!("could not open document: {reason}");
@@ -643,7 +867,23 @@ impl App {
             }
             if ctrl && input.key_pressed(egui::Key::W) {
                 if let Some(id) = self.store.state().active_tab {
-                    commands.push(Command::CloseTab(id));
+                    commands.push(Command::RequestCloseTab(id));
+                }
+            }
+            if input.key_pressed(egui::Key::Escape) {
+                if self.store.state().fullscreen {
+                    commands.push(Command::ToggleFullscreen);
+                } else if self.store.state().tool.annotation_kind().is_some() {
+                    commands.push(Command::SetTool(Tool::Select));
+                }
+            }
+            if ctrl && input.key_pressed(egui::Key::S) {
+                if self.store.state().active().is_some_and(|tab| tab.document.is_some()) {
+                    if input.modifiers.shift {
+                        commands.push(Command::SaveDocumentAs);
+                    } else {
+                        commands.push(Command::SaveDocument);
+                    }
                 }
             }
         });
@@ -677,6 +917,41 @@ impl App {
         {
             tracing::error!("could not open a file dialog thread: {error}");
             self.dialog_open = false;
+        }
+    }
+
+    /// Open a native save dialog on a worker thread.
+    ///
+    /// Mirrors `show_open_dialog`: the dialog blocks, so it runs elsewhere and
+    /// reports back through a channel.
+    fn show_save_dialog(&mut self) {
+        if self.save_dialog_open {
+            return;
+        }
+        self.save_dialog_open = true;
+
+        let sender = self.save_dialog_tx.clone();
+        let default_name = self
+            .store
+            .state()
+            .active()
+            .map(|tab| tab.path.file_name().map(|n| n.to_string_lossy().to_string()))
+            .flatten();
+
+        if let Err(error) = std::thread::Builder::new()
+            .name("save-dialog".to_string())
+            .spawn(move || {
+                let mut dialog = rfd::FileDialog::new()
+                    .add_filter("PDF document", &["pdf"])
+                    .set_title("Save PDF as");
+                if let Some(name) = default_name {
+                    dialog = dialog.set_file_name(name);
+                }
+                let _ = sender.send(dialog.save_file());
+            })
+        {
+            tracing::error!("could not open a save dialog thread: {error}");
+            self.save_dialog_open = false;
         }
     }
 
@@ -777,6 +1052,10 @@ impl App {
                 self.show_open_dialog();
                 continue;
             }
+            if matches!(command, Command::SaveDocumentAs) {
+                self.show_save_dialog();
+                continue;
+            }
             let is_scroll_by = matches!(command, Command::ScrollBy { .. });
             let fullscreen = matches!(command, Command::ToggleFullscreen);
             let effects = self.store.dispatch(command);
@@ -787,7 +1066,33 @@ impl App {
                 }
             }
             if fullscreen {
-                ctx.send_viewport_cmd(ViewportCommand::Fullscreen(self.store.state().fullscreen));
+                let entering = self.store.state().fullscreen;
+                if entering {
+                    // Un-maximize first: a maximized window going borderless
+                    // fullscreen is the known "not truly fullscreen" failure.
+                    let maximized = ctx.input(|input| input.viewport().maximized);
+                    self.pre_fullscreen_maximized = maximized;
+                    if maximized == Some(true) {
+                        ctx.send_viewport_cmd(ViewportCommand::Maximized(false));
+                    }
+                    ctx.send_viewport_cmd(ViewportCommand::Fullscreen(true));
+                } else {
+                    ctx.send_viewport_cmd(ViewportCommand::Fullscreen(false));
+                    if self.pre_fullscreen_maximized == Some(true) {
+                        ctx.send_viewport_cmd(ViewportCommand::Maximized(true));
+                    }
+                    self.pre_fullscreen_maximized = None;
+                }
+                // The commands reach winit after this frame; log what the
+                // viewport reported before them so a follow-up report is a
+                // log line rather than a screenshot.
+                tracing::info!(
+                    entering,
+                    before_fullscreen = ?ctx.input(|input| input.viewport().fullscreen),
+                    before_maximized = ?ctx.input(|input| input.viewport().maximized),
+                    "fullscreen toggled"
+                );
+                ctx.request_repaint();
             }
             self.execute(effects);
         }
@@ -907,6 +1212,29 @@ impl eframe::App for App {
                                         &mut commands,
                                     );
                                 }
+                                SidebarTab::Comments => {
+                                    match store
+                                        .state()
+                                        .active()
+                                        .and_then(|t| t.annotations.as_ref())
+                                    {
+                                        Some(list) => commands.extend(comments_panel(
+                                            ui,
+                                            &palette,
+                                            doc.id,
+                                            list,
+                                            view.selected_annotation,
+                                        )),
+                                        None => {
+                                            ui.add_space(6.0);
+                                            ui.label(
+                                                egui::RichText::new("Reading annotations…")
+                                                    .color(palette.text_dim)
+                                                    .size(12.0),
+                                            );
+                                        }
+                                    }
+                                }
                                 SidebarTab::Forms => {
                                     // The tab only appears in the strip once a
                                     // form exists, so an unread form here means
@@ -915,6 +1243,7 @@ impl eframe::App for App {
                                         Some(form) => commands.extend(forms_panel(
                                             ui,
                                             &palette,
+                                            doc.id,
                                             form,
                                             view.selected_field,
                                         )),
@@ -973,6 +1302,13 @@ impl eframe::App for App {
             egui::CentralPanel::default()
                 .frame(frame(palette.window_bg))
                 .show(ui, |ui| {
+                    // The annotation tool strip sits above the page; it only
+                    // exists while a document is open, so an empty launch shows
+                    // just the welcome card.
+                    if store.state().active().is_some_and(|tab| tab.document.is_some()) {
+                        commands.extend(annotation_bar(ui, &palette, store.state()));
+                        ui.separator();
+                    }
                     canvas_size = Some(ui.available_size());
 
                     let state = store.state();
@@ -984,6 +1320,12 @@ impl eframe::App for App {
                         }
                         Some(tab) => {
                             if let Some(doc) = tab.document.as_ref() {
+                                // Field drafts belong to one document; a draft
+                                // typed into the previous tab must never leak
+                                // into another that reuses the same field ids.
+                                if canvas.active_document() != Some(doc.id) {
+                                    canvas.forget_edits();
+                                }
                                 // A programmatic jump scrolls inside `draw`, but
                                 // the centre page reported by this frame is still
                                 // the pre-jump one. Skip the update or it would
@@ -1003,14 +1345,16 @@ impl eframe::App for App {
                                     tab.form.as_ref(),
                                     tab.view.selected_field,
                                     palette.accent,
+                                    store.state().tool,
                                 );
                                 tiles.extend(pending);
 
                                 // Resolve a click on the page into a form field
-                                // selection. The canvas only reports where the
-                                // click landed; deciding what is underneath is
-                                // document knowledge, so it happens here.
-                                if let Some(point) = canvas.take_click() {
+                                // selection — but only in Select mode, where a
+                                // click cannot mean "place an annotation".
+                                if let Some(point) = canvas.take_click().filter(|_| {
+                                    store.state().tool.annotation_kind().is_none()
+                                }) {
                                     let hit = pdfreader_render::hit_page(
                                         canvas.page_spaces(),
                                         point,
@@ -1021,9 +1365,39 @@ impl eframe::App for App {
                                             f.id.page == space.index && f.rect.contains(x, y)
                                         })
                                     })
-                                    .map(|f| f.id);
-                                    commands.push(Command::SelectFormField(hit));
+                                    .cloned();
+                                    commands
+                                        .push(Command::SelectFormField(hit.as_ref().map(|f| f.id)));
+
+                                    // Boolean widgets toggle on click, the way
+                                    // they do in every PDF viewer — PDFium has
+                                    // already drawn their current appearance,
+                                    // so the click is the whole interaction.
+                                    if let Some(field) = hit {
+                                        if field.is_editable() {
+                                            match field.kind {
+                                                FormFieldType::CheckBox => {
+                                                    commands.push(Command::SetFormFieldValue {
+                                                        id: field.id,
+                                                        value: FieldValue::Checked(
+                                                            field.value != FieldValue::Checked(true),
+                                                        ),
+                                                    });
+                                                }
+                                                FormFieldType::RadioButton
+                                                    if field.value != FieldValue::Checked(true) =>
+                                                {
+                                                    commands.push(Command::SetFormFieldValue {
+                                                        id: field.id,
+                                                        value: FieldValue::Checked(true),
+                                                    });
+                                                }
+                                                _ => {}
+                                            }
+                                        }
+                                    }
                                 }
+                                commands.extend(canvas.take_edits());
 
                                 // Keep both the page indicator and the
                                 // persisted viewport offset in step with
@@ -1077,6 +1451,79 @@ impl eframe::App for App {
         }
         for tab in cancelled {
             self.password_prompts.remove(&tab);
+        }
+
+        // The unsaved-changes prompt. Saving first means the close only
+        // completes once the engine has serialised and the bytes are on disk,
+        // which is why `close_after_save` exists rather than closing inline.
+        if let Some(tab) = self.pending_close {
+            let path = self
+                .store
+                .state()
+                .tab(tab)
+                .map(|t| t.path.clone())
+                .unwrap_or_default();
+            match confirm_close_dialog(&ctx, &palette, &path) {
+                Some(CloseChoice::SaveAndClose) => {
+                    self.pending_close = None;
+                    if let Some(doc) = self
+                        .store
+                        .state()
+                        .tab(tab)
+                        .and_then(|t| t.document.as_ref())
+                        .map(|d| d.id)
+                    {
+                        if let Some(handle) = self.handles.get(&doc).copied() {
+                            self.save_target = Some(path.clone());
+                            self.close_after_save = Some(tab);
+                            self.engine.send(EngineRequest::SaveDocument {
+                                doc,
+                                handle,
+                                flatten: false,
+                            });
+                        }
+                    }
+                }
+                Some(CloseChoice::Discard) => {
+                    self.pending_close = None;
+                    let effects = self.store.dispatch(Command::ConfirmCloseTab(tab));
+                    self.execute(effects);
+                }
+                Some(CloseChoice::Cancel) => {
+                    self.pending_close = None;
+                }
+                None => {}
+            }
+        }
+
+        // A failed save or field write surfaces here so "nothing happened" is
+        // never the only feedback. Click anywhere on it to dismiss.
+        if let Some(error) = self.save_error.clone() {
+            let response = egui::Area::new(egui::Id::new("save-error"))
+                .anchor(egui::Align2::CENTER_BOTTOM, egui::Vec2::new(0.0, -36.0))
+                .show(&ctx, |ui| {
+                    egui::Frame::new()
+                        .fill(palette.panel_bg)
+                        .stroke(egui::Stroke::new(1.0, palette.danger))
+                        .corner_radius(3.0)
+                        .inner_margin(egui::Margin::same(10))
+                        .show(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new(format!("{error}  (click to dismiss)"))
+                                    .color(palette.text)
+                                    .size(12.0),
+                            );
+                        });
+                    ui.interact(
+                        ui.min_rect(),
+                        egui::Id::new("save-error-dismiss"),
+                        egui::Sense::click(),
+                    )
+                })
+                .inner;
+            if response.clicked() {
+                self.save_error = None;
+            }
         }
 
         self.canvas_size = canvas_size;
@@ -1418,6 +1865,69 @@ enum PasswordAction {
 }
 
 /// Draw the passphrase prompt without blocking the render or engine threads.
+/// What the user chose in the unsaved-changes prompt.
+enum CloseChoice {
+    /// Write the changes first, then close the tab.
+    SaveAndClose,
+    /// Throw the changes away and close the tab.
+    Discard,
+    /// Do nothing; keep the tab and its changes.
+    Cancel,
+}
+
+/// The unsaved-changes prompt for a dirty tab.
+fn confirm_close_dialog(
+    ctx: &egui::Context,
+    palette: &pdfreader_ui::Palette,
+    path: &std::path::Path,
+) -> Option<CloseChoice> {
+    let mut choice = None;
+    egui::Window::new("Unsaved changes")
+        .collapsible(false)
+        .resizable(false)
+        .frame(
+            egui::Frame::new()
+                .fill(palette.panel_bg)
+                .stroke(egui::Stroke::new(1.0, palette.border))
+                .corner_radius(3.0)
+                .inner_margin(egui::Margin::same(18)),
+        )
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        .show(ctx, |ui| {
+            ui.set_min_width(330.0);
+            ui.label(
+                egui::RichText::new(format!(
+                    "{} has changes that are not saved.",
+                    path.display()
+                ))
+                .color(palette.text)
+                .size(13.0),
+            );
+            ui.add_space(14.0);
+            ui.horizontal(|ui| {
+                if ui
+                    .add(egui::Button::new(egui::RichText::new("Save and close").size(12.5)))
+                    .clicked()
+                {
+                    choice = Some(CloseChoice::SaveAndClose);
+                }
+                if ui
+                    .add(egui::Button::new(egui::RichText::new("Discard changes").size(12.5)))
+                    .clicked()
+                {
+                    choice = Some(CloseChoice::Discard);
+                }
+                if ui
+                    .add(egui::Button::new(egui::RichText::new("Cancel").size(12.5)))
+                    .clicked()
+                {
+                    choice = Some(CloseChoice::Cancel);
+                }
+            });
+        });
+    choice
+}
+
 fn password_dialog(
     ctx: &egui::Context,
     palette: &pdfreader_ui::Palette,

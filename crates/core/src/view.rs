@@ -66,6 +66,8 @@ pub struct ViewState {
     /// a row in one highlights the widget in the other, so it has to live in
     /// state rather than in either widget.
     pub selected_field: Option<FieldId>,
+    /// The annotation the user last selected, if any.
+    pub selected_annotation: Option<crate::annotation::AnnotationId>,
 }
 
 impl Default for ViewState {
@@ -79,6 +81,7 @@ impl Default for ViewState {
             mode: ViewMode::Continuous,
             current_page: 0,
             selected_field: None,
+            selected_annotation: None,
         }
     }
 }

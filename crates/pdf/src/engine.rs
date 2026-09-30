@@ -12,8 +12,12 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use pdfium_render::prelude::*;
-use pdfreader_core::{FormInfo, Outline, OutlineNode, PageGeometry, Rotation};
+use pdfreader_core::{
+    AnnotationId, AnnotationInfo, FormInfo, NewAnnotation, Outline, OutlineNode, PageGeometry,
+    Rotation,
+};
 
+use crate::annot;
 use crate::error::EngineError;
 use crate::form::read_form;
 use crate::text::{CharBox, TextPage};
@@ -103,6 +107,52 @@ pub trait PdfEngine {
     /// Returns an empty [`FormInfo`] for documents with no AcroForm rather than
     /// an error: "no form" is a normal state, not a failure.
     fn form_fields(&mut self, handle: DocumentHandle) -> Result<FormInfo>;
+
+    /// Write a value into one form field.
+    ///
+    /// `id` is the `(page, annotation index)` pair reported by
+    /// [`Self::form_fields`]. Returns `Ok(true)` when the value was written,
+    /// `Ok(false)` when the widget is missing or read-only, and an error when
+    /// the widget type cannot be written at all.
+    fn set_field_value(
+        &mut self,
+        handle: DocumentHandle,
+        id: pdfreader_core::FieldId,
+        value: pdfreader_core::FieldValue,
+    ) -> Result<bool>;
+
+    /// Serialise the document, optionally flattening annotations and form
+    /// values into page content first.
+    ///
+    /// Returns the raw PDF bytes. Writing them back to disk is the caller's
+    /// job, so this method never touches the file the document was opened from
+    /// (PDFium cannot save over a file it holds open).
+    fn save_to_bytes(&mut self, handle: DocumentHandle, flatten: bool) -> Result<Vec<u8>>;
+
+    /// List every non-widget annotation in the document, in page order.
+    fn annotations(&mut self, handle: DocumentHandle) -> Result<Vec<AnnotationInfo>>;
+
+    /// Create an annotation described by `new` on `page`.
+    fn add_annotation(
+        &mut self,
+        handle: DocumentHandle,
+        page: u32,
+        new: NewAnnotation,
+    ) -> Result<()>;
+
+    /// Remove one annotation.
+    ///
+    /// Returns `Ok(false)` when the id no longer resolves, which is not an
+    /// error: the document may have been edited since the list was read.
+    fn delete_annotation(&mut self, handle: DocumentHandle, id: AnnotationId) -> Result<bool>;
+
+    /// Replace the text contents of one annotation.
+    fn set_annotation_contents(
+        &mut self,
+        handle: DocumentHandle,
+        id: AnnotationId,
+        contents: &str,
+    ) -> Result<()>;
 }
 
 /// PDFium-backed engine.
@@ -277,6 +327,145 @@ impl PdfEngine for PdfiumEngine {
             .get(&handle)
             .ok_or(EngineError::NotOpen(handle.raw()))?;
         Ok(read_form(document))
+    }
+
+    fn set_field_value(
+        &mut self,
+        handle: DocumentHandle,
+        id: pdfreader_core::FieldId,
+        value: pdfreader_core::FieldValue,
+    ) -> Result<bool> {
+        let Self { documents, .. } = self;
+        let document = documents
+            .get(&handle)
+            .ok_or(EngineError::NotOpen(handle.raw()))?;
+
+        let mut page = page_of(document, id.page)?;
+        // A stale or bogus widget id means "nothing to write", not a failure:
+        // the form was re-read or the document changed between the request and
+        // the write, and neither is exceptional.
+        let Ok(mut annotation) = page
+            .annotations_mut()
+            .get(id.annot_index as PdfPageAnnotationIndex)
+        else {
+            return Ok(false);
+        };
+
+        let Some(field) = annotation.as_form_field_mut() else {
+            return Ok(false);
+        };
+        if field.is_read_only() {
+            return Ok(false);
+        }
+
+        let outcome = match value {
+            pdfreader_core::FieldValue::Text(text) => field
+                .as_text_field_mut()
+                .ok_or_else(|| EngineError::Unsupported("editing this widget".to_string()))
+                .and_then(|text_field| {
+                    text_field
+                        .set_value(&text)
+                        .map_err(|error| EngineError::Pdfium(error.to_string()))
+                }),
+            pdfreader_core::FieldValue::Checked(on) => {
+                // Selecting a radio button means checking that widget; PDFium's
+                // radio group deselects its siblings. Unchecking one outright
+                // has no setter, so radios are toggle-on only.
+                if let Some(checkbox) = field.as_checkbox_field_mut() {
+                    checkbox
+                        .set_checked(on)
+                        .map_err(|error| EngineError::Pdfium(error.to_string()))
+                } else if let Some(radio) = field.as_radio_button_field_mut() {
+                    if on {
+                        radio
+                            .set_checked()
+                            .map_err(|error| EngineError::Pdfium(error.to_string()))
+                    } else {
+                        Err(EngineError::Unsupported(
+                            "clearing a radio button".to_string(),
+                        ))
+                    }
+                } else {
+                    Err(EngineError::Unsupported("editing this widget".to_string()))
+                }
+            }
+            // pdfium-render exposes combo and list box fields read-only, so a
+            // choice cannot be written back through the safe binding.
+            pdfreader_core::FieldValue::Choice(_) => Err(EngineError::Unsupported(
+                "changing a dropdown or list selection".to_string(),
+            )),
+            pdfreader_core::FieldValue::Empty => Err(EngineError::Unsupported(
+                "clearing this widget".to_string(),
+            )),
+        };
+        outcome.map(|()| true)
+    }
+
+    fn save_to_bytes(&mut self, handle: DocumentHandle, flatten: bool) -> Result<Vec<u8>> {
+        let document = self
+            .documents
+            .get_mut(&handle)
+            .ok_or(EngineError::NotOpen(handle.raw()))?;
+
+        if flatten {
+            let page_count = document.pages().len();
+            let pages = document.pages_mut();
+            for index in 0..page_count {
+                if let Ok(mut page) = pages.get(index) {
+                    page.flatten()
+                        .map_err(|error| EngineError::Pdfium(error.to_string()))?;
+                }
+            }
+        }
+
+        document
+            .save_to_bytes()
+            .map_err(|error| EngineError::Pdfium(error.to_string()))
+    }
+
+    fn annotations(&mut self, handle: DocumentHandle) -> Result<Vec<AnnotationInfo>> {
+        let document = self
+            .documents
+            .get(&handle)
+            .ok_or(EngineError::NotOpen(handle.raw()))?;
+        Ok(annot::list_annotations(document))
+    }
+
+    fn add_annotation(
+        &mut self,
+        handle: DocumentHandle,
+        page: u32,
+        new: NewAnnotation,
+    ) -> Result<()> {
+        let document = self
+            .documents
+            .get_mut(&handle)
+            .ok_or(EngineError::NotOpen(handle.raw()))?;
+        annot::create_annotation(document, page, &new)
+            .map_err(|error| EngineError::Pdfium(error.to_string()))
+    }
+
+    fn delete_annotation(&mut self, handle: DocumentHandle, id: AnnotationId) -> Result<bool> {
+        let document = self
+            .documents
+            .get_mut(&handle)
+            .ok_or(EngineError::NotOpen(handle.raw()))?;
+        annot::remove_annotation(document, id)
+            .map_err(|error| EngineError::Pdfium(error.to_string()))
+    }
+
+    fn set_annotation_contents(
+        &mut self,
+        handle: DocumentHandle,
+        id: AnnotationId,
+        contents: &str,
+    ) -> Result<()> {
+        let document = self
+            .documents
+            .get_mut(&handle)
+            .ok_or(EngineError::NotOpen(handle.raw()))?;
+        annot::change_contents(document, id, contents)
+            .map_err(|error| EngineError::Pdfium(error.to_string()))
     }
 
     fn render_tile(&mut self, handle: DocumentHandle, request: &TileRequest) -> Result<TilePixels> {

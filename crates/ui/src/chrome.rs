@@ -9,8 +9,9 @@ use egui::{
     ViewportCommand,
 };
 use pdfreader_core::{
-    AppState, Command, FieldId, FormFieldInfo, FormInfo, Outline, OutlineNode, SidebarTab, Tab,
-    ThemeId, ViewMode, ZoomMode,
+    AnnotationId, AnnotationInfo, AnnotationKind, AppState, Command, DocumentId, FieldId, FieldValue,
+    FormFieldInfo, FormFieldType, FormInfo, Outline, OutlineNode, SidebarTab, Tab, ThemeId, Tool,
+    ViewMode, ZoomMode,
 };
 
 use crate::theme::Palette;
@@ -80,10 +81,25 @@ pub fn menu_bar(ui: &mut Ui, state: &AppState, palette: &Palette) -> Vec<Command
                     commands.push(Command::ShowOpenDialog);
                     ui.close();
                 }
+                ui.add_enabled_ui(has_doc, |ui| {
+                    if menu_item(ui, "Save", "Ctrl+S").clicked() {
+                        commands.push(Command::SaveDocument);
+                        ui.close();
+                    }
+                    if menu_item(ui, "Save as…", "Ctrl+Shift+S").clicked() {
+                        commands.push(Command::SaveDocumentAs);
+                        ui.close();
+                    }
+                    if menu_item(ui, "Flatten form and annotations", "").clicked() {
+                        commands.push(Command::FlattenDocument);
+                        ui.close();
+                    }
+                });
+                ui.separator();
                 ui.add_enabled_ui(has_tab, |ui| {
                     if menu_item(ui, "Close tab", "Ctrl+W").clicked() {
                         if let Some(id) = state.active_tab {
-                            commands.push(Command::CloseTab(id));
+                            commands.push(Command::RequestCloseTab(id));
                         }
                         ui.close();
                     }
@@ -190,7 +206,7 @@ pub fn menu_bar(ui: &mut Ui, state: &AppState, palette: &Palette) -> Vec<Command
                     commands.push(Command::ToggleSidebar);
                     ui.close();
                 }
-                if menu_item(ui, "Fullscreen", "F11").clicked() {
+                if menu_item(ui, fullscreen_label(state), "F11").clicked() {
                     commands.push(Command::ToggleFullscreen);
                     ui.close();
                 }
@@ -593,10 +609,10 @@ pub fn tab_bar(ui: &mut Ui, state: &AppState, palette: &Palette) -> Vec<Command>
                                             false,
                                             true,
                                         ) {
-                                            commands.push(Command::CloseTab(tab.id));
+                                            commands.push(Command::RequestCloseTab(tab.id));
                                         }
                                         if tab_response.middle_clicked() {
-                                            commands.push(Command::CloseTab(tab.id));
+                                            commands.push(Command::RequestCloseTab(tab.id));
                                         }
                                     });
                                 });
@@ -665,28 +681,367 @@ pub const SIDEBAR_TABS: [(SidebarTab, &str, Icon); 3] = [
 
 /// The sidebar sections to show for the current state.
 ///
-/// The Forms tab only appears for documents that actually have fields. Showing
-/// it unconditionally would put a permanently empty panel in front of every
-/// user, since the overwhelming majority of PDFs have no AcroForm at all.
-pub fn available_sidebar_tabs(state: &AppState) -> Vec<(SidebarTab, &'static str, Icon)> {
+/// The Forms tab is always present: hiding it for documents without fields
+/// made the feature impossible to discover, and an empty panel that says so is
+/// more honest than a tab that appears and vanishes between documents.
+pub fn available_sidebar_tabs(_state: &AppState) -> Vec<(SidebarTab, &'static str, Icon)> {
     let mut tabs = SIDEBAR_TABS.to_vec();
-    if state.active().and_then(Tab::form).is_some() {
-        tabs.push((SidebarTab::Forms, "Forms", Icon::Document));
-    }
+    tabs.push((SidebarTab::Comments, "Comments", Icon::Document));
+    tabs.push((SidebarTab::Forms, "Forms", Icon::Document));
     tabs
+}
+
+/// Height of the annotation tool strip above the canvas.
+pub const ANNOTATION_BAR_HEIGHT: f32 = 30.0;
+
+/// The annotation tool strip: one button per tool, the active one lit.
+///
+/// Rendered as a thin row above the canvas. Text labels rather than icons —
+/// eight hand-drawn glyphs for tools this specialised would cost more than the
+/// words, and the strip only exists while a document is open.
+pub fn annotation_bar(ui: &mut Ui, palette: &Palette, state: &AppState) -> Vec<Command> {
+    let mut commands = Vec::new();
+    egui::Frame::new()
+        .fill(palette.panel_bg)
+        .inner_margin(egui::Margin::symmetric(8, 2))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.set_min_height(ANNOTATION_BAR_HEIGHT - 4.0);
+                ui.label(RichText::new("Annotate").color(palette.text_dim).size(11.0));
+                for tool in Tool::ALL {
+                    let active = state.tool == tool;
+                    let label = RichText::new(tool.label()).size(11.5).color(if active {
+                        palette.accent
+                    } else {
+                        palette.text
+                    });
+                    let button = egui::Button::new(label)
+                        .fill(if active { palette.accent_soft } else { Color32::TRANSPARENT })
+                        .corner_radius(4.0);
+                    if ui.add(button).clicked() {
+                        commands.push(Command::SetTool(tool));
+                    }
+                }
+            });
+        });
+    commands
+}
+
+/// Height of one row in the Comments panel.
+const COMMENT_ROW_HEIGHT: f32 = 34.0;
+
+/// The Comments panel: every annotation, clickable to jump, editable, deletable.
+///
+/// Selecting a FreeText or sticky note also opens its text editor, because
+/// those are the two kinds whose whole purpose is their text.
+pub fn comments_panel(
+    ui: &mut Ui,
+    palette: &Palette,
+    doc: DocumentId,
+    annotations: &[AnnotationInfo],
+    selected: Option<AnnotationId>,
+) -> Vec<Command> {
+    let mut commands = Vec::new();
+
+    if annotations.is_empty() {
+        empty_sidebar(
+            ui,
+            palette,
+            Icon::Document,
+            "No annotations",
+            "Pick a tool above the page, then drag to draw or click to place a note.",
+        );
+        return commands;
+    }
+
+    egui::Frame::new()
+        .inner_margin(egui::Margin::symmetric(10, 6))
+        .show(ui, |ui| {
+            let label = if annotations.len() == 1 {
+                "1 annotation".to_string()
+            } else {
+                format!("{} annotations", annotations.len())
+            };
+            ui.label(RichText::new(label).color(palette.text_dim).size(11.0));
+        });
+    ui.separator();
+
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            egui::Frame::new()
+                .inner_margin(egui::Margin::symmetric(6, 4))
+                .show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    for annotation in annotations {
+                        let is_selected = selected == Some(annotation.id);
+                        let response =
+                            show_comment_row(ui, palette, annotation, is_selected);
+                        if response.clicked() && ui.input(|i| i.modifiers.shift) {
+                            // Shift-click deletes: one interaction for the
+                            // most common follow-up, without a context menu.
+                            // Selection is skipped — deleting then selecting
+                            // the same id just clears the selection anyway.
+                            commands.push(Command::DeleteAnnotation(annotation.id));
+                        } else if response.clicked() {
+                            commands.push(Command::SelectAnnotation(Some(annotation.id)));
+                        }
+                        if is_selected {
+                            draw_comment_editor(ui, palette, doc, annotation, &mut commands);
+                        }
+                    }
+                });
+        });
+
+    commands
+}
+
+/// Draw one annotation row: kind and page, with a contents preview.
+fn show_comment_row(
+    ui: &mut Ui,
+    palette: &Palette,
+    annotation: &AnnotationInfo,
+    is_selected: bool,
+) -> egui::Response {
+    let width = ui.available_width();
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(width, COMMENT_ROW_HEIGHT), Sense::click());
+
+    if !ui.is_rect_visible(rect) {
+        return response;
+    }
+
+    let fill = if is_selected {
+        palette.accent_soft
+    } else if response.hovered() {
+        palette.surface_hover
+    } else {
+        Color32::TRANSPARENT
+    };
+    ui.painter().rect_filled(rect.expand(1.0), 4.0, fill);
+
+    let painter = ui.painter().with_clip_rect(rect);
+    let left = rect.min.x + 8.0;
+    painter.text(
+        egui::pos2(left, rect.min.y + 4.0),
+        Align2::LEFT_TOP,
+        format!("{} · p.{}", annotation.kind.label(), annotation.id.page + 1),
+        FontId::proportional(11.5),
+        palette.text,
+    );
+    let preview = if annotation.display_contents().is_empty() {
+        "—".to_string()
+    } else {
+        truncate(annotation.display_contents(), 30)
+    };
+    painter.text(
+        egui::pos2(left, rect.min.y + 20.0),
+        Align2::LEFT_TOP,
+        preview,
+        FontId::proportional(10.5),
+        palette.text_dim,
+    );
+    response
+}
+
+/// The contents editor for the selected annotation, plus its delete button.
+///
+/// Only FreeText and sticky notes get the editor — the markup kinds have no
+/// text to edit, and their geometry is the drag that created them.
+fn draw_comment_editor(
+    ui: &mut Ui,
+    palette: &Palette,
+    doc: DocumentId,
+    annotation: &AnnotationInfo,
+    commands: &mut Vec<Command>,
+) {
+    egui::Frame::new()
+        .inner_margin(egui::Margin::symmetric(8, 4))
+        .show(ui, |ui| {
+            let editable = matches!(
+                annotation.kind,
+                AnnotationKind::FreeText | AnnotationKind::StickyNote
+            );
+            if editable {
+                let key = Id::new(("comment-draft", doc.raw(), annotation.id.page, annotation.id.annot_index));
+                let current = annotation.display_contents().to_string();
+                let mut draft = ui.memory_mut(|mem| {
+                    mem.data
+                        .get_temp_mut_or_insert_with::<String>(key, || current.clone())
+                        .clone()
+                });
+
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut draft).desired_width(ui.available_width()),
+                );
+                let changed = draft != current;
+                let submit =
+                    response.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if changed && (response.lost_focus() || submit) {
+                    commands.push(Command::SetAnnotationContents {
+                        id: annotation.id,
+                        contents: draft.clone(),
+                    });
+                }
+                if changed {
+                    ui.memory_mut(|mem| mem.data.insert_temp(key, draft));
+                }
+                ui.add_space(4.0);
+            }
+
+            ui.horizontal(|ui| {
+                if ui
+                    .add(egui::Button::new(
+                        RichText::new("Delete").size(11.0).color(palette.danger),
+                    ))
+                    .clicked()
+                {
+                    commands.push(Command::DeleteAnnotation(annotation.id));
+                }
+            });
+        });
 }
 
 /// Height of one row in the Forms panel: field name over type and value.
 const FORM_ROW_HEIGHT: f32 = 36.0;
 
-/// The Forms panel: every field in the document, clickable to jump to it.
+/// egui memory key for one field's in-progress text draft.
+fn draft_key(doc: DocumentId, id: FieldId) -> Id {
+    Id::new(("form-draft", doc.raw(), id.page, id.annot_index))
+}
+
+/// Draw the editor for the selected field, if its type has one.
+fn draw_field_editor(
+    ui: &mut Ui,
+    palette: &Palette,
+    doc: DocumentId,
+    field: &FormFieldInfo,
+    commands: &mut Vec<Command>,
+) {
+    if !field.is_editable() {
+        return;
+    }
+
+    egui::Frame::new()
+        .inner_margin(egui::Margin::symmetric(8, 4))
+        .show(ui, |ui| {
+            match field.kind {
+                FormFieldType::Text => {
+                    draw_text_editor(ui, doc, field, commands);
+                }
+                // A checkbox has no separate editor surface: a real checkbox
+                // right under the name is the whole interaction.
+                FormFieldType::CheckBox => {
+                    let mut checked = field.value == FieldValue::Checked(true);
+                    if ui.checkbox(&mut checked, "").changed() {
+                        commands.push(Command::SetFormFieldValue {
+                            id: field.id,
+                            value: FieldValue::Checked(checked),
+                        });
+                    }
+                }
+                FormFieldType::ComboBox | FormFieldType::ListBox => {
+                    draw_choice_editor(ui, doc, field, commands);
+                }
+                // Radio buttons are chosen by clicking their rows; push
+                // buttons and signature fields have nothing to edit here.
+                FormFieldType::RadioButton
+                | FormFieldType::PushButton
+                | FormFieldType::Signature
+                | FormFieldType::Unknown => {}
+            }
+        });
+    let _ = palette;
+}
+
+/// A single-line text editor that commits on Enter or blur.
+///
+/// The draft lives in egui memory so it survives the panel being scrolled or
+/// the sidebar being toggled mid-edit, without committing half-typed text.
+fn draw_text_editor(
+    ui: &mut Ui,
+    doc: DocumentId,
+    field: &FormFieldInfo,
+    commands: &mut Vec<Command>,
+) {
+    let key = draft_key(doc, field.id);
+    let current = field.value.as_text();
+
+    let mut draft = ui.memory_mut(|mem| {
+        mem.data
+            .get_temp_mut_or_insert_with::<String>(key, || current.clone())
+            .clone()
+    });
+
+    let response = ui.add(
+        egui::TextEdit::singleline(&mut draft).desired_width(ui.available_width()),
+    );
+    let changed = draft != current;
+    let submit = response.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+
+    if changed && (response.lost_focus() || submit) {
+        commands.push(Command::SetFormFieldValue {
+            id: field.id,
+            value: FieldValue::Text(draft.clone()),
+        });
+    }
+    if changed {
+        // Keep the stored draft in step whether or not the edit committed, so
+        // the next frame does not see already-typed text as new.
+        ui.memory_mut(|mem| mem.data.insert_temp(key, draft));
+    }
+
+    // Enter commits without blurring in a single-line field, so keep the
+    // caret where the user expects it for the next field.
+    if submit {
+        response.request_focus();
+    }
+}
+
+/// A dropdown for combo and list box fields.
+fn draw_choice_editor(
+    ui: &mut Ui,
+    doc: DocumentId,
+    field: &FormFieldInfo,
+    commands: &mut Vec<Command>,
+) {
+    let current = field.value.as_text();
+    let id = Id::new(("form-choice", doc.raw(), field.id.page, field.id.annot_index));
+    let selection = if current.is_empty() { "—" } else { current.as_str() };
+
+    egui::ComboBox::new(id, "")
+        .selected_text(RichText::new(selection).size(11.5))
+        .width(ui.available_width())
+        .show_ui(ui, |ui| {
+            for option in &field.options {
+                let label = if option.label.is_empty() {
+                    "—"
+                } else {
+                    option.label.as_str()
+                };
+                if ui.selectable_label(option.selected, label).clicked() {
+                    commands.push(Command::SetFormFieldValue {
+                        id: field.id,
+                        value: FieldValue::Choice(Some(option.label.clone())),
+                    });
+                }
+            }
+        });
+}
+
+/// The Forms panel: every field in the document, editable in place.
 ///
 /// This is the list half of form filling. The other half is the overlay drawn
 /// on the page itself; both read and write `ViewState::selected_field` so that
 /// clicking a row here highlights the widget out there, and vice versa.
+///
+/// Text fields commit on Enter or when the input loses focus, so typing does
+/// not trigger a PDFium write per keystroke; checkbox, radio and dropdown
+/// changes are discrete and dispatch immediately.
 pub fn forms_panel(
     ui: &mut Ui,
     palette: &Palette,
+    doc: DocumentId,
     form: &FormInfo,
     selected: Option<FieldId>,
 ) -> Vec<Command> {
@@ -724,9 +1079,27 @@ pub fn forms_panel(
                 .show(ui, |ui| {
                     ui.spacing_mut().item_spacing.y = 2.0;
                     for field in &form.fields {
-                        let response = show_form_row(ui, palette, field, selected == Some(field.id));
+                        let is_selected = selected == Some(field.id);
+                        let response = show_form_row(ui, palette, field, is_selected);
                         if response.clicked() {
                             commands.push(Command::SelectFormField(Some(field.id)));
+                            // Clicking a radio row is how that option gets
+                            // chosen, matching how radio widgets behave on the
+                            // page. Unchecking is intentionally not offered:
+                            // the engine has no way to write it.
+                            if field.kind == FormFieldType::RadioButton
+                                && field.is_editable()
+                                && field.value != FieldValue::Checked(true)
+                            {
+                                commands.push(Command::SetFormFieldValue {
+                                    id: field.id,
+                                    value: FieldValue::Checked(true),
+                                });
+                            }
+                        }
+
+                        if is_selected {
+                            draw_field_editor(ui, palette, doc, field, &mut commands);
                         }
                     }
                 });
@@ -1110,6 +1483,15 @@ fn show_outline_node(
                 show_outline_node(ui, palette, child, next_id, commands, depth + 1);
             }
         });
+    }
+}
+
+/// The View menu's fullscreen entry reflects the current state, so the user is
+/// never left guessing whether F11 will enter or leave.
+const fn fullscreen_label(state: &AppState) -> &'static str {
+    match state.fullscreen {
+        true => "Exit fullscreen",
+        false => "Fullscreen",
     }
 }
 

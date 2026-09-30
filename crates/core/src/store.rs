@@ -32,6 +32,17 @@ pub struct Tab {
     pub loading: bool,
     /// Failure reason, when the load failed.
     pub error: Option<String>,
+    /// Whether the document has changes that have not been written to disk.
+    ///
+    /// Every mutating command sets this; saving clears it. Session state is
+    /// not covered — persisting the viewport is not an edit.
+    pub dirty: bool,
+    /// The document's annotations, once the engine has listed them.
+    ///
+    /// `None` means "not read yet"; an empty vec means "read, and there are
+    /// none". The Comments panel distinguishes the two the same way the Forms
+    /// panel does.
+    pub annotations: Option<Vec<crate::annotation::AnnotationInfo>>,
 }
 
 impl Tab {
@@ -67,6 +78,9 @@ pub struct AppState {
     pub sidebar_tab: SidebarTab,
     /// Whether the window is fullscreen.
     pub fullscreen: bool,
+    /// The active annotation tool. Not persisted: a reader opens in select
+    /// mode, and a tool chosen last session means nothing this session.
+    pub tool: crate::annotation::Tool,
 }
 
 impl AppState {
@@ -156,6 +170,274 @@ impl Store {
                 self.dispatch(Command::GoToPage(page))
             }
 
+            Command::SetFormFieldValue { id, value } => {
+                let Some(tab) = self.state.active_mut() else {
+                    return Vec::new();
+                };
+                let Some(doc) = tab.document.as_ref().map(|d| d.id) else {
+                    return Vec::new();
+                };
+                // Radio buttons can be selected but not cleared (the engine has
+                // no uncheck), and push buttons carry no value: filter both out
+                // here so the UI never emits a write that must fail.
+                let writable = tab
+                    .form
+                    .as_ref()
+                    .and_then(|form| form.field(id))
+                    .is_some_and(|field| match value {
+                        crate::form::FieldValue::Checked(false) => {
+                            field.kind != crate::form::FormFieldType::RadioButton
+                        }
+                        crate::form::FieldValue::Checked(true)
+                        | crate::form::FieldValue::Text(_)
+                        | crate::form::FieldValue::Choice(_)
+                        | crate::form::FieldValue::Empty => field.is_editable(),
+                    });
+                if !writable {
+                    return Vec::new();
+                }
+
+                let changed = tab
+                    .form
+                    .as_mut()
+                    .is_some_and(|form| form.set_value(id, value.clone()));
+                if !changed {
+                    return Vec::new();
+                }
+                tab.dirty = true;
+                vec![
+                    Effect::SetField {
+                        doc,
+                        id,
+                        value,
+                    },
+                    Effect::InvalidateTiles,
+                ]
+            }
+
+            Command::SetTool(tool) => {
+                self.state.tool = tool;
+                Vec::new()
+            }
+
+            Command::AnnotationsLoaded { doc, annotations } => {
+                if let Some(tab) = self
+                    .state
+                    .tabs
+                    .iter_mut()
+                    .find(|t| t.document.as_ref().is_some_and(|d| d.id == doc))
+                {
+                    let still_there = tab
+                        .view
+                        .selected_annotation
+                        .is_none_or(|sel| annotations.iter().any(|a| a.id == sel));
+                    if !still_there {
+                        tab.view.selected_annotation = None;
+                    }
+                    tab.annotations = Some(annotations);
+                }
+                Vec::new()
+            }
+
+            Command::AnnotationsLoadFailed { doc } => {
+                // Only the never-read state is a stuck panel; a failed edit on
+                // an existing list must not wipe what the user is looking at.
+                if let Some(tab) = self
+                    .state
+                    .tabs
+                    .iter_mut()
+                    .find(|t| t.document.as_ref().is_some_and(|d| d.id == doc))
+                {
+                    if tab.annotations.is_none() {
+                        tab.annotations = Some(Vec::new());
+                    }
+                }
+                Vec::new()
+            }
+
+            Command::SelectAnnotation(id) => {
+                let Some(tab) = self.state.active_mut() else {
+                    return Vec::new();
+                };
+                let Some(annotation_id) = id else {
+                    tab.view.selected_annotation = None;
+                    return Vec::new();
+                };
+                // Ids are positional and shift after a delete: a selection of
+                // an id that no longer resolves is stale, not an error.
+                let resolves = tab
+                    .annotations
+                    .as_ref()
+                    .is_some_and(|list| list.iter().any(|a| a.id == annotation_id));
+                if !resolves {
+                    return Vec::new();
+                }
+                tab.view.selected_annotation = id;
+                let Some(page) = tab
+                    .annotations
+                    .as_ref()
+                    .and_then(|list| list.iter().find(|a| a.id == annotation_id))
+                    .map(|a| a.id.page)
+                else {
+                    return Vec::new();
+                };
+                self.dispatch(Command::GoToPage(page))
+            }
+
+            // Creation is not optimistic about the list: the engine answers
+            // with a fresh one, and that answer is where the new id comes from.
+            Command::AddAnnotation { page, new } => {
+                let Some(tab) = self.state.active() else {
+                    return Vec::new();
+                };
+                let Some(doc) = tab.document.as_ref().map(|d| d.id) else {
+                    return Vec::new();
+                };
+                if let Some(tab) = self.state.active_mut() {
+                    tab.dirty = true;
+                    tab.view.selected_annotation = None;
+                }
+                // Without invalidation the annotation exists only in PDFium's
+                // memory: cached tiles keep the old pixels until a scroll.
+                vec![
+                    Effect::AddAnnotation { doc, page, new },
+                    Effect::InvalidateTiles,
+                ]
+            }
+
+            Command::DeleteAnnotation(id) => {
+                let Some(tab) = self.state.active() else {
+                    return Vec::new();
+                };
+                let Some(doc) = tab.document.as_ref().map(|d| d.id) else {
+                    return Vec::new();
+                };
+                if let Some(tab) = self.state.active_mut() {
+                    tab.dirty = true;
+                    tab.view.selected_annotation = None;
+                    if let Some(list) = tab.annotations.as_mut() {
+                        list.retain(|a| a.id != id);
+                    }
+                }
+                vec![
+                    Effect::DeleteAnnotation { doc, id },
+                    Effect::InvalidateTiles,
+                ]
+            }
+
+            Command::SetAnnotationContents { id, contents } => {
+                let Some(tab) = self.state.active_mut() else {
+                    return Vec::new();
+                };
+                let Some(doc) = tab.document.as_ref().map(|d| d.id) else {
+                    return Vec::new();
+                };
+                // A stale id after a delete must not write text into whichever
+                // annotation shifted into its slot.
+                let resolved = tab
+                    .annotations
+                    .as_mut()
+                    .and_then(|list| list.iter_mut().find(|a| a.id == id));
+                let Some(a) = resolved else {
+                    return Vec::new();
+                };
+                a.contents = (!contents.is_empty()).then_some(contents.clone());
+                tab.dirty = true;
+                vec![
+                    Effect::SetAnnotationContents {
+                        doc,
+                        id,
+                        contents,
+                    },
+                    Effect::InvalidateTiles,
+                ]
+            }
+
+            Command::SaveDocument => {
+                let Some(tab) = self.state.active() else {
+                    return Vec::new();
+                };
+                let Some(doc) = tab.document.as_ref().map(|d| d.id) else {
+                    return Vec::new();
+                };
+                vec![Effect::SaveDocument {
+                    doc,
+                    path: tab.path.clone(),
+                    flatten: false,
+                }]
+            }
+
+            Command::SaveDocumentAs => Vec::new(),
+
+            // Only the tab holding that document clears its flag, so a save
+            // racing a tab switch cannot mark the wrong tab clean.
+            Command::DocumentSaved { doc } => {
+                if let Some(tab) = self
+                    .state
+                    .tabs
+                    .iter_mut()
+                    .find(|t| t.document.as_ref().is_some_and(|d| d.id == doc))
+                {
+                    tab.dirty = false;
+                }
+                Vec::new()
+            }
+
+            Command::SaveDocumentTo(path) => {
+                let Some(tab) = self.state.active() else {
+                    return Vec::new();
+                };
+                let Some(doc) = tab.document.as_ref().map(|d| d.id) else {
+                    return Vec::new();
+                };
+                vec![Effect::SaveDocument {
+                    doc,
+                    path,
+                    flatten: false,
+                }]
+            }
+
+            Command::FlattenDocument => {
+                let Some(tab) = self.state.active() else {
+                    return Vec::new();
+                };
+                let Some(doc) = tab.document.as_ref().map(|d| d.id) else {
+                    return Vec::new();
+                };
+                let path = tab.path.clone();
+                if let Some(tab) = self.state.active_mut() {
+                    tab.dirty = true;
+                }
+                vec![Effect::SaveDocument {
+                    doc,
+                    path,
+                    flatten: true,
+                }]
+            }
+
+            // A dirty tab asks before closing; a clean one closes directly, so
+            // the common case does not grow a prompt.
+            Command::RequestCloseTab(id) => match self.state.tab(id).is_some_and(|t| t.dirty) {
+                true => vec![Effect::ConfirmClose { tab: id }],
+                false => self.dispatch(Command::ConfirmCloseTab(id)),
+            },
+
+            Command::ConfirmCloseTab(id) => {
+                let doc_id = self
+                    .state
+                    .tab(id)
+                    .and_then(|t| t.document.as_ref())
+                    .map(|d| d.id);
+                self.state.tabs.retain(|t| t.id != id);
+                if self.state.active_tab == Some(id) {
+                    self.state.active_tab = self.state.tabs.last().map(|t| t.id);
+                }
+                match doc_id {
+                    Some(doc) => vec![Effect::CloseDocument { doc }, Effect::PersistSession],
+                    None => vec![Effect::PersistSession],
+                }
+            }
+
             Command::OpenPath(path) => {
                 self.next_tab_id += 1;
                 let id = TabId::from_raw(self.next_tab_id);
@@ -167,6 +449,8 @@ impl Store {
                     view: ViewState::default(),
                     loading: true,
                     error: None,
+                    dirty: false,
+                    annotations: None,
                 });
                 self.state.active_tab = Some(id);
                 vec![Effect::OpenDocument { tab: id, path }]
@@ -196,22 +480,6 @@ impl Store {
                     t.loading = false;
                 }
                 Vec::new()
-            }
-
-            Command::CloseTab(id) => {
-                let doc_id = self
-                    .state
-                    .tab(id)
-                    .and_then(|t| t.document.as_ref())
-                    .map(|d| d.id);
-                self.state.tabs.retain(|t| t.id != id);
-                if self.state.active_tab == Some(id) {
-                    self.state.active_tab = self.state.tabs.last().map(|t| t.id);
-                }
-                match doc_id {
-                    Some(doc) => vec![Effect::CloseDocument { doc }, Effect::PersistSession],
-                    None => vec![Effect::PersistSession],
-                }
             }
 
             Command::ActivateTab(id) => {
@@ -462,7 +730,7 @@ mod tests {
             panic!()
         };
         assert_eq!(s.state().active_tab, Some(t2));
-        let effects = s.dispatch(Command::CloseTab(t2));
+        let effects = s.dispatch(Command::ConfirmCloseTab(t2));
         assert_eq!(s.state().active_tab, Some(t1));
         assert!(effects.contains(&Effect::PersistSession));
         assert!(
@@ -475,7 +743,7 @@ mod tests {
     #[test]
     fn closing_a_loaded_tab_releases_its_document() {
         let (mut s, tab) = opened_store(2);
-        let effects = s.dispatch(Command::CloseTab(tab));
+        let effects = s.dispatch(Command::ConfirmCloseTab(tab));
         assert!(
             effects
                 .iter()
@@ -549,7 +817,7 @@ mod tests {
     fn a_late_form_response_for_a_closed_tab_is_ignored() {
         let (mut s, tab) = opened_store(1);
         let doc = s.state().tab(tab).unwrap().document.as_ref().unwrap().id;
-        s.dispatch(Command::CloseTab(tab));
+        s.dispatch(Command::ConfirmCloseTab(tab));
 
         let form = FormInfo {
             kind: FormKind::Acrobat,
@@ -619,6 +887,229 @@ mod tests {
             required: false,
             multiline: false,
         }
+    }
+
+    #[test]
+    fn setting_a_field_value_updates_the_form_and_marks_the_tab_dirty() {
+        let (mut s, tab) = opened_store(2);
+        let doc = s.state().tab(tab).unwrap().document.as_ref().unwrap().id;
+        let mut field = sample_field(0);
+        field.id = FieldId::new(0, 0);
+        s.dispatch(Command::FormFieldsLoaded {
+            doc,
+            form: FormInfo {
+                kind: FormKind::Acrobat,
+                fields: vec![field],
+            },
+        });
+
+        let effects = s.dispatch(Command::SetFormFieldValue {
+            id: FieldId::new(0, 0),
+            value: FieldValue::Text("typed".into()),
+        });
+        let state = s.state();
+        assert_eq!(
+            state.tab(tab).unwrap().form().unwrap().field(FieldId::new(0, 0)).unwrap().value,
+            FieldValue::Text("typed".into())
+        );
+        assert!(state.tab(tab).unwrap().dirty);
+        assert!(effects.iter().any(|e| matches!(e, Effect::SetField { .. })));
+        assert!(effects.iter().any(|e| matches!(e, Effect::InvalidateTiles)));
+
+        // The same value again changes nothing: no engine write, no dirty flag
+        // churn while the user merely re-renders the panel.
+        let effects = s.dispatch(Command::SetFormFieldValue {
+            id: FieldId::new(0, 0),
+            value: FieldValue::Text("typed".into()),
+        });
+        assert!(effects.is_empty());
+    }
+
+    #[test]
+    fn a_dirty_tab_asks_before_closing_and_a_clean_one_does_not() {
+        let (mut s, tab) = opened_store(1);
+        s.dispatch(Command::DocumentOpened {
+            tab,
+            document: doc_with_pages(1),
+        });
+
+        // Clean tab: closes immediately, no prompt.
+        let effects = s.dispatch(Command::RequestCloseTab(tab));
+        assert!(
+            !effects.iter().any(|e| matches!(e, Effect::ConfirmClose { .. })),
+            "a clean tab must not prompt"
+        );
+        assert!(s.state().tabs.is_empty());
+
+        // Dirty tab: prompt instead of closing; only the confirm closes it.
+        let (mut s, tab) = opened_store(1);
+        s.dispatch(Command::DocumentOpened {
+            tab,
+            document: doc_with_pages(1),
+        });
+        if let Some(t) = s.state.tabs.iter_mut().find(|t| t.id == tab) {
+            t.dirty = true;
+        }
+        let effects = s.dispatch(Command::RequestCloseTab(tab));
+        assert!(effects.iter().any(|e| matches!(e, Effect::ConfirmClose { .. })));
+        assert_eq!(s.state().tabs.len(), 1, "the tab must still be open");
+
+        s.dispatch(Command::ConfirmCloseTab(tab));
+        assert!(s.state().tabs.is_empty());
+    }
+
+    #[test]
+    fn document_saved_clears_only_the_tab_holding_that_document() {
+        let (mut s, tab) = opened_store(1);
+        let doc = s.state().tab(tab).unwrap().document.as_ref().unwrap().id;
+        s.state.tabs[0].dirty = true;
+
+        s.dispatch(Command::DocumentSaved { doc });
+        assert!(!s.state.tab(tab).unwrap().dirty);
+
+        // A save for some other document must not clean this tab.
+        s.state.tabs[0].dirty = true;
+        s.dispatch(Command::DocumentSaved {
+            doc: DocumentId::from_raw(999),
+        });
+        assert!(s.state.tab(tab).unwrap().dirty);
+    }
+
+    /// The annotation tool appeared dead because mutations never invalidated
+    /// the tile cache: PDFium updated, the page pixels did not. Locked in.
+    #[test]
+    fn annotation_mutations_invalidate_tiles() {
+        let (mut s, tab) = opened_store(1);
+        let doc = s.state().tab(tab).unwrap().document.as_ref().unwrap().id;
+        s.state.tabs[0].annotations = Some(Vec::new());
+
+        let effects = s.dispatch(Command::AddAnnotation {
+            page: 0,
+            new: crate::annotation::NewAnnotation::Highlight(Rect::from_xywh(
+                0.0, 0.0, 10.0, 10.0,
+            )),
+        });
+        assert!(
+            effects.iter().any(|e| matches!(e, Effect::InvalidateTiles)),
+            "AddAnnotation must invalidate tiles"
+        );
+
+        s.state.tabs[0].annotations = Some(vec![crate::annotation::AnnotationInfo {
+            id: crate::annotation::AnnotationId::new(0, 0),
+            kind: crate::annotation::AnnotationKind::Highlight,
+            rect: Rect::from_xywh(0.0, 0.0, 10.0, 10.0),
+            contents: None,
+        }]);
+        let effects = s.dispatch(Command::SetAnnotationContents {
+            id: crate::annotation::AnnotationId::new(0, 0),
+            contents: "hello".into(),
+        });
+        assert!(
+            effects.iter().any(|e| matches!(e, Effect::InvalidateTiles)),
+            "SetAnnotationContents must invalidate tiles"
+        );
+
+        let effects = s.dispatch(Command::DeleteAnnotation(crate::annotation::AnnotationId::new(
+            0, 0,
+        )));
+        assert!(
+            effects.iter().any(|e| matches!(e, Effect::InvalidateTiles)),
+            "DeleteAnnotation must invalidate tiles"
+        );
+    }
+
+    /// A stale id must never select or write into whichever annotation shifted
+    /// into its slot after a delete.
+    #[test]
+    fn stale_annotation_ids_are_ignored() {
+        let (mut s, tab) = opened_store(1);
+        let doc = s.state().tab(tab).unwrap().document.as_ref().unwrap().id;
+        let annotations = vec![
+            crate::annotation::AnnotationInfo {
+                id: crate::annotation::AnnotationId::new(0, 0),
+                kind: crate::annotation::AnnotationKind::Highlight,
+                rect: Rect::from_xywh(0.0, 0.0, 10.0, 10.0),
+                contents: None,
+            },
+            crate::annotation::AnnotationInfo {
+                id: crate::annotation::AnnotationId::new(0, 1),
+                kind: crate::annotation::AnnotationKind::StickyNote,
+                rect: Rect::from_xywh(20.0, 20.0, 30.0, 30.0),
+                contents: Some("note".into()),
+            },
+        ];
+        s.state.tabs[0].annotations = Some(annotations);
+
+        // Selecting an id that does not resolve is a no-op, not a selection.
+        s.dispatch(Command::SelectAnnotation(Some(crate::annotation::AnnotationId::new(
+            0, 99,
+        ))));
+        assert_eq!(s.state.active().unwrap().view.selected_annotation, None);
+
+        // A valid selection sticks.
+        s.dispatch(Command::SelectAnnotation(Some(crate::annotation::AnnotationId::new(0, 1))));
+        assert_eq!(
+            s.state.active().unwrap().view.selected_annotation,
+            Some(crate::annotation::AnnotationId::new(0, 1))
+        );
+
+        // Editing a stale id writes nothing and emits nothing.
+        let effects = s.dispatch(Command::SetAnnotationContents {
+            id: crate::annotation::AnnotationId::new(0, 99),
+            contents: "wrong target".into(),
+        });
+        assert!(effects.is_empty());
+        assert_eq!(
+            s.state.active().unwrap().annotations.as_ref().unwrap()[1]
+                .contents
+                .as_deref(),
+            Some("note"),
+            "the live annotation must be untouched"
+        );
+
+        // A fresh list that no longer contains the selection clears it, so a
+        // delete can never leave the highlight on the wrong row.
+        let shifted = vec![crate::annotation::AnnotationInfo {
+            id: crate::annotation::AnnotationId::new(0, 0),
+            kind: crate::annotation::AnnotationKind::StickyNote,
+            rect: Rect::from_xywh(20.0, 20.0, 30.0, 30.0),
+            contents: Some("note".into()),
+        }];
+        s.dispatch(Command::AnnotationsLoaded {
+            doc,
+            annotations: shifted,
+        });
+        assert_eq!(s.state.active().unwrap().view.selected_annotation, None);
+    }
+
+    /// An annotation failure before the first read must not leave the Comments
+    /// panel stuck on "Reading annotations…" forever.
+    #[test]
+    fn a_failed_annotation_read_unsticks_the_panel() {
+        let (mut s, tab) = opened_store(1);
+        let doc = s.state().tab(tab).unwrap().document.as_ref().unwrap().id;
+        assert!(s.state.tab(tab).unwrap().annotations.is_none());
+
+        s.dispatch(Command::AnnotationsLoadFailed { doc });
+        assert_eq!(
+            s.state.tab(tab).unwrap().annotations,
+            Some(Vec::new()),
+            "never-read must become read-but-empty"
+        );
+
+        // A failure on an existing list must NOT wipe it.
+        s.state.tabs[0].annotations = Some(vec![crate::annotation::AnnotationInfo {
+            id: crate::annotation::AnnotationId::new(0, 0),
+            kind: crate::annotation::AnnotationKind::Highlight,
+            rect: Rect::from_xywh(0.0, 0.0, 10.0, 10.0),
+            contents: None,
+        }]);
+        s.dispatch(Command::AnnotationsLoadFailed { doc });
+        assert_eq!(
+            s.state.tab(tab).unwrap().annotations.as_ref().unwrap().len(),
+            1,
+            "an existing list survives a failed operation"
+        );
     }
 
     #[test]

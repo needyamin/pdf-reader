@@ -49,4 +49,12 @@ pub enum EngineError {
     /// PDFium itself rejected the operation.
     #[error("pdfium error: {0}")]
     Pdfium(String),
+
+    /// The operation exists in the PDF format but the engine cannot perform it.
+    ///
+    /// Used where PDFium's safe binding exposes no way to write a value —
+    /// currently combo and list box selection, which only have immutable
+    /// accessors in `pdfium-render`.
+    #[error("{0} is not supported by the PDF engine")]
+    Unsupported(String),
 }
