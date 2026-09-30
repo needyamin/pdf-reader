@@ -53,6 +53,7 @@ pub enum Icon {
     Close,
     Pan,
     More,
+    Undo,
 }
 
 /// Top-level application menu.
@@ -726,17 +727,26 @@ pub fn annotation_bar(ui: &mut Ui, palette: &Palette, state: &AppState) -> Vec<C
                 let undoable = state
                     .active()
                     .is_some_and(|tab| !tab.undo_stack.is_empty());
-                if ui
-                    .add_enabled(
-                        undoable,
-                        egui::Button::new(RichText::new("Undo").size(11.5).color(palette.text))
-                            .fill(Color32::TRANSPARENT)
-                            .corner_radius(4.0),
-                    )
-                    .clicked()
-                {
+                let undo_response = ui.add_enabled(
+                    undoable,
+                    egui::Button::new("")
+                        .min_size(Vec2::new(28.0, 22.0))
+                        .fill(if undoable {
+                            palette.accent_soft
+                        } else {
+                            Color32::TRANSPARENT
+                        })
+                        .corner_radius(4.0),
+                );
+                if undo_response.clicked() && undoable {
                     commands.push(Command::Undo);
                 }
+                draw_icon(
+                    ui.painter(),
+                    undo_response.rect.center(),
+                    Icon::Undo,
+                    if undoable { palette.text } else { palette.text_dim },
+                );
             });
         });
     commands
@@ -1679,6 +1689,27 @@ fn draw_icon(painter: &egui::Painter, center: Pos2, icon: Icon, color: Color32) 
         // The universal "move" glyph: four arrows pointing out from a centre
         // point. Reads as grab-and-drag at 16 px, unlike a literal hand which
         // turns to mush at icon size.
+        Icon::Undo => {
+            // Open circle (the sweep) with an arrowhead closing it, the
+            // conventional "step back" glyph.
+            let radius = 5.5;
+            let points: Vec<Pos2> = (0..=10)
+                .map(|i| {
+                    let angle = -0.6 + (i as f32 / 10.0) * 4.4; // radians, CCW
+                    c + Vec2::new(angle.cos() * radius, -angle.sin() * radius)
+                })
+                .collect();
+            painter.line(points, stroke);
+            // Arrowhead at the sweep's start (top-left), pointing left-down.
+            painter.line(
+                vec![
+                    c + Vec2::new(-6.5, -6.5),
+                    c + Vec2::new(-6.0, -1.5),
+                    c + Vec2::new(-1.5, -2.0),
+                ],
+                stroke,
+            );
+        }
         Icon::Pan => {
             let arm = 6.0;
             let head = 2.2;

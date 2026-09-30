@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use pdfium_render::prelude::*;
+use pdfium_render::prelude::PdfFormFieldCommon as _;
 use pdfreader_core::{
     AnnotationId, AnnotationInfo, FormInfo, NewAnnotation, Outline, OutlineNode, PageGeometry,
     Rotation,
@@ -132,13 +133,14 @@ pub trait PdfEngine {
     /// List every non-widget annotation in the document, in page order.
     fn annotations(&mut self, handle: DocumentHandle) -> Result<Vec<AnnotationInfo>>;
 
-    /// Create an annotation described by `new` on `page`.
+    /// Create an annotation described by `new` on `page`, returning the new
+    /// annotation's id.
     fn add_annotation(
         &mut self,
         handle: DocumentHandle,
         page: u32,
         new: NewAnnotation,
-    ) -> Result<()>;
+    ) -> Result<AnnotationId>;
 
     /// Remove one annotation.
     ///
@@ -337,36 +339,44 @@ impl PdfEngine for PdfiumEngine {
     ) -> Result<bool> {
         let Self { documents, .. } = self;
         let document = documents
-            .get(&handle)
+            .get_mut(&handle)
             .ok_or(EngineError::NotOpen(handle.raw()))?;
 
-        let mut page = page_of(document, id.page)?;
-        // A stale or bogus widget id means "nothing to write", not a failure:
-        // the form was re-read or the document changed between the request and
-        // the write, and neither is exceptional.
-        let Ok(mut annotation) = page
-            .annotations_mut()
-            .get(id.annot_index as PdfPageAnnotationIndex)
-        else {
-            return Ok(false);
+        let text_value = match &value {
+            pdfreader_core::FieldValue::Text(text) => Some(text.clone()),
+            _ => None,
         };
 
-        let Some(field) = annotation.as_form_field_mut() else {
-            return Ok(false);
-        };
-        if field.is_read_only() {
-            return Ok(false);
-        }
+        // Phase 1: write through the target widget.
+        let (outcome, shared_name) = {
+            let mut page = page_of(document, id.page)?;
+            // A stale or bogus widget id means "nothing to write", not a
+            // failure: the form was re-read or the document changed between
+            // the request and the write, and neither is exceptional.
+            let Ok(mut annotation) = page
+                .annotations_mut()
+                .get(id.annot_index as PdfPageAnnotationIndex)
+            else {
+                return Ok(false);
+            };
 
-        let outcome = match value {
-            pdfreader_core::FieldValue::Text(text) => field
-                .as_text_field_mut()
-                .ok_or_else(|| EngineError::Unsupported("editing this widget".to_string()))
-                .and_then(|text_field| {
-                    text_field
-                        .set_value(&text)
-                        .map_err(|error| EngineError::Pdfium(error.to_string()))
-                }),
+            let Some(field) = annotation.as_form_field_mut() else {
+                return Ok(false);
+            };
+            if field.is_read_only() {
+                return Ok(false);
+            }
+
+            let shared_name: Option<String> = field.name().map(|n| n.to_string());
+            let outcome = match value {
+                pdfreader_core::FieldValue::Text(text) => field
+                    .as_text_field_mut()
+                    .ok_or_else(|| EngineError::Unsupported("editing this widget".to_string()))
+                    .and_then(|text_field| {
+                        text_field
+                            .set_value(&text)
+                            .map_err(|error| EngineError::Pdfium(error.to_string()))
+                    }),
             pdfreader_core::FieldValue::Checked(on) => {
                 // Selecting a radio button means checking that widget; PDFium's
                 // radio group deselects its siblings. Unchecking one outright
@@ -398,7 +408,20 @@ impl PdfEngine for PdfiumEngine {
                 "clearing this widget".to_string(),
             )),
         };
-        outcome.map(|()| true)
+            (outcome, shared_name)
+        };
+
+        outcome?;
+
+        // Phase 2: a field whose name is shared by several widgets keeps its
+        // value on the parent field dictionary, which pdfium-render cannot
+        // write; writing every widget's own dictionary keeps the text in the
+        // document and consistent across our UI.
+        if let (Some(text), Some(name)) = (text_value, shared_name) {
+            annot::sync_shared_text_fields(document, &name, &text)
+                .map_err(|error| EngineError::Pdfium(error.to_string()))?;
+        }
+        Ok(true)
     }
 
     fn save_to_bytes(&mut self, handle: DocumentHandle, flatten: bool) -> Result<Vec<u8>> {
@@ -436,7 +459,7 @@ impl PdfEngine for PdfiumEngine {
         handle: DocumentHandle,
         page: u32,
         new: NewAnnotation,
-    ) -> Result<()> {
+    ) -> Result<AnnotationId> {
         let document = self
             .documents
             .get_mut(&handle)

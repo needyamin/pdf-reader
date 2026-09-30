@@ -68,6 +68,22 @@ type ThumbCacheKey = (DocumentId, Rotation, u32);
 /// thread, PDFium regenerates the page, and fresh tiles round-trip back. For
 /// the couple of frames that takes, the echo is what the user sees — without
 /// it the shape they just drew would blink out and reappear.
+/// A note waiting for its text while the input popup is open on the canvas.
+///
+/// The annotation itself is only created when the user confirms the text, so
+/// it is born with the right contents in a single round-trip.
+#[derive(Clone, Debug)]
+struct NoteInput {
+    /// Page the note sits on.
+    page: u32,
+    /// Layout-space anchor of the note tag.
+    point: (f32, f32),
+    /// The text being typed.
+    text: String,
+    /// Whether the popup should grab keyboard focus (first frame only).
+    opened: bool,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct PendingEcho {
     /// Document the shape belongs to.
@@ -192,6 +208,8 @@ pub struct Canvas {
     stale_thumbs: HashSet<ThumbCacheKey>,
     /// Shapes echoed on screen while their real pixels render.
     pending: Vec<PendingEcho>,
+    /// Open text input for a note being placed.
+    note_input: Option<NoteInput>,
 }
 
 impl Default for Canvas {
@@ -232,6 +250,7 @@ impl Canvas {
             stale_tiles: HashSet::new(),
             stale_thumbs: HashSet::new(),
             pending: Vec::new(),
+            note_input: None,
         }
     }
 
@@ -615,6 +634,10 @@ impl Canvas {
             // page under the toolbar/sidebar. Keep culling in local space and
             // translate only at paint time.
             let content_origin = ui.min_rect().min;
+            // Work on a local copy so the note popup can mutate freely without
+            // fighting the other `self` borrows in this closure. Written back
+            // at the end of the frame.
+            let mut note_input = self.note_input.take();
             let (_, page_area) = ui.allocate_exact_size(content, Sense::click_and_drag());
             let painter = ui.painter().clone();
 
@@ -643,7 +666,11 @@ impl Canvas {
                 // Press begins the shape exactly where the pointer is, but
                 // only when it lands on a page inside the visible canvas —
                 // toolbar or menu clicks must not start strokes.
-                if pointer.primary_pressed() && in_view {
+                if pointer.primary_pressed()
+                    && in_view
+                    && self.draw_start.is_none()
+                    && note_input.is_none()
+                {
                     if let Some(pos) = pointer.interact_pos() {
                         let local = (pos.x - content_origin.x, pos.y - content_origin.y);
                         if let Some(space) = page_spaces.iter().find(|sp| {
@@ -681,17 +708,28 @@ impl Canvas {
                         let dragged =
                             (end.0 - start.0).abs() > 3.0 || (end.1 - start.1).abs() > 3.0;
                         let new = match kind {
-                            AnnotationKind::StickyNote => page_spaces
-                                .iter()
-                                .find(|space| space.index == page)
-                                .map(|space| {
+                            // A note opens its text input right here; the
+                            // annotation is created (with the typed text) when
+                            // the input is confirmed.
+                            AnnotationKind::StickyNote => {
+                                if let Some(space) =
+                                    page_spaces.iter().find(|space| space.index == page)
+                                {
                                     let (px, py) = space.to_page(end);
                                     let (w, h) = space.geom.oriented(space.rotation);
-                                    NewAnnotation::StickyNote(
-                                        (px.clamp(0.0, w), py.clamp(0.0, h)),
-                                        "Note".into(),
-                                    )
-                                }),
+                                    // The LOCAL copy: the field was taken at the
+                                    // top of the frame and written back at the
+                                    // end — writing the field here would be
+                                    // wiped before the popup ever saw it.
+                                    note_input = Some(NoteInput {
+                                        page,
+                                        point: (px.clamp(0.0, w), py.clamp(0.0, h)),
+                                        text: String::new(),
+                                        opened: false,
+                                    });
+                                }
+                                None
+                            }
                             AnnotationKind::FreeText if !dragged => page_spaces
                                 .iter()
                                 .find(|space| space.index == page)
@@ -854,6 +892,19 @@ impl Canvas {
                 }
             }
 
+            // Form values (typed text, chosen options) drawn over the pages:
+            // PDFium does not render live field values without a form-fill
+            // environment, so the overlay is what makes filling visible.
+            if let Some(form) = form {
+                draw_form_values(
+                    &painter,
+                    form,
+                    selected,
+                    &page_spaces,
+                    content_origin,
+                );
+            }
+
             // Form field overlay, drawn after the tiles so it sits on top of
             // them. PDFium has already rasterized each widget's appearance into
             // the tiles; what egui adds is the interactive layer — an outline
@@ -908,6 +959,94 @@ impl Canvas {
                 );
             }
 
+            // Text input for a note being placed, anchored at its tag. The
+            // note is created only when the text is confirmed, so it is born
+            // with the right contents in one round-trip.
+            if let Some(note) = &mut note_input {
+                let page_visible = page_spaces.iter().any(|sp| sp.index == note.page);
+                if !page_visible {
+                    note_input = None;
+                }
+                if let Some(space) = page_spaces
+                    .iter()
+                    .find(|sp| sp.index == note_input.as_ref().map(|n| n.page).unwrap_or(0))
+                {
+                    let anchor = note_input.as_ref().map(|n| n.point).unwrap_or((0.0, 0.0));
+                    let (lx, ly) = space.to_screen_point(anchor);
+                    draw_note_tag(&painter, (lx, ly), content_origin);
+
+                    let input_id = egui::Id::new(("note-input", doc.id.raw()));
+                    let commit_text = egui::Area::new(input_id)
+                        .order(egui::Order::Foreground)
+                        .fixed_pos(pos2(
+                            lx + content_origin.x + 14.0,
+                            ly + content_origin.y - 8.0,
+                        ))
+                        .show(ui.ctx(), |ui| {
+                            egui::Frame::new()
+                                .fill(background)
+                                .stroke(egui::Stroke::new(1.0, accent.gamma_multiply(0.6)))
+                                .corner_radius(3.0)
+                                .inner_margin(egui::Margin::same(6))
+                                .show(ui, |ui| {
+                                    let Some(note) = note_input.as_mut() else {
+                                        return None;
+                                    };
+                                    ui.set_min_width(190.0);
+                                    let response = ui.add(
+                                        egui::TextEdit::singleline(&mut note.text)
+                                            .hint_text("Type a note…")
+                                            .desired_width(178.0),
+                                    );
+                                    if note.opened {
+                                        response.request_focus();
+                                        note.opened = false;
+                                    }
+                                    let escape =
+                                        ui.input(|i| i.key_pressed(egui::Key::Escape));
+                                    let enter =
+                                        ui.input(|i| i.key_pressed(egui::Key::Enter));
+                                    // Enter always commits; a click-away commits
+                                    // only when there is text, otherwise it
+                                    // discards the placement. Esc discards.
+                                    if escape {
+                                        return Some(None);
+                                    }
+                                    if enter || response.lost_focus() {
+                                        return Some(Some(note.text.clone()));
+                                    }
+                                    None
+                                })
+                                .inner
+                        })
+                        .inner;
+                    if let Some(decision) = commit_text {
+                        if let Some(note) = note_input.take() {
+                            // `None` = Esc discard. `Some(text)` = create; the
+                            // engine falls back to "Note" for empty text.
+                            if let Some(text) = decision {
+                                let (px, py) = space.to_page(note.point);
+                                let (w, h) = space.geom.oriented(space.rotation);
+                                self.edits.push(Command::AddAnnotation {
+                                    page: note.page,
+                                    new: NewAnnotation::StickyNote(
+                                        (px.clamp(0.0, w), py.clamp(0.0, h)),
+                                        text,
+                                    ),
+                                });
+                                self.pending.push(PendingEcho {
+                                    doc: doc.id,
+                                    page: note.page,
+                                    kind: AnnotationKind::StickyNote,
+                                    rect: None,
+                                    point: Some(note.point),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+
             // Live tool preview, drawn ABOVE the opaque tiles so the shape is
             // visible from the very first frame of the press.
             if let (Some(kind), Some(start)) = (tool.annotation_kind(), self.draw_start) {
@@ -928,6 +1067,9 @@ impl Canvas {
             // top of everything. They disappear on their own when the page's
             // fresh tiles land.
             draw_pending_echoes(&painter, &self.pending, doc.id, &page_spaces, content_origin);
+
+            // Write the note popup state back for the next frame.
+            self.note_input = note_input;
         });
 
         self.scroll_offset = output.state.offset;
@@ -1179,6 +1321,56 @@ fn draw_shape_preview(
     painter.rect_stroke(rect, 1.0, Stroke::new(1.5, stroke_color), StrokeKind::Inside);
 }
 
+/// Draw the current values of text-like form fields on top of the page.
+///
+/// PDFium renders a field's static appearance stream — which is empty until a
+/// form-fill environment runs, and `pdfium-render` does not wrap one. Drawing
+/// the values ourselves keeps typed text visible at all times and lets the
+/// font size adapt to each field's height, which is what real forms need
+/// (fields are often only 10–14 pt tall).
+fn draw_form_values(
+    painter: &egui::Painter,
+    form: &FormInfo,
+    selected: Option<FieldId>,
+    page_spaces: &[PageSpace],
+    content_origin: egui::Pos2,
+) {
+    for field in &form.fields {
+        // The selected field's own editor is on top; drawing the value under
+        // it would double-render the text.
+        if selected == Some(field.id) {
+            continue;
+        }
+        let value = match &field.value {
+            FieldValue::Text(text) if !text.is_empty() => text,
+            FieldValue::Choice(Some(label)) if !label.is_empty() => label,
+            _ => continue,
+        };
+        let Some(space) = page_spaces.iter().find(|sp| sp.index == field.id.page) else {
+            continue;
+        };
+        let screen = space.to_screen(field.rect);
+        let rect = Rect::from_min_size(
+            pos2(screen.x, screen.y),
+            vec2(screen.w.max(1.0), screen.h.max(1.0)),
+        )
+        .translate(content_origin.to_vec2());
+        if !painter.clip_rect().intersects(rect) {
+            continue;
+        }
+
+        let painter = painter.with_clip_rect(rect);
+        let font_size = (rect.height() * 0.62).clamp(6.0, 15.0);
+        painter.text(
+            rect.left_top() + vec2(2.0, rect.height() / 2.0),
+            egui::Align2::LEFT_CENTER,
+            value,
+            egui::FontId::proportional(font_size),
+            Color32::from_rgb(25, 25, 25),
+        );
+    }
+}
+
 /// Draw the just-drawn shapes that are still waiting for their real pixels.
 ///
 /// Colours approximate what PDFium will render for each kind, so the echo
@@ -1271,11 +1463,22 @@ fn draw_field_editor(
                 .memory(|mem| mem.data.get_temp::<String>(editor_id))
                 .unwrap_or_else(|| field.value.as_text());
 
+            // Auto size: real form fields are often 10–14 pt tall, so the
+            // editor font follows the field height. The text stays dark in
+            // every theme — the page underneath is always white.
+            let font_size = (rect.height() * 0.62).clamp(7.0, 15.0);
+            editor.style_mut().text_styles.insert(
+                egui::TextStyle::Body,
+                egui::FontId::proportional(font_size),
+            );
+            editor.visuals_mut().override_text_color =
+                Some(Color32::from_rgb(25, 25, 25));
+
             let inner = editor.add(
                 egui::TextEdit::singleline(&mut draft)
                     .desired_width(rect.width())
                     .frame(egui::Frame::NONE)
-                    .font(egui::TextStyle::Monospace),
+                    .font(egui::TextStyle::Body),
             );
 
             let changed = draft != field.value.as_text();

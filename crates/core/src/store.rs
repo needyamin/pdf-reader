@@ -23,8 +23,6 @@ pub enum UndoAction {
         page: u32,
         /// Resolved once the fresh list arrives.
         id: Option<crate::annotation::AnnotationId>,
-        /// The list before the add, for identity.
-        before: Vec<crate::annotation::AnnotationInfo>,
     },
     /// An annotation was deleted; undo means re-creating it.
     Delete {
@@ -255,7 +253,11 @@ impl Store {
                 Vec::new()
             }
 
-            Command::AnnotationsLoaded { doc, annotations } => {
+            Command::AnnotationsLoaded {
+                doc,
+                annotations,
+                created,
+            } => {
                 if let Some(tab) = self
                     .state
                     .tabs
@@ -269,18 +271,16 @@ impl Store {
                     if !still_there {
                         tab.view.selected_annotation = None;
                     }
-                    // A just-created annotation has no id until now: the last
-                    // listed annotation on the edited page is it (PDFium
-                    // appends; popups are hidden from this list).
-                    if let Some(last) = tab.undo_stack.last_mut() {
-                        if let UndoAction::Add { page, id, .. } = last {
-                            if id.is_none() {
-                                *id = annotations
-                                    .iter()
-                                    .filter(|a| a.id.page == *page)
-                                    .map(|a| a.id.annot_index)
-                                    .max()
-                                    .map(|idx| crate::annotation::AnnotationId::new(*page, idx));
+                    // Resolve the undo entry for the annotation the engine just
+                    // reported as created. Even with several adds in flight,
+                    // each fresh list carries exactly the id it produced.
+                    if let Some(created_id) = created {
+                        for entry in tab.undo_stack.iter_mut().rev() {
+                            if let UndoAction::Add { page, id, .. } = entry {
+                                if *page == created_id.page && id.is_none() {
+                                    *id = Some(created_id);
+                                    break;
+                                }
                             }
                         }
                     }
@@ -315,23 +315,31 @@ impl Store {
                 };
                 // Ids are positional and shift after a delete: a selection of
                 // an id that no longer resolves is stale, not an error.
-                let resolves = tab
-                    .annotations
-                    .as_ref()
-                    .is_some_and(|list| list.iter().any(|a| a.id == annotation_id));
-                if !resolves {
-                    return Vec::new();
-                }
-                tab.view.selected_annotation = id;
-                let Some(page) = tab
+                let target = tab
                     .annotations
                     .as_ref()
                     .and_then(|list| list.iter().find(|a| a.id == annotation_id))
-                    .map(|a| a.id.page)
-                else {
+                    .map(|a| {
+                        (
+                            a.id.page,
+                            (
+                                (a.rect.min_x + a.rect.max_x) / 2.0,
+                                (a.rect.min_y + a.rect.max_y) / 2.0,
+                            ),
+                        )
+                    });
+                let Some((page, point)) = target else {
                     return Vec::new();
                 };
-                self.dispatch(Command::GoToPage(page))
+                tab.view.selected_annotation = id;
+                let tab_id = tab.id;
+                // Centre on the annotation itself, not the page top — that is
+                // what makes "click a comment → see the noted area" work.
+                vec![Effect::ScrollToPoint {
+                    tab: tab_id,
+                    page,
+                    point,
+                }]
             }
 
             // Creation is not optimistic about the list: the engine answers
@@ -348,11 +356,7 @@ impl Store {
                     tab.view.selected_annotation = None;
                     // The id is positional and unknown until the fresh list
                     // arrives; `AnnotationsLoaded` fills it in by diffing.
-                    tab.undo_stack.push(UndoAction::Add {
-                        page,
-                        id: None,
-                        before: tab.annotations.clone().unwrap_or_default(),
-                    });
+                    tab.undo_stack.push(UndoAction::Add { page, id: None });
                     if tab.undo_stack.len() > UNDO_LIMIT {
                         tab.undo_stack.remove(0);
                     }
@@ -435,16 +439,23 @@ impl Store {
                     return Vec::new();
                 };
                 match action {
-                    // Undoing a create = delete it. That delete records its own
-                    // undo entry, so a second Undo re-creates the annotation.
+                    // Undo of a create: delete it — in place, WITHOUT pushing
+                    // an inverse entry, so each Undo click steps exactly one
+                    // operation back through history.
                     UndoAction::Add { id: Some(id), .. } => {
-                        self.dispatch(Command::DeleteAnnotation(id))
+                        if let Some(tab) = self.state.active_mut() {
+                            tab.view.selected_annotation = None;
+                            if let Some(list) = tab.annotations.as_mut() {
+                                list.retain(|a| a.id != id);
+                            }
+                        }
+                        vec![
+                            Effect::DeleteAnnotation { doc, id },
+                            Effect::InvalidateTiles,
+                        ]
                     }
-                    UndoAction::Add { id: None, .. } => {
-                        // The fresh list never arrived; nothing to reverse.
-                        Vec::new()
-                    }
-                    // Undoing a delete = re-create it verbatim.
+                    UndoAction::Add { id: None, .. } => Vec::new(),
+                    // Undo of a delete: re-create it verbatim (no new entry).
                     UndoAction::Delete { info } => {
                         match crate::annotation::NewAnnotation::from_info(&info) {
                             Some(new) => {
@@ -463,13 +474,26 @@ impl Store {
                             None => Vec::new(),
                         }
                     }
-                    // Undoing a text edit = restore the previous text.
-                    UndoAction::Contents { id, previous } => self.dispatch(
-                        Command::SetAnnotationContents {
-                            id,
-                            contents: previous.unwrap_or_default(),
-                        },
-                    ),
+                    // Undo of a text edit: restore the previous text (no new
+                    // entry).
+                    UndoAction::Contents { id, previous } => {
+                        let restored = previous.clone().unwrap_or_default();
+                        if let Some(list) = tab.annotations.as_mut() {
+                            if let Some(a) = list.iter_mut().find(|a| a.id == id) {
+                                a.contents =
+                                    (!restored.is_empty()).then_some(restored.clone());
+                                tab.dirty = true;
+                            }
+                        }
+                        vec![
+                            Effect::SetAnnotationContents {
+                                doc,
+                                id,
+                                contents: restored,
+                            },
+                            Effect::InvalidateTiles,
+                        ]
+                    }
                 }
             }
 
@@ -1199,6 +1223,7 @@ mod tests {
         s.dispatch(Command::AnnotationsLoaded {
             doc,
             annotations: shifted,
+            created: None,
         });
         assert_eq!(s.state.active().unwrap().view.selected_annotation, None);
     }
@@ -1256,7 +1281,8 @@ mod tests {
             "the id is not known yet"
         );
 
-        // The fresh list arrives: the new annotation resolves onto the entry.
+        // The fresh list arrives with the id the engine reported as created:
+        // the entry resolves onto it.
         let annotations = vec![crate::annotation::AnnotationInfo {
             id: crate::annotation::AnnotationId::new(0, 0),
             kind: crate::annotation::AnnotationKind::Highlight,
@@ -1266,6 +1292,7 @@ mod tests {
         s.dispatch(Command::AnnotationsLoaded {
             doc,
             annotations: annotations.clone(),
+            created: Some(crate::annotation::AnnotationId::new(0, 0)),
         });
         let resolved = match s.state.tab(tab).unwrap().undo_stack[0] {
             UndoAction::Add { id: Some(id), .. } => Some(id),
@@ -1287,11 +1314,12 @@ mod tests {
             Some(crate::annotation::AnnotationId::new(0, 0)),
             "undo of an add must delete it, got {effects:?}"
         );
-        // The delete recorded its own undo entry: a second Undo re-creates.
-        assert!(matches!(
-            s.state.tab(tab).unwrap().undo_stack.last(),
-            Some(UndoAction::Delete { .. })
-        ));
+        // Linear undo: the inverse is NOT recorded, so the stack is empty and
+        // the next Undo click steps to the operation before this one.
+        assert!(
+            s.state.tab(tab).unwrap().undo_stack.is_empty(),
+            "undo must not push an inverse entry"
+        );
     }
 
     /// Undo of a delete re-creates the exact annotation.

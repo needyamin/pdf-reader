@@ -13,8 +13,8 @@
 //!   appearance could still be baked into cached tiles after a change.
 
 use pdfium_render::prelude::{
-    PdfColor, PdfDocument, PdfPageAnnotationCommon, PdfPageAnnotationType, PdfPoints,
-    PdfQuadPoints,
+    PdfColor, PdfDocument, PdfFormFieldCommon as _, PdfPageAnnotationCommon,
+    PdfPageAnnotationType, PdfPoints, PdfQuadPoints,
 };
 
 use pdfreader_core::{
@@ -87,12 +87,13 @@ fn is_hidden_type(annotation_type: PdfPageAnnotationType) -> bool {
     )
 }
 
-/// Create an annotation described by `new` on `page`.
+/// Create an annotation described by `new` on `page`, returning its id.
 pub(crate) fn create_annotation(
     document: &mut PdfDocument<'_>,
     page: u32,
     new: &NewAnnotation,
-) -> Result<(), pdfium_render::prelude::PdfiumError> {
+) -> Result<AnnotationId, pdfium_render::prelude::PdfiumError> {
+    let page_index = page;
     let mut page = document
         .pages_mut()
         .get(page as i32)
@@ -143,7 +144,11 @@ pub(crate) fn create_annotation(
     }
 
     page.regenerate_content()?;
-    Ok(())
+    // PDFium appends new annotations to the end of the page's list; popups are
+    // hidden from `list_annotations` but still occupy indices, so the created
+    // widget is the LAST annotation on the page.
+    let count = page.annotations().len();
+    Ok(AnnotationId::new(page_index, (count - 1) as u32))
 }
 
 /// Set the bounds and quad points of a markup annotation over `rect`.
@@ -229,6 +234,48 @@ fn pdf_rect(rect: Rect) -> pdfium_render::prelude::PdfRect {
         PdfPoints::new(rect.max_y),
         PdfPoints::new(rect.max_x),
     )
+}
+
+/// Write a text value into every widget that shares `name`.
+///
+/// A PDF field whose name appears on several pages/positions is ONE field with
+/// multiple kid widgets: the value belongs on the parent field dictionary,
+/// which `pdfium-render` does not expose for writing. Writing each widget's own
+/// dictionary keeps every in-app surface consistent (our state, this crate's
+/// list) and persists the text into the file's widget dictionaries.
+pub(crate) fn sync_shared_text_fields(
+    document: &mut PdfDocument<'_>,
+    name: &str,
+    value: &str,
+) -> Result<(), pdfium_render::prelude::PdfiumError> {
+    let page_count = document.pages().len();
+    for page_index in 0..page_count {
+        let Ok(mut page) = document.pages_mut().get(page_index as i32) else {
+            continue;
+        };
+        let targets: Vec<usize> = {
+            let mut targets = Vec::new();
+            for (index, annotation) in page.annotations().iter().enumerate() {
+                let Some(field) = annotation.as_form_field() else {
+                    continue;
+                };
+                if field.as_text_field().is_some() && field.name().as_deref() == Some(name) {
+                    targets.push(index);
+                }
+            }
+            targets
+        };
+        for index in targets {
+            if let Ok(mut annotation) = page.annotations_mut().get(index) {
+                if let Some(mut text) =
+                    annotation.as_form_field_mut().and_then(|f| f.as_text_field_mut())
+                {
+                    text.set_value(value)?;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Replace the text contents of one annotation.

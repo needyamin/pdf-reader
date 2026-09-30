@@ -249,6 +249,15 @@ pub enum EngineResponse {
         /// Every non-widget annotation, in page order.
         annotations: Vec<pdfreader_core::AnnotationInfo>,
     },
+    /// An annotation was created; carries its id and the fresh list.
+    AnnotationAdded {
+        /// Document that was edited.
+        doc: DocumentId,
+        /// The created annotation.
+        id: pdfreader_core::AnnotationId,
+        /// Every non-widget annotation after the creation.
+        annotations: Vec<pdfreader_core::AnnotationInfo>,
+    },
     /// An annotation operation failed.
     AnnotationsFailed {
         /// Document that was being edited.
@@ -523,8 +532,8 @@ fn run(
                 new,
             } => {
                 let response = match engine.add_annotation(handle, page, new) {
-                    Ok(()) => match engine.annotations(handle) {
-                        Ok(annotations) => EngineResponse::Annotations { doc, annotations },
+                    Ok(id) => match engine.annotations(handle) {
+                        Ok(annotations) => EngineResponse::AnnotationAdded { doc, id, annotations },
                         Err(error) => EngineResponse::AnnotationsFailed {
                             doc,
                             reason: error.to_string(),

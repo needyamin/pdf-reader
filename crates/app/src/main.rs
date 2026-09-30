@@ -225,6 +225,9 @@ struct App {
     /// Destination for the save currently in flight, so the serialised bytes
     /// land where the user asked rather than where the file was opened from.
     save_target: Option<PathBuf>,
+    /// Annotation jump waiting to be applied: page + PDF-space point to
+    /// centre in the viewport.
+    scroll_to_point: Option<(u32, (f32, f32))>,
     /// Whether the window was maximized when fullscreen was entered, so
     /// leaving fullscreen can put it back. Borderless fullscreen from a
     /// maximized window is a known egui-winit conflict on Windows: entering
@@ -311,6 +314,7 @@ impl App {
             save_error: None,
             save_target: None,
             pre_fullscreen_maximized: None,
+            scroll_to_point: None,
             password_prompts: HashMap::new(),
             search_query: seeded_query.unwrap_or_default(),
             search_results: Vec::new(),
@@ -409,6 +413,9 @@ impl App {
                 }
                 Effect::ConfirmClose { tab } => {
                     self.pending_close = Some(tab);
+                }
+                Effect::ScrollToPoint { tab: _, page, point } => {
+                    self.scroll_to_point = Some((page, point));
                 }
                 Effect::LoadAnnotations { doc } => {
                     if let Some(handle) = self.handles.get(&doc).copied() {
@@ -690,9 +697,23 @@ impl App {
                     self.save_error = Some(reason);
                 }
                 EngineResponse::Annotations { doc, annotations } => {
-                    let effects = self
-                        .store
-                        .dispatch(Command::AnnotationsLoaded { doc, annotations });
+                    let effects = self.store.dispatch(Command::AnnotationsLoaded {
+                        doc,
+                        annotations,
+                        created: None,
+                    });
+                    self.execute(effects);
+                }
+                EngineResponse::AnnotationAdded {
+                    doc,
+                    id,
+                    annotations,
+                } => {
+                    let effects = self.store.dispatch(Command::AnnotationsLoaded {
+                        doc,
+                        annotations,
+                        created: Some(id),
+                    });
                     self.execute(effects);
                 }
                 EngineResponse::AnnotationsFailed { doc, reason } => {
@@ -1126,6 +1147,7 @@ impl eframe::App for App {
                 store,
                 canvas,
                 scroll_to_page,
+                scroll_to_point,
                 search_query,
                 search_results,
                 search_doc,
@@ -1403,6 +1425,24 @@ impl eframe::App for App {
                                     }
                                 }
                                 commands.extend(canvas.take_edits());
+
+                                // A comment click wants the exact noted area
+                                // centred, not the top of its page: convert the
+                                // PDF-space point to layout coords and set an
+                                // absolute scroll offset for the next frame.
+                                if let Some((page, (px, py))) = scroll_to_point.take() {
+                                    if let Some(space) =
+                                        canvas.page_spaces().iter().find(|sp| sp.index == page)
+                                    {
+                                        let (lx, ly) = space.to_screen_point((px, py));
+                                        if let Some(size) = canvas_size {
+                                            canvas.request_scroll_to(egui::Vec2::new(
+                                                (lx - size.x / 2.0).max(0.0),
+                                                (ly - size.y / 2.0).max(0.0),
+                                            ));
+                                        }
+                                    }
+                                }
 
                                 // Keep both the page indicator and the
                                 // persisted viewport offset in step with

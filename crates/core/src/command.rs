@@ -221,6 +221,9 @@ pub enum Command {
         doc: crate::document::DocumentId,
         /// Every non-widget annotation, in page order.
         annotations: Vec<crate::annotation::AnnotationInfo>,
+        /// The annotation that was just created, when this load follows an
+        /// add — used to resolve the undo entry's positional id.
+        created: Option<crate::annotation::AnnotationId>,
     },
 
     /// Select an annotation, or clear the selection with `None`.
@@ -330,6 +333,19 @@ pub enum Effect {
     ConfirmClose {
         /// Tab the user asked to close.
         tab: TabId,
+    },
+
+    /// Scroll a tab so the given PDF-space point sits at the viewport centre.
+    ///
+    /// Used for annotation jumps: clicking a comment must land on the exact
+    /// noted area, not just the top of its page.
+    ScrollToPoint {
+        /// Tab to scroll.
+        tab: TabId,
+        /// Page the point is on.
+        page: u32,
+        /// PDF-space point to centre on.
+        point: (f32, f32),
     },
 
     /// Enumerate a document's annotations on the engine thread.
