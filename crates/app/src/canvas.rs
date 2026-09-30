@@ -604,6 +604,7 @@ impl Canvas {
             Some(offset) => scroll.scroll_offset(offset),
             None => scroll,
         };
+        let mut live_pointer: Option<(f32, f32)> = None;
         let output = scroll.show_viewport(ui, |ui, viewport| {
             viewport_center_y = viewport.center().y;
             viewport_center_x = viewport.center().x;
@@ -627,137 +628,144 @@ impl Canvas {
                 }
             }
 
-            // Annotation tools: drag draws (with a live rubber band), and the
-            // sticky-note tool places on click. Coordinates go through
-            // PageSpace::to_page so the annotation lands where it looks.
+            // Annotation tools: the shape appears on the very first frame of
+            // the press and follows the pointer live; releasing commits it.
+            // Raw pointer state rather than the page area's drag flags — with
+            // Sense::click_and_drag those are postponed until the pointer has
+            // moved a bit (egui is deciding click vs drag), which read as a
+            // delay before anything appeared.
             if let Some(kind) = tool.annotation_kind() {
-                if page_area.drag_started() {
-                    if let Some(pos) = page_area.interact_pointer_pos() {
+                let pointer = ui.input(|i| i.pointer.clone());
+                let in_view = pointer
+                    .latest_pos()
+                    .is_some_and(|pos| ui.clip_rect().contains(pos));
+
+                // Press begins the shape exactly where the pointer is, but
+                // only when it lands on a page inside the visible canvas —
+                // toolbar or menu clicks must not start strokes.
+                if pointer.primary_pressed() && in_view {
+                    if let Some(pos) = pointer.interact_pos() {
                         let local = (pos.x - content_origin.x, pos.y - content_origin.y);
-                        self.draw_start = Some(local);
-                        self.draw_page = page_spaces
-                            .iter()
-                            .find(|space| {
-                                local.0 >= space.origin.0
-                                    && local.0 <= space.origin.0 + space.size.0
-                                    && local.1 >= space.origin.1
-                                    && local.1 <= space.origin.1 + space.size.1
-                            })
-                            .map(|space| space.index);
+                        if let Some(space) = page_spaces.iter().find(|sp| {
+                            local.0 >= sp.origin.0
+                                && local.0 <= sp.origin.0 + sp.size.0
+                                && local.1 >= sp.origin.1
+                                && local.1 <= sp.origin.1 + sp.size.1
+                        }) {
+                            self.draw_start = Some(local);
+                            self.draw_page = Some(space.index);
+                        }
                     }
                 }
 
-                let dragging = page_area.dragged() && self.draw_start.is_some();
-                let mut pointer_now = None;
-                if dragging || page_area.drag_stopped() {
-                    pointer_now = page_area.interact_pointer_pos();
+                // While held, remember where the pointer is; the preview is
+                // drawn *after* the tiles (they are opaque and would cover
+                // anything painted earlier in the frame).
+                if pointer.primary_down() && self.draw_start.is_some() {
+                    live_pointer = pointer
+                        .interact_pos()
+                        .or(pointer.latest_pos())
+                        .map(|pos| (pos.x - content_origin.x, pos.y - content_origin.y));
                 }
 
-                // Live preview while the drag is in progress.
-                if dragging {
-                    if let (Some(start), Some(end)) = (self.draw_start, pointer_now) {
-                        let end = (end.x - content_origin.x, end.y - content_origin.y);
-                        let min_x = start.0.min(end.0);
-                        let min_y = start.1.min(end.1);
-                        painter.rect_stroke(
-                            Rect::from_min_size(
-                                pos2(min_x, min_y),
-                                vec2((end.0 - min_x).abs(), (end.1 - min_y).abs()),
-                            )
-                            .translate(content_origin.to_vec2()),
-                            2.0,
-                            Stroke::new(1.5, accent),
-                            StrokeKind::Outside,
-                        );
-                    }
-                }
-
-                if page_area.drag_stopped() {
-                    if let (Some(start), Some(page), Some(end)) =
-                        (self.draw_start, self.draw_page, pointer_now)
-                    {
-                        let end = (end.x - content_origin.x, end.y - content_origin.y);
-                        // A near-zero drag on a click-placed tool is a placement.
-                        let dragged = (end.0 - start.0).abs() > 3.0 || (end.1 - start.1).abs() > 3.0;
+                // Release commits where the pointer is. Note and Type also
+                // commit on a plain click: a note places at the click, and a
+                // text box gets a default size — neither requires a drag.
+                if pointer.primary_released() && self.draw_start.is_some() {
+                    if let (Some(start), Some(page), Some(pos)) = (
+                        self.draw_start,
+                        self.draw_page,
+                        pointer.interact_pos().or(pointer.latest_pos()),
+                    ) {
+                        let end = (pos.x - content_origin.x, pos.y - content_origin.y);
+                        let dragged =
+                            (end.0 - start.0).abs() > 3.0 || (end.1 - start.1).abs() > 3.0;
                         let new = match kind {
-                            AnnotationKind::StickyNote if !dragged => page_spaces
+                            AnnotationKind::StickyNote => page_spaces
                                 .iter()
                                 .find(|space| space.index == page)
                                 .map(|space| {
-                                    // Keep the anchor on the page even if the
-                                    // click somehow lands a hair past the edge.
                                     let (px, py) = space.to_page(end);
                                     let (w, h) = space.geom.oriented(space.rotation);
-                                    NewAnnotation::StickyNote((
-                                        px.clamp(0.0, w),
-                                        py.clamp(0.0, h),
-                                    ))
+                                    NewAnnotation::StickyNote(
+                                        (px.clamp(0.0, w), py.clamp(0.0, h)),
+                                        "Note".into(),
+                                    )
                                 }),
-                            AnnotationKind::StickyNote => None,
-                            _ if dragged => {
-                                page_spaces
-                                    .iter()
-                                    .find(|space| space.index == page)
-                                    .and_then(|space| {
-                                        let (sx, sy) = space.to_page(start);
-                                        let (ex, ey) = space.to_page(end);
-                                        let rect =
-                                            PdfSpaceRect::from_corners((sx, sy), (ex, ey));
-                                        // A drag that ends over another page (or
-                                        // past the edge) converts through the
-                                        // start page's transform; clamp the
-                                        // result to the page so a highlight can
-                                        // never extend beyond it. A degenerate
-                                        // result (the whole drag was off-page)
-                                        // simply creates nothing.
-                                        let (w, h) = space.geom.oriented(space.rotation);
-                                        let page_bounds =
-                                            PdfSpaceRect::from_xywh(0.0, 0.0, w, h);
-                                        let rect = page_bounds.intersection(rect)?;
-                                        match kind {
-                                            AnnotationKind::Highlight => {
-                                                Some(NewAnnotation::Highlight(rect))
-                                            }
-                                            AnnotationKind::Underline => {
-                                                Some(NewAnnotation::Underline(rect))
-                                            }
-                                            AnnotationKind::StrikeOut => {
-                                                Some(NewAnnotation::StrikeOut(rect))
-                                            }
-                                            AnnotationKind::Squiggly => {
-                                                Some(NewAnnotation::Squiggly(rect))
-                                            }
-                                            AnnotationKind::Square => {
-                                                Some(NewAnnotation::Square(rect))
-                                            }
-                                            AnnotationKind::FreeText => Some(
-                                                NewAnnotation::FreeText(rect, "Text".into()),
-                                            ),
-                                            _ => None,
+                            AnnotationKind::FreeText if !dragged => page_spaces
+                                .iter()
+                                .find(|space| space.index == page)
+                                .and_then(|space| {
+                                    // A click with the Type tool places a
+                                    // default-size box, not nothing.
+                                    let (px, py) = space.to_page(end);
+                                    let (w, h) = space.geom.oriented(space.rotation);
+                                    let x = px.clamp(0.0, (w - 160.0).max(0.0));
+                                    let y = py.clamp(0.0, (h - 24.0).max(0.0));
+                                    let rect = PdfSpaceRect::from_xywh(
+                                        x,
+                                        y,
+                                        160.0_f32.min(w),
+                                        24.0_f32.min(h),
+                                    );
+                                    Some(NewAnnotation::FreeText(rect, "Text".into()))
+                                }),
+                            _ if dragged => page_spaces
+                                .iter()
+                                .find(|space| space.index == page)
+                                .and_then(|space| {
+                                    let (sx, sy) = space.to_page(start);
+                                    let (ex, ey) = space.to_page(end);
+                                    let rect =
+                                        PdfSpaceRect::from_corners((sx, sy), (ex, ey));
+                                    // Clamp to the page: a drag that ends over
+                                    // another page converts through the start
+                                    // page's transform, and nothing may extend
+                                    // past the page it was drawn on.
+                                    let (w, h) = space.geom.oriented(space.rotation);
+                                    let page_bounds =
+                                        PdfSpaceRect::from_xywh(0.0, 0.0, w, h);
+                                    let rect = page_bounds.intersection(rect)?;
+                                    match kind {
+                                        AnnotationKind::Highlight => {
+                                            Some(NewAnnotation::Highlight(rect))
                                         }
-                                    })
-                            }
+                                        AnnotationKind::Underline => {
+                                            Some(NewAnnotation::Underline(rect))
+                                        }
+                                        AnnotationKind::StrikeOut => {
+                                            Some(NewAnnotation::StrikeOut(rect))
+                                        }
+                                        AnnotationKind::Squiggly => {
+                                            Some(NewAnnotation::Squiggly(rect))
+                                        }
+                                        AnnotationKind::Square => {
+                                            Some(NewAnnotation::Square(rect))
+                                        }
+                                        AnnotationKind::FreeText => Some(
+                                            NewAnnotation::FreeText(rect, "Text".into()),
+                                        ),
+                                        _ => None,
+                                    }
+                                }),
                             _ => None,
                         };
                         if let Some(new) = new {
-                            // Capture the echo data first: `new` moves into
-                            // the command below.
                             let echo_has_rect = new.rect().is_some();
-                            let rect = Rect::from_min_max(
+                            let echo_point = new.rect().is_none().then_some(end);
+                            let echo_kind = new.kind();
+                            let echo_rect = Rect::from_min_max(
                                 pos2(start.0.min(end.0), start.1.min(end.1)),
                                 pos2(start.0.max(end.0), start.1.max(end.1)),
                             );
                             self.edits
                                 .push(Command::AddAnnotation { page, new });
-                            // Echo the shape now: the real pixels are one
-                            // engine round-trip away, and the thing just drawn
-                            // must not blink out in between.
                             self.pending.push(PendingEcho {
                                 doc: doc.id,
                                 page,
-                                kind,
-                                rect: echo_has_rect.then_some(rect),
-                                point: (!echo_has_rect).then_some(end),
+                                kind: echo_kind,
+                                rect: echo_has_rect.then_some(echo_rect),
+                                point: echo_point,
                             });
                         }
                     }
@@ -765,6 +773,8 @@ impl Canvas {
                     self.draw_page = None;
                 }
             }
+
+
             painter.rect_filled(ui.clip_rect(), 0.0, background);
 
             let prefetch = viewport.expand2(vec2(viewport.width() * 0.5, viewport.height() * 0.5));
@@ -896,6 +906,22 @@ impl Canvas {
                     content_origin,
                     &mut self.edits,
                 );
+            }
+
+            // Live tool preview, drawn ABOVE the opaque tiles so the shape is
+            // visible from the very first frame of the press.
+            if let (Some(kind), Some(start)) = (tool.annotation_kind(), self.draw_start) {
+                if let Some(end) = live_pointer {
+                    if kind == AnnotationKind::StickyNote {
+                        draw_note_tag(&painter, end, content_origin);
+                    } else {
+                        let rect = Rect::from_min_max(
+                            pos2(start.0.min(end.0), start.1.min(end.1)),
+                            pos2(start.0.max(end.0), start.1.max(end.1)),
+                        );
+                        draw_shape_preview(&painter, kind, rect, content_origin);
+                    }
+                }
             }
 
             // Echoes of shapes the user just drew, drawn last so they sit on
@@ -1104,6 +1130,55 @@ impl Canvas {
     }
 }
 
+/// Fill and stroke colours for one annotation kind, matching what PDFium will
+/// render for it, so previews and echoes blend into the final appearance.
+fn annotation_colors(kind: AnnotationKind) -> (Color32, Color32) {
+    match kind {
+        AnnotationKind::Highlight => (
+            Color32::from_rgba_unmultiplied(255, 235, 59, 70),
+            Color32::from_rgb(212, 180, 0),
+        ),
+        AnnotationKind::StrikeOut => (Color32::TRANSPARENT, Color32::from_rgb(211, 47, 47)),
+        AnnotationKind::Squiggly => (Color32::TRANSPARENT, Color32::from_rgb(67, 160, 71)),
+        AnnotationKind::Square => (Color32::TRANSPARENT, Color32::from_rgb(211, 47, 47)),
+        AnnotationKind::FreeText => (
+            Color32::from_rgba_unmultiplied(255, 255, 255, 140),
+            Color32::from_rgb(80, 80, 80),
+        ),
+        _ => (Color32::TRANSPARENT, Color32::from_rgb(80, 80, 80)),
+    }
+}
+
+/// The sticky note's on-screen stand-in: a small yellow tag.
+fn draw_note_tag(painter: &egui::Painter, point: (f32, f32), content_origin: egui::Pos2) {
+    let rect = Rect::from_center_size(
+        pos2(point.0 + content_origin.x, point.1 + content_origin.y),
+        vec2(18.0, 18.0),
+    );
+    painter.rect_filled(rect, 3.0, Color32::from_rgb(255, 213, 79));
+    painter.rect_stroke(
+        rect,
+        3.0,
+        Stroke::new(1.0, Color32::from_rgb(140, 110, 0)),
+        StrokeKind::Outside,
+    );
+}
+
+/// The rectangle kinds' on-screen stand-in.
+fn draw_shape_preview(
+    painter: &egui::Painter,
+    kind: AnnotationKind,
+    rect: Rect,
+    content_origin: egui::Pos2,
+) {
+    let rect = rect.translate(content_origin.to_vec2());
+    let (fill, stroke_color) = annotation_colors(kind);
+    if fill != Color32::TRANSPARENT {
+        painter.rect_filled(rect, 1.0, fill);
+    }
+    painter.rect_stroke(rect, 1.0, Stroke::new(1.5, stroke_color), StrokeKind::Inside);
+}
+
 /// Draw the just-drawn shapes that are still waiting for their real pixels.
 ///
 /// Colours approximate what PDFium will render for each kind, so the echo
@@ -1121,57 +1196,17 @@ fn draw_pending_echoes(
     let painter = painter.with_clip_rect(painter.clip_rect());
 
     for shape in pending.iter().filter(|s| s.doc == doc) {
-        let Some(space) = page_spaces.iter().find(|sp| sp.index == shape.page) else {
+        if !page_spaces.iter().any(|sp| sp.index == shape.page) {
             continue;
-        };
-        let _ = space;
+        }
 
         match shape.point {
-            // A sticky note echoes as its icon: a small yellow tag.
-            Some((x, y)) => {
-                let rect = Rect::from_center_size(
-                    pos2(x + content_origin.x, y + content_origin.y),
-                    vec2(18.0, 18.0),
-                );
-                painter.rect_filled(rect, 3.0, Color32::from_rgb(255, 213, 79));
-                painter.rect_stroke(
-                    rect,
-                    3.0,
-                    Stroke::new(1.0, Color32::from_rgb(140, 110, 0)),
-                    StrokeKind::Outside,
-                );
-            }
+            // A sticky note echoes as its icon.
+            Some(point) => draw_note_tag(&painter, point, content_origin),
             // Everything else echoes as its rectangle.
             None => {
                 let Some(rect) = shape.rect else { continue };
-                let rect = rect.translate(content_origin.to_vec2());
-                let (fill, stroke_color) = match shape.kind {
-                    AnnotationKind::Highlight => (
-                        Color32::from_rgba_unmultiplied(255, 235, 59, 70),
-                        Color32::from_rgb(212, 180, 0),
-                    ),
-                    AnnotationKind::StrikeOut => (
-                        Color32::TRANSPARENT,
-                        Color32::from_rgb(211, 47, 47),
-                    ),
-                    AnnotationKind::Squiggly => (
-                        Color32::TRANSPARENT,
-                        Color32::from_rgb(67, 160, 71),
-                    ),
-                    AnnotationKind::Square => (
-                        Color32::TRANSPARENT,
-                        Color32::from_rgb(211, 47, 47),
-                    ),
-                    AnnotationKind::FreeText => (
-                        Color32::from_rgba_unmultiplied(255, 255, 255, 140),
-                        Color32::from_rgb(80, 80, 80),
-                    ),
-                    _ => (Color32::TRANSPARENT, Color32::from_rgb(80, 80, 80)),
-                };
-                if fill != Color32::TRANSPARENT {
-                    painter.rect_filled(rect, 1.0, fill);
-                }
-                painter.rect_stroke(rect, 1.0, Stroke::new(1.5, stroke_color), StrokeKind::Inside);
+                draw_shape_preview(&painter, shape.kind, rect, content_origin);
             }
         }
     }

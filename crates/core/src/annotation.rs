@@ -186,8 +186,8 @@ pub enum NewAnnotation {
     Squiggly(Rect),
     /// Rectangle outline.
     Square(Rect),
-    /// Sticky note anchored at a point.
-    StickyNote((f32, f32)),
+    /// Sticky note anchored at a point, with its initial text.
+    StickyNote((f32, f32), String),
     /// Free text drawn into a rectangle.
     FreeText(Rect, String),
 }
@@ -202,7 +202,7 @@ impl NewAnnotation {
             | Self::Squiggly(r)
             | Self::Square(r)
             | Self::FreeText(r, _) => Some(*r),
-            Self::StickyNote(_) => None,
+            Self::StickyNote(_, _) => None,
         }
     }
 
@@ -214,9 +214,31 @@ impl NewAnnotation {
             Self::StrikeOut(_) => AnnotationKind::StrikeOut,
             Self::Squiggly(_) => AnnotationKind::Squiggly,
             Self::Square(_) => AnnotationKind::Square,
-            Self::StickyNote(_) => AnnotationKind::StickyNote,
+            Self::StickyNote(_, _) => AnnotationKind::StickyNote,
             Self::FreeText(_, _) => AnnotationKind::FreeText,
         }
+    }
+
+    /// Reconstruct the annotation this info describes, for undoing a delete.
+    ///
+    /// Text kinds keep their text; markup kinds keep their rectangle.
+    pub fn from_info(info: &AnnotationInfo) -> Option<Self> {
+        let rect = info.rect;
+        Some(match info.kind {
+            AnnotationKind::Highlight => Self::Highlight(rect),
+            AnnotationKind::Underline => Self::Underline(rect),
+            AnnotationKind::StrikeOut => Self::StrikeOut(rect),
+            AnnotationKind::Squiggly => Self::Squiggly(rect),
+            AnnotationKind::Square => Self::Square(rect),
+            AnnotationKind::FreeText => {
+                Self::FreeText(rect, info.contents.clone().unwrap_or_default())
+            }
+            AnnotationKind::StickyNote => Self::StickyNote(
+                (rect.min_x, rect.min_y),
+                info.contents.clone().unwrap_or_else(|| "Note".into()),
+            ),
+            AnnotationKind::Stamp | AnnotationKind::Link | AnnotationKind::Other => return None,
+        })
     }
 }
 
@@ -263,7 +285,7 @@ mod tests {
         let rect = Rect::from_xywh(0.0, 0.0, 10.0, 10.0);
         assert_eq!(NewAnnotation::Highlight(rect).kind(), AnnotationKind::Highlight);
         assert_eq!(NewAnnotation::Square(rect).rect(), Some(rect));
-        assert_eq!(NewAnnotation::StickyNote((5.0, 5.0)).rect(), None);
+        assert_eq!(NewAnnotation::StickyNote((5.0, 5.0), "n".into()).rect(), None);
     }
 
     #[test]

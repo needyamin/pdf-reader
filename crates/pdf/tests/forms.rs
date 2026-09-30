@@ -378,7 +378,7 @@ fn created_annotations_survive_a_save_round_trip() {
         .expect("create highlight");
     // A sticky note with text.
     engine
-        .add_annotation(handle, 0, NewAnnotation::StickyNote((420.0, 700.0)))
+        .add_annotation(handle, 0, NewAnnotation::StickyNote((420.0, 700.0), "Reviewed later".into()))
         .expect("create note");
     // Typewriter text.
     engine

@@ -870,6 +870,11 @@ impl App {
                     commands.push(Command::RequestCloseTab(id));
                 }
             }
+            if input.key_pressed(egui::Key::Z) && input.modifiers.command {
+                if self.store.state().active().is_some_and(|tab| !tab.undo_stack.is_empty()) {
+                    commands.push(Command::Undo);
+                }
+            }
             if input.key_pressed(egui::Key::Escape) {
                 if self.store.state().fullscreen {
                     commands.push(Command::ToggleFullscreen);

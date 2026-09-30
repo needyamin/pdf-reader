@@ -126,11 +126,13 @@ pub(crate) fn create_annotation(
             // Outline only: a zero-alpha fill keeps the page text visible.
             annot.set_fill_color(PdfColor::new(255, 0, 0, 0))?;
         }
-        NewAnnotation::StickyNote((x, y)) => {
-            let mut annot = annotations.create_text_annotation("Note")?;
+        NewAnnotation::StickyNote((x, y), contents) => {
+            let mut annot = annotations.create_text_annotation(contents)?;
             annot.set_position(PdfPoints::new(*x), PdfPoints::new(*y))?;
             annot.set_stroke_color(PdfColor::YELLOW)?;
-            annot.set_contents("Note")?;
+            if contents.is_empty() {
+                annot.set_contents("Note")?;
+            }
         }
         NewAnnotation::FreeText(rect, contents) => {
             let mut annot = annotations.create_free_text_annotation(contents)?;

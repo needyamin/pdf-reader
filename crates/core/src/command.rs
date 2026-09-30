@@ -249,6 +249,9 @@ pub enum Command {
         contents: String,
     },
 
+    /// Undo the last annotation operation on the active document.
+    Undo,
+
     /// An annotation operation failed on the engine thread.
     ///
     /// If the list was never read, this un-sticks the Comments panel from its

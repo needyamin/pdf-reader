@@ -722,6 +722,21 @@ pub fn annotation_bar(ui: &mut Ui, palette: &Palette, state: &AppState) -> Vec<C
                         commands.push(Command::SetTool(tool));
                     }
                 }
+                ui.separator();
+                let undoable = state
+                    .active()
+                    .is_some_and(|tab| !tab.undo_stack.is_empty());
+                if ui
+                    .add_enabled(
+                        undoable,
+                        egui::Button::new(RichText::new("Undo").size(11.5).color(palette.text))
+                            .fill(Color32::TRANSPARENT)
+                            .corner_radius(4.0),
+                    )
+                    .clicked()
+                {
+                    commands.push(Command::Undo);
+                }
             });
         });
     commands
