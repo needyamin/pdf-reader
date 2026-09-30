@@ -267,7 +267,7 @@ pub(crate) fn sync_shared_text_fields(
         };
         for index in targets {
             if let Ok(mut annotation) = page.annotations_mut().get(index) {
-                if let Some(mut text) =
+                if let Some(text) =
                     annotation.as_form_field_mut().and_then(|f| f.as_text_field_mut())
                 {
                     text.set_value(value)?;

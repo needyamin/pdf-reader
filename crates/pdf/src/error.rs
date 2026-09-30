@@ -50,6 +50,34 @@ pub enum EngineError {
     #[error("pdfium error: {0}")]
     Pdfium(String),
 
+    /// The job was cancelled by the user before it finished.
+    ///
+    /// Not a failure: the caller asked for this. It travels as an error only
+    /// because that is what unwinds a loop cleanly, and the shell treats it as
+    /// a quiet stop rather than something to report.
+    #[error("cancelled")]
+    Cancelled,
+
+    /// Building an output file failed for a reason that is not `PDFium`'s fault.
+    ///
+    /// Encoding a rendered page and rasterizing it are different operations;
+    /// conflating the second's failures with the first's would send the reader
+    /// looking in the wrong place.
+    #[error("export failed: {0}")]
+    Export(String),
+
+    /// One input of a multi-file job could not be used.
+    ///
+    /// Multi-file operations need to name the file that failed: "the document
+    /// is encrypted" is useless when the job was handed a dozen of them.
+    #[error("{path} could not be used: {reason}")]
+    Source {
+        /// File that failed.
+        path: PathBuf,
+        /// Why, in user-facing terms.
+        reason: String,
+    },
+
     /// The operation exists in the PDF format but the engine cannot perform it.
     ///
     /// Used where PDFium's safe binding exposes no way to write a value —

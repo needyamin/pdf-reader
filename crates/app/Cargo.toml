@@ -8,9 +8,24 @@ name = "pdfreader-app"
 description = "PDF Reader desktop application"
 publish = false
 
+# Compiles `assets/icon.ico` into a Windows resource (build.rs: Windows only).
+build = "build.rs"
+
 [[bin]]
 name = "pdf-reader"
 path = "src/main.rs"
+
+[target.'cfg(windows)'.build-dependencies]
+embed-resource = "3.0"
+
+# `ShellExecuteW` is how printing hands a temporary PDF to the OS print
+# pipeline. Only the shell and foundation APIs are needed.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [dependencies]
 pdfreader-core = { workspace = true }
@@ -21,8 +36,8 @@ pdfreader-ui = { workspace = true }
 crossbeam-channel = { workspace = true }
 eframe = { workspace = true }
 egui = { workspace = true }
-# Only the PNG encoder is needed (for the PDFREADER_SCREENSHOT debug capture).
-image = { version = "0.25", default-features = false, features = ["png"] }
+# PNG for the PDFREADER_SCREENSHOT debug capture, PNG/JPEG for page export.
+image = { workspace = true }
 rfd = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

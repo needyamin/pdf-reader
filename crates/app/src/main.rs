@@ -6,27 +6,34 @@
 
 mod canvas;
 mod engine_thread;
+mod print;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 
 use egui::ViewportCommand;
 use pdfreader_core::{
-    Command, DocumentId, Effect, FieldValue, FormFieldType, SidebarTab, Store, Tab, ThemeId, Tool,
-    ViewMode, ZoomMode,
+    Command, DocumentId, Effect, ExportTarget, FieldValue, FormFieldType, SidebarTab, Store, Tab,
+    ThemeId, Tool, ViewMode, ZoomMode,
 };
 use pdfreader_pdf::engine::{DocumentHandle, PdfiumEngine};
 use pdfreader_search::SearchMatch;
 use pdfreader_ui::{
-    ANNOTATION_BAR_HEIGHT, MENUBAR_HEIGHT, STATUSBAR_HEIGHT, TABBAR_HEIGHT, TOOLBAR_HEIGHT,
-    TOOLS_RAIL_WIDTH, annotation_bar, comments_panel, forms_panel, menu_bar, outline_tree,
-    sidebar_tabs, status_bar, tab_bar, toolbar, tools_rail,
+    MENUBAR_HEIGHT, STATUSBAR_HEIGHT, TABBAR_HEIGHT, TOOLBAR_HEIGHT, TOOLS_RAIL_WIDTH,
+    annotation_bar, comments_panel, forms_panel, menu_bar, outline_tree, sidebar_tabs, status_bar,
+    tab_bar, toolbar, tools_rail,
 };
 use serde::{Deserialize, Serialize};
 
 use canvas::{Canvas, MARGIN, PendingThumb, PendingTile, SCROLLBAR_ALLOWANCE};
 use engine_thread::{EngineRequest, EngineResponse, EngineThread};
+
+/// Application icon, embedded at compile time so the window is branded even
+/// when the exe is copied somewhere without `assets/` next to it.
+const ICON_PNG: &[u8] = include_bytes!("../../../assets/icon.png");
 
 /// Write PDF bytes to `path` atomically.
 ///
@@ -77,6 +84,16 @@ fn write_pdf_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result
 fn main() {
     init_tracing();
 
+    // Print spool files cannot be deleted when their job finishes — the shell
+    // hands the file to a handler that reads it afterwards — so they are swept
+    // here, at the first moment every earlier print is certainly done with its
+    // file. Failures are ignored: a file still open simply survives to the next
+    // launch.
+    let swept = print::sweep_stale_spool_files();
+    if swept > 0 {
+        tracing::info!("removed {swept} stale print file(s) from the temp directory");
+    }
+
     let engine = match PdfiumEngine::bind(exe_dir().as_deref()) {
         Ok(engine) => engine,
         Err(error) => {
@@ -99,22 +116,41 @@ fn main() {
     // handler for "Open with" and file associations.
     let initial = std::env::args_os().nth(1).map(PathBuf::from);
 
+    let viewport = egui::ViewportBuilder::default()
+        .with_inner_size([1400.0, 900.0])
+        .with_min_inner_size([820.0, 560.0])
+        // Native OS decorations: the standard minimize / maximize / close
+        // buttons are always present and behave the way people expect.
+        .with_decorations(true)
+        .with_maximized(true)
+        .with_title("PDF Reader");
+
+    // Title bar, taskbar and Alt-Tab. Without this Windows falls back to the
+    // generic application icon even when the exe carries a resource.
+    let viewport = match eframe::icon_data::from_png_bytes(ICON_PNG) {
+        Ok(icon) => viewport.with_icon(std::sync::Arc::new(icon)),
+        Err(error) => {
+            eprintln!("failed to decode the application icon: {error}");
+            viewport
+        }
+    };
+
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1400.0, 900.0])
-            .with_min_inner_size([820.0, 560.0])
-            // Native OS decorations: the standard minimize / maximize / close
-            // buttons are always present and behave the way people expect.
-            .with_decorations(true)
-            .with_maximized(true)
-            .with_title("PDF Reader"),
+        viewport,
         ..Default::default()
     };
 
     if let Err(error) = eframe::run_native(
         "PDF Reader",
         options,
-        Box::new(move |_cc| Ok(Box::new(App::new(engine_thread, initial)))),
+        Box::new(move |cc| {
+            // Ctrl+Plus / Ctrl+Minus / Ctrl+0 zoom the *document* here, so
+            // egui's whole-GUI zoom has to be switched off: otherwise both
+            // fire on the same keypress and the menus and toolbars scale along
+            // with the page, which is what a PDF reader must never do.
+            cc.egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
+            Ok(Box::new(App::new(engine_thread, initial)))
+        }),
     ) {
         eprintln!("eframe failed: {error}");
         std::process::exit(1);
@@ -190,6 +226,208 @@ fn load_settings() -> Settings {
     }
 }
 
+/// Image extensions the reader can decode.
+///
+/// Matches the `image` features the workspace enables; adding a codec there
+/// means adding it here, or the picker will hide files the app can read.
+const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg"];
+
+/// What a native dialog is being opened for.
+///
+/// The intent is what turns a bare path back into the command that acts on it,
+/// so it has to survive the round trip through the dialog thread.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DialogIntent {
+    /// Pick one PDF to open.
+    OpenPdf,
+    /// Pick where to save the active document.
+    SavePdf,
+    /// Pick where to save the current page as an image.
+    SavePageImage(pdfreader_core::ImageFormat),
+    /// Pick where to save the current page as a PDF.
+    SavePagePdf,
+    /// Pick a folder to write every page into as images.
+    PickImageFolder(pdfreader_core::ImageFormat),
+    /// Pick several images to compose into a PDF.
+    PickImages,
+    /// Pick several PDFs to merge.
+    PickPdfs,
+    /// Pick where to save a composed or merged document.
+    ///
+    /// Only ever the second half of a two-step job, which is why it reads its
+    /// inputs from `pending_sources` rather than carrying them.
+    SaveComposed,
+}
+
+/// What a native dialog came back with.
+enum DialogResult {
+    /// The user closed it without choosing.
+    Cancelled,
+    /// A single file or folder.
+    Path(PathBuf),
+    /// Several files, in the order the dialog returned them.
+    Paths(Vec<PathBuf>),
+}
+
+/// Inputs for a job that is still waiting for its destination.
+enum PendingJob {
+    /// Images to place into a new PDF, one page each.
+    ImagesToPdf(Vec<PathBuf>),
+    /// Documents to concatenate, in order.
+    MergePdfs(Vec<PathBuf>),
+}
+
+/// Show one native dialog and normalise its answer.
+///
+/// Runs on the dialog thread, so it takes everything it needs by value and
+/// never touches application state.
+fn run_dialog(intent: DialogIntent, default_name: Option<String>) -> DialogResult {
+    // Naming a save dialog's file is only meaningful when it is a save dialog.
+    let with_name = |mut dialog: rfd::FileDialog| {
+        if let Some(name) = default_name.clone() {
+            dialog = dialog.set_file_name(name);
+        }
+        dialog
+    };
+
+    match intent {
+        DialogIntent::OpenPdf => rfd::FileDialog::new()
+            .add_filter("PDF document", &["pdf"])
+            .set_title("Open PDF")
+            .pick_file()
+            .map_or(DialogResult::Cancelled, DialogResult::Path),
+
+        DialogIntent::SavePdf => with_name(
+            rfd::FileDialog::new()
+                .add_filter("PDF document", &["pdf"])
+                .set_title("Save PDF as"),
+        )
+        .save_file()
+        .map_or(DialogResult::Cancelled, DialogResult::Path),
+
+        DialogIntent::SavePageImage(format) => with_name(
+            rfd::FileDialog::new()
+                .add_filter(format.label(), &[format.extension()])
+                .set_title("Save page as"),
+        )
+        .save_file()
+        .map_or(DialogResult::Cancelled, DialogResult::Path),
+
+        DialogIntent::SavePagePdf => with_name(
+            rfd::FileDialog::new()
+                .add_filter("PDF document", &["pdf"])
+                .set_title("Save page as PDF"),
+        )
+        .save_file()
+        .map_or(DialogResult::Cancelled, DialogResult::Path),
+
+        DialogIntent::PickImageFolder(_) => rfd::FileDialog::new()
+            .set_title("Choose a folder for the exported pages")
+            .pick_folder()
+            .map_or(DialogResult::Cancelled, DialogResult::Path),
+
+        DialogIntent::PickImages => rfd::FileDialog::new()
+            .add_filter("Images", IMAGE_EXTENSIONS)
+            .set_title("Choose images, one page each")
+            .pick_files()
+            .map_or(DialogResult::Cancelled, DialogResult::Paths),
+
+        DialogIntent::PickPdfs => rfd::FileDialog::new()
+            .add_filter("PDF document", &["pdf"])
+            .set_title("Choose PDFs to merge, in order")
+            .pick_files()
+            .map_or(DialogResult::Cancelled, DialogResult::Paths),
+
+        DialogIntent::SaveComposed => with_name(
+            rfd::FileDialog::new()
+                .add_filter("PDF document", &["pdf"])
+                .set_title("Save the new PDF as"),
+        )
+        .save_file()
+        .map_or(DialogResult::Cancelled, DialogResult::Path),
+    }
+}
+
+/// The dialog a command opens, if it opens one.
+///
+/// Dialog commands are intercepted by the shell rather than reduced, exactly
+/// like `ShowOpenDialog`: the reducer cannot show a window, and it must not
+/// invent a path the user never chose.
+fn dialog_intent_for(command: &Command) -> Option<DialogIntent> {
+    match command {
+        Command::ShowOpenDialog => Some(DialogIntent::OpenPdf),
+        Command::SaveDocumentAs => Some(DialogIntent::SavePdf),
+        Command::ShowExportImageDialog(format) => Some(DialogIntent::SavePageImage(*format)),
+        Command::ShowExportPagesPdfDialog => Some(DialogIntent::SavePagePdf),
+        Command::ShowExportAllPagesDialog(format) => Some(DialogIntent::PickImageFolder(*format)),
+        Command::ShowImagesToPdfDialog => Some(DialogIntent::PickImages),
+        Command::ShowMergeDialog => Some(DialogIntent::PickPdfs),
+        _ => None,
+    }
+}
+
+/// Default file name for a dialog that saves the page currently in view.
+///
+/// One-based and zero-padded to match the names "all pages as images" writes,
+/// so a directory of mixed exports still sorts in page order.
+fn page_file_name(tab: &Tab, extension: &str) -> String {
+    let stem = tab
+        .document
+        .as_ref()
+        .map_or_else(|| "page".to_string(), |doc| doc.title.clone());
+    format!("{stem}-page-{:04}.{extension}", tab.view.current_page + 1)
+}
+
+/// What a status message is telling the user, which decides how it looks.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ToastKind {
+    /// Something went wrong and needs attention.
+    Error,
+    /// Work is in progress; the message carries a Cancel button.
+    Busy,
+    /// Something worked.
+    Success,
+}
+
+/// A short sentence describing what a finished job produced.
+///
+/// A directory means "all pages as images", which reports a file count; a file
+/// reports its page count. `pages` is 1 for a single-page export, which reads
+/// better without the count spelled out.
+fn describe_output(path: &std::path::Path, pages: u32) -> String {
+    if path.is_dir() {
+        return format!("Wrote {pages} images to {}", path.display());
+    }
+
+    let name = path.file_name().map_or_else(
+        || path.display().to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    );
+
+    if pages > 1 {
+        format!("Wrote {name} ({pages} pages)")
+    } else {
+        format!("Wrote {name}")
+    }
+}
+
+/// An export, composition or merge job the shell is waiting on.
+///
+/// Jobs run one at a time on the engine thread, so the shell tracks exactly
+/// one. Starting another cancels this one first rather than queueing behind it,
+/// which would otherwise leave the user watching a progress bar for work they
+/// no longer want.
+struct RunningJob {
+    /// Identifier the engine echoes back on every report.
+    id: u64,
+    /// What the job is doing, for the progress message.
+    label: String,
+    /// Set to ask the engine to stop at the next item.
+    cancel: Arc<AtomicBool>,
+    /// Items finished and total, once the engine has reported any.
+    progress: Option<(u32, u32)>,
+}
+
 /// The eframe application.
 struct App {
     /// Application state and the reducer.
@@ -200,18 +438,23 @@ struct App {
     engine: EngineThread,
     /// Engine handles for documents the store knows about.
     handles: HashMap<DocumentId, DocumentHandle>,
-    /// Receives the result of a native file dialog.
-    dialog_rx: Receiver<Option<PathBuf>>,
+    /// Receives the result of whichever native file dialog is open.
+    ///
+    /// One channel and one slot serve every dialog: only one can be open at a
+    /// time, and the intent recorded alongside it is what says how to read the
+    /// answer. A channel per dialog would be six copies of the same plumbing.
+    dialog_rx: Receiver<DialogResult>,
     /// Sends file dialog results.
-    dialog_tx: Sender<Option<PathBuf>>,
-    /// Whether a dialog is already open, so we do not stack them.
-    dialog_open: bool,
-    /// Receives the result of the save-as dialog.
-    save_dialog_rx: Receiver<Option<PathBuf>>,
-    /// Sends save-as dialog results.
-    save_dialog_tx: Sender<Option<PathBuf>>,
-    /// Whether a save-as dialog is already open.
-    save_dialog_open: bool,
+    dialog_tx: Sender<DialogResult>,
+    /// What the open dialog is for, so its answer can be routed. `None` means
+    /// no dialog is open.
+    dialog_intent: Option<DialogIntent>,
+    /// Files the user picked for a job that still needs a destination.
+    ///
+    /// The native dialog API has no "pick inputs and a destination at once", so
+    /// images→PDF and merge run in two steps and the inputs wait here while the
+    /// save dialog is open.
+    pending_sources: Option<PendingJob>,
     /// Tab awaiting the unsaved-changes prompt.
     ///
     /// Set by `Effect::ConfirmClose`; the tab is not closed until the user
@@ -225,6 +468,14 @@ struct App {
     /// Destination for the save currently in flight, so the serialised bytes
     /// land where the user asked rather than where the file was opened from.
     save_target: Option<PathBuf>,
+    /// The export or composition job currently running, if any.
+    running_job: Option<RunningJob>,
+    /// What the last finished job did, shown until the user dismisses it.
+    ///
+    /// Separate from `save_error` so a success can be reported too: an export
+    /// that wrote a file to a folder the user then has to go and find deserves
+    /// an acknowledgement.
+    job_notice: Option<String>,
     /// Annotation jump waiting to be applied: page + PDF-space point to
     /// centre in the viewport.
     scroll_to_point: Option<(u32, (f32, f32))>,
@@ -276,7 +527,6 @@ impl App {
     /// Build the application.
     fn new(engine: EngineThread, initial: Option<PathBuf>) -> Self {
         let (dialog_tx, dialog_rx) = channel();
-        let (save_dialog_tx, save_dialog_rx) = channel();
         let settings = load_settings();
 
         let mut store = Store::new();
@@ -305,14 +555,14 @@ impl App {
             handles: HashMap::new(),
             dialog_rx,
             dialog_tx,
-            dialog_open: false,
-            save_dialog_rx,
-            save_dialog_tx,
-            save_dialog_open: false,
+            dialog_intent: None,
+            pending_sources: None,
             pending_close: None,
             close_after_save: None,
             save_error: None,
             save_target: None,
+            running_job: None,
+            job_notice: None,
             pre_fullscreen_maximized: None,
             scroll_to_point: None,
             password_prompts: HashMap::new(),
@@ -456,6 +706,110 @@ impl App {
                     }
                     self.canvas.invalidate_page(doc, id.page);
                 }
+                Effect::ExportPageImage {
+                    doc,
+                    page,
+                    rotation,
+                    scale,
+                    format,
+                    path,
+                } => {
+                    if let Some(handle) = self.handles.get(&doc).copied() {
+                        let label = format!("Exporting page {} as {}", page + 1, format.label());
+                        let (job, cancel) = self.begin_job(label);
+                        self.engine.send(EngineRequest::ExportPageImage {
+                            handle,
+                            page,
+                            rotation,
+                            scale,
+                            format,
+                            path,
+                            job,
+                            cancel,
+                        });
+                    }
+                }
+                Effect::ExportAllPages {
+                    doc,
+                    dir,
+                    stem,
+                    rotation,
+                    scale,
+                    format,
+                } => {
+                    if let Some(handle) = self.handles.get(&doc).copied() {
+                        let label = format!("Exporting every page as {}", format.label());
+                        let (job, cancel) = self.begin_job(label);
+                        self.engine.send(EngineRequest::ExportAllPages {
+                            handle,
+                            dir,
+                            stem,
+                            rotation,
+                            scale,
+                            format,
+                            job,
+                            cancel,
+                        });
+                    }
+                }
+                Effect::ExportPages { doc, range, path } => {
+                    if let Some(handle) = self.handles.get(&doc).copied() {
+                        let label = match range {
+                            Some(_) => "Exporting the page as PDF",
+                            None => "Exporting the document as PDF",
+                        };
+                        let (job, cancel) = self.begin_job(label.to_string());
+                        self.engine.send(EngineRequest::ExportPages {
+                            handle,
+                            range,
+                            path,
+                            target: ExportTarget::SaveFile,
+                            job,
+                            cancel,
+                        });
+                    }
+                }
+                Effect::Print { doc, range } => {
+                    if let Some(handle) = self.handles.get(&doc).copied() {
+                        let (job, cancel) = self.begin_job("Preparing to print".to_string());
+                        // The shell names the spool file because it owns the
+                        // file's lifetime: it cannot be deleted when the job
+                        // finishes, since the print handler reads it afterwards.
+                        self.engine.send(EngineRequest::ExportPages {
+                            handle,
+                            range,
+                            path: print::spool_path(job),
+                            target: ExportTarget::Print,
+                            job,
+                            cancel,
+                        });
+                    }
+                }
+                Effect::ImagesToPdf {
+                    images,
+                    output,
+                    scale,
+                } => {
+                    let label = format!("Building a PDF from {} images", images.len());
+                    let (job, cancel) = self.begin_job(label);
+                    self.engine.send(EngineRequest::ImagesToPdf {
+                        images,
+                        output,
+                        scale,
+                        job,
+                        cancel,
+                    });
+                }
+                Effect::MergePdfs { sources, output } => {
+                    let label = format!("Merging {} documents", sources.len());
+                    let (job, cancel) = self.begin_job(label);
+                    self.engine.send(EngineRequest::MergePdfs {
+                        sources,
+                        output,
+                        job,
+                        cancel,
+                    });
+                }
             }
         }
     }
@@ -492,19 +846,11 @@ impl App {
             self.applied_theme = Some(theme_id);
         }
 
-        if let Ok(picked) = self.dialog_rx.try_recv() {
-            self.dialog_open = false;
-            if let Some(path) = picked {
-                let effects = self.store.dispatch(Command::OpenPath(path));
-                self.execute(effects);
-            }
-        }
-
-        if let Ok(picked) = self.save_dialog_rx.try_recv() {
-            self.save_dialog_open = false;
-            if let Some(path) = picked {
-                let effects = self.store.dispatch(Command::SaveDocumentTo(path));
-                self.execute(effects);
+        if let Ok(result) = self.dialog_rx.try_recv() {
+            // The intent is taken before routing, which frees the slot for a
+            // two-step job's second dialog.
+            if let Some(intent) = self.dialog_intent.take() {
+                self.handle_dialog_result(ctx, intent, result);
             }
         }
 
@@ -804,9 +1150,109 @@ impl App {
                         self.search_started = None;
                     }
                 }
+                EngineResponse::JobProgress { job, done, total } => {
+                    // A late report from a job that was already cancelled must
+                    // not resurrect its progress bar.
+                    if let Some(running) = self.running_job.as_mut()
+                        && running.id == job
+                    {
+                        running.progress = Some((done, total));
+                    }
+                }
+                EngineResponse::JobDone {
+                    job,
+                    output,
+                    pages,
+                    target,
+                } => {
+                    // A report from a job that was already superseded must not
+                    // clear the state of the job that replaced it.
+                    if self.take_job(job).is_none() {
+                        continue;
+                    }
+                    match target {
+                        // The file is written; all that is left is to tell the
+                        // user where it went.
+                        ExportTarget::SaveFile => {
+                            self.job_notice = Some(describe_output(&output, pages));
+                        }
+                        ExportTarget::Print => {
+                            // Hand the spool file to the OS. It is deliberately
+                            // not deleted here: the handler reads it after this
+                            // returns. The next launch sweeps it up.
+                            match print::print_pdf(&output) {
+                                Ok(()) => {
+                                    tracing::info!(
+                                        "sent {} to the print handler",
+                                        output.display()
+                                    );
+                                    self.job_notice = Some("Sent to the printer".to_string());
+                                }
+                                Err(error) => {
+                                    tracing::warn!("printing failed: {error}");
+                                    self.save_error = Some(format!("Could not print: {error}"));
+                                }
+                            }
+                        }
+                    }
+                }
+                EngineResponse::JobCancelled { job } => {
+                    // Cancelling is what the user asked for, so it is not worth
+                    // a message: the progress bar simply goes away.
+                    if self.take_job(job).is_some() {
+                        tracing::info!("job {job} cancelled");
+                    }
+                }
+                EngineResponse::JobFailed { job, reason } => {
+                    if self.take_job(job).is_none() {
+                        continue;
+                    }
+                    tracing::warn!("job {job} failed: {reason}");
+                    self.save_error = Some(reason);
+                }
             }
         }
         drained
+    }
+
+    /// Clear the running job if `job` is the one being tracked.
+    ///
+    /// Returns the job when it was, so a stale report from a superseded job
+    /// cannot clear the state of the job that replaced it.
+    fn take_job(&mut self, job: u64) -> Option<RunningJob> {
+        if self.running_job.as_ref().is_some_and(|r| r.id == job) {
+            self.running_job.take()
+        } else {
+            None
+        }
+    }
+
+    /// Start a job, cancelling whatever was running before.
+    ///
+    /// Long jobs are not queued: the engine thread also serves tile rendering,
+    /// so a second export would otherwise freeze the page for the duration of
+    /// the first. Cancelling is honoured between items, so the old job stops
+    /// promptly.
+    fn begin_job(&mut self, label: String) -> (u64, Arc<AtomicBool>) {
+        self.cancel_running_job();
+
+        let id = self.engine.new_job();
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.running_job = Some(RunningJob {
+            id,
+            label,
+            cancel: Arc::clone(&cancel),
+            progress: None,
+        });
+
+        (id, cancel)
+    }
+
+    /// Ask the running job to stop, if there is one.
+    fn cancel_running_job(&mut self) {
+        if let Some(running) = self.running_job.take() {
+            running.cancel.store(true, Ordering::Relaxed);
+        }
     }
 
     /// Turn keyboard input into commands.
@@ -892,8 +1338,34 @@ impl App {
                 }
             }
             if input.key_pressed(egui::Key::Z) && input.modifiers.command {
-                if self.store.state().active().is_some_and(|tab| !tab.undo_stack.is_empty()) {
+                // Ctrl+Shift+Z is redo on every platform; Ctrl+Y is the
+                // Windows spelling of the same thing.
+                let can_undo = self
+                    .store
+                    .state()
+                    .active()
+                    .is_some_and(|tab| !tab.undo_stack.is_empty());
+                let can_redo = self
+                    .store
+                    .state()
+                    .active()
+                    .is_some_and(|tab| !tab.redo_stack.is_empty());
+                if input.modifiers.shift {
+                    if can_redo {
+                        commands.push(Command::Redo);
+                    }
+                } else if can_undo {
                     commands.push(Command::Undo);
+                }
+            }
+            if ctrl && input.key_pressed(egui::Key::Y) {
+                if self
+                    .store
+                    .state()
+                    .active()
+                    .is_some_and(|tab| !tab.redo_stack.is_empty())
+                {
+                    commands.push(Command::Redo);
                 }
             }
             if input.key_pressed(egui::Key::Escape) {
@@ -912,6 +1384,18 @@ impl App {
                     }
                 }
             }
+            // Ctrl+P prints the whole document, the same as the File menu
+            // entry. It needs a document, so it is a no-op on an empty window.
+            if ctrl && input.key_pressed(egui::Key::P) {
+                if self
+                    .store
+                    .state()
+                    .active()
+                    .is_some_and(|tab| tab.document.is_some())
+                {
+                    commands.push(Command::Print);
+                }
+            }
         });
 
         commands
@@ -921,63 +1405,112 @@ impl App {
     ///
     /// The dialog blocks, and blocking the UI thread is exactly what this
     /// architecture exists to avoid, so it runs elsewhere and reports back
-    /// through a channel.
-    fn show_open_dialog(&mut self) {
-        if self.dialog_open {
+    /// through a channel. One dialog at a time: a second request while one is
+    /// open is dropped rather than stacked, because a modal window that appears
+    /// behind another one looks like the application has hung.
+    fn show_dialog(&mut self, intent: DialogIntent) {
+        if self.dialog_intent.is_some() {
             return;
         }
-        self.dialog_open = true;
+        self.dialog_intent = Some(intent);
 
         let sender = self.dialog_tx.clone();
+        let default_name = self.dialog_default_name(intent);
 
         if let Err(error) = std::thread::Builder::new()
             .name("file-dialog".to_string())
             .spawn(move || {
-                let picked = rfd::FileDialog::new()
-                    .add_filter("PDF document", &["pdf"])
-                    .set_title("Open PDF")
-                    .pick_file();
-
-                let _ = sender.send(picked);
+                let _ = sender.send(run_dialog(intent, default_name));
             })
         {
             tracing::error!("could not open a file dialog thread: {error}");
-            self.dialog_open = false;
+            self.dialog_intent = None;
         }
     }
 
-    /// Open a native save dialog on a worker thread.
-    ///
-    /// Mirrors `show_open_dialog`: the dialog blocks, so it runs elsewhere and
-    /// reports back through a channel.
-    fn show_save_dialog(&mut self) {
-        if self.save_dialog_open {
-            return;
-        }
-        self.save_dialog_open = true;
+    /// A sensible pre-filled file name for the dialog being opened.
+    fn dialog_default_name(&self, intent: DialogIntent) -> Option<String> {
+        let tab = self.store.state().active();
 
-        let sender = self.save_dialog_tx.clone();
-        let default_name = self
-            .store
-            .state()
-            .active()
-            .map(|tab| tab.path.file_name().map(|n| n.to_string_lossy().to_string()))
-            .flatten();
+        match intent {
+            DialogIntent::OpenPdf
+            | DialogIntent::PickImages
+            | DialogIntent::PickPdfs
+            | DialogIntent::PickImageFolder(_) => None,
 
-        if let Err(error) = std::thread::Builder::new()
-            .name("save-dialog".to_string())
-            .spawn(move || {
-                let mut dialog = rfd::FileDialog::new()
-                    .add_filter("PDF document", &["pdf"])
-                    .set_title("Save PDF as");
-                if let Some(name) = default_name {
-                    dialog = dialog.set_file_name(name);
+            DialogIntent::SavePdf => tab.and_then(|tab| {
+                tab.path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+            }),
+
+            DialogIntent::SavePageImage(format) => Some(page_file_name(tab?, format.extension())),
+            DialogIntent::SavePagePdf => Some(page_file_name(tab?, "pdf")),
+
+            DialogIntent::SaveComposed => Some(
+                match self.pending_sources {
+                    Some(PendingJob::MergePdfs(_)) => "merged",
+                    _ => "images",
                 }
-                let _ = sender.send(dialog.save_file());
-            })
-        {
-            tracing::error!("could not open a save dialog thread: {error}");
-            self.save_dialog_open = false;
+                .to_string()
+                + ".pdf",
+            ),
+        }
+    }
+
+    /// Route a dialog's answer to the command that acts on it.
+    fn handle_dialog_result(
+        &mut self,
+        ctx: &egui::Context,
+        intent: DialogIntent,
+        result: DialogResult,
+    ) {
+        match (intent, result) {
+            // Closing a dialog abandons a half-finished two-step job rather
+            // than leaving its inputs waiting for a destination forever.
+            (_, DialogResult::Cancelled) => self.pending_sources = None,
+
+            (DialogIntent::OpenPdf, DialogResult::Path(path)) => {
+                self.apply(ctx, vec![Command::OpenPath(path)]);
+            }
+            (DialogIntent::SavePdf, DialogResult::Path(path)) => {
+                self.apply(ctx, vec![Command::SaveDocumentTo(path)]);
+            }
+            (DialogIntent::SavePageImage(format), DialogResult::Path(path)) => {
+                self.apply(ctx, vec![Command::ExportPageImage { path, format }]);
+            }
+            (DialogIntent::SavePagePdf, DialogResult::Path(path)) => {
+                self.apply(ctx, vec![Command::ExportPagesPdf { path }]);
+            }
+            (DialogIntent::PickImageFolder(format), DialogResult::Path(dir)) => {
+                self.apply(ctx, vec![Command::ExportAllPages { dir, format }]);
+            }
+
+            // Step one of a two-step job: remember the inputs and ask where the
+            // result should go.
+            (DialogIntent::PickImages, DialogResult::Paths(images)) if !images.is_empty() => {
+                self.pending_sources = Some(PendingJob::ImagesToPdf(images));
+                self.show_dialog(DialogIntent::SaveComposed);
+            }
+            (DialogIntent::PickPdfs, DialogResult::Paths(sources)) if !sources.is_empty() => {
+                self.pending_sources = Some(PendingJob::MergePdfs(sources));
+                self.show_dialog(DialogIntent::SaveComposed);
+            }
+
+            // Step two: the inputs are known and the destination just arrived.
+            (DialogIntent::SaveComposed, DialogResult::Path(output)) => {
+                let command = match self.pending_sources.take() {
+                    Some(PendingJob::ImagesToPdf(images)) => Command::ImagesToPdf { images, output },
+                    Some(PendingJob::MergePdfs(sources)) => Command::MergePdfs { sources, output },
+                    // The inputs were dropped by an earlier cancellation.
+                    None => return,
+                };
+                self.apply(ctx, vec![command]);
+            }
+
+            // A picker that came back empty, or an intent/result pairing that
+            // cannot happen: treat it as a cancellation.
+            _ => self.pending_sources = None,
         }
     }
 
@@ -1074,12 +1607,8 @@ impl App {
                 self.start_search(query);
                 continue;
             }
-            if matches!(command, Command::ShowOpenDialog) {
-                self.show_open_dialog();
-                continue;
-            }
-            if matches!(command, Command::SaveDocumentAs) {
-                self.show_save_dialog();
+            if let Some(intent) = dialog_intent_for(&command) {
+                self.show_dialog(intent);
                 continue;
             }
             let is_scroll_by = matches!(command, Command::ScrollBy { .. });
@@ -1541,33 +2070,88 @@ impl eframe::App for App {
             }
         }
 
-        // A failed save or field write surfaces here so "nothing happened" is
-        // never the only feedback. Click anywhere on it to dismiss.
-        if let Some(error) = self.save_error.clone() {
-            let response = egui::Area::new(egui::Id::new("save-error"))
+        // Status feedback: a failure, a job in progress, or a finished job.
+        // One slot rather than a stack — at most one of these is interesting at
+        // a time, and the newest is always the most relevant. Click a finished
+        // message to dismiss it; a running job offers Cancel instead.
+        let toast = self
+            .save_error
+            .as_ref()
+            .map(|text| (ToastKind::Error, text.clone()))
+            .or_else(|| {
+                self.running_job
+                    .as_ref()
+                    .map(|job| (ToastKind::Busy, job.label.clone()))
+            })
+            .or_else(|| {
+                self.job_notice
+                    .as_ref()
+                    .map(|text| (ToastKind::Success, text.clone()))
+            });
+
+        if let Some((kind, text)) = toast {
+            let progress = self.running_job.as_ref().and_then(|job| job.progress);
+            let mut dismiss = false;
+            let mut cancel = false;
+
+            egui::Area::new(egui::Id::new("status-toast"))
                 .anchor(egui::Align2::CENTER_BOTTOM, egui::Vec2::new(0.0, -36.0))
                 .show(&ctx, |ui| {
+                    let stroke = match kind {
+                        ToastKind::Error => palette.danger,
+                        ToastKind::Busy | ToastKind::Success => palette.accent,
+                    };
                     egui::Frame::new()
                         .fill(palette.panel_bg)
-                        .stroke(egui::Stroke::new(1.0, palette.danger))
+                        .stroke(egui::Stroke::new(1.0, stroke))
                         .corner_radius(3.0)
                         .inner_margin(egui::Margin::same(10))
                         .show(ui, |ui| {
-                            ui.label(
-                                egui::RichText::new(format!("{error}  (click to dismiss)"))
-                                    .color(palette.text)
-                                    .size(12.0),
-                            );
+                            ui.horizontal(|ui| {
+                                let message = match (kind, progress) {
+                                    (ToastKind::Busy, Some((done, total))) => {
+                                        format!("{text}  ({done}/{total})")
+                                    }
+                                    _ => text.clone(),
+                                };
+                                ui.label(
+                                    egui::RichText::new(message).color(palette.text).size(12.0),
+                                );
+
+                                if kind == ToastKind::Busy {
+                                    if ui
+                                        .button(egui::RichText::new("Cancel").size(12.0))
+                                        .clicked()
+                                    {
+                                        cancel = true;
+                                    }
+                                } else {
+                                    ui.label(
+                                        egui::RichText::new("(click to dismiss)")
+                                            .color(palette.text_dim)
+                                            .size(11.0),
+                                    );
+                                }
+                            });
                         });
-                    ui.interact(
-                        ui.min_rect(),
-                        egui::Id::new("save-error-dismiss"),
-                        egui::Sense::click(),
-                    )
-                })
-                .inner;
-            if response.clicked() {
+
+                    if kind != ToastKind::Busy {
+                        ui.interact(
+                            ui.min_rect(),
+                            egui::Id::new("status-toast-dismiss"),
+                            egui::Sense::click(),
+                        )
+                        .clicked()
+                        .then(|| dismiss = true);
+                    }
+                });
+
+            if cancel {
+                self.cancel_running_job();
+            }
+            if dismiss {
                 self.save_error = None;
+                self.job_notice = None;
             }
         }
 

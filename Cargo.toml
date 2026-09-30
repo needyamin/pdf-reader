@@ -58,7 +58,10 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rfd = "0.17"
-image = "0.25"
+# Page export (PNG/JPEG) and image decoding for "images to PDF". Default
+# features are off so only the codecs this application uses are compiled in;
+# add more (bmp, gif, tiff, webp) here to widen what it can read.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 quick_cache = "0.6"
 zstd = "0.13"
 clap = { version = "4", features = ["derive"] }

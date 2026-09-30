@@ -7,6 +7,7 @@
 pub mod annotation;
 pub mod command;
 pub mod document;
+pub mod export;
 pub mod form;
 pub mod rect;
 pub mod store;
@@ -15,6 +16,7 @@ pub mod view;
 pub use annotation::{AnnotationId, AnnotationInfo, AnnotationKind, NewAnnotation, Tool};
 pub use command::{Command, Effect, SidebarTab, TabId};
 pub use document::{Document, DocumentId, Outline, OutlineNode, PageGeometry, Rotation};
+pub use export::{ExportTarget, ImageFormat, PageRange};
 pub use form::{
     FieldId, FieldOption, FieldValue, FormFieldInfo, FormFieldType, FormInfo, FormKind,
 };

@@ -255,6 +255,12 @@ pub enum Command {
     /// Undo the last annotation operation on the active document.
     Undo,
 
+    /// Re-apply the annotation operation that was just undone.
+    ///
+    /// Only meaningful straight after an undo: any new edit clears the redo
+    /// history, exactly like every other editor.
+    Redo,
+
     /// An annotation operation failed on the engine thread.
     ///
     /// If the list was never read, this un-sticks the Comments panel from its
@@ -262,6 +268,75 @@ pub enum Command {
     AnnotationsLoadFailed {
         /// Document the failed operation belonged to.
         doc: crate::document::DocumentId,
+    },
+
+    /// Ask the shell to pick a destination, then write the current page out as
+    /// an image.
+    ShowExportImageDialog(crate::export::ImageFormat),
+
+    /// Write the active document's current page out as an image file.
+    ///
+    /// The page, rotation and resolution come from the reducer rather than the
+    /// caller: the shell would otherwise have to duplicate the resolution rule,
+    /// and a dialog that runs a few frames after the menu click must export the
+    /// page the user was looking at when they clicked.
+    ExportPageImage {
+        /// Destination file, chosen by the user.
+        path: PathBuf,
+        /// Format to write.
+        format: crate::export::ImageFormat,
+    },
+
+    /// Ask the shell to pick a directory, then write every page out as images.
+    ShowExportAllPagesDialog(crate::export::ImageFormat),
+
+    /// Write every page of the active document out as image files.
+    ExportAllPages {
+        /// Destination directory, chosen by the user.
+        dir: PathBuf,
+        /// Format to write.
+        format: crate::export::ImageFormat,
+    },
+
+    /// Ask the shell to pick a destination, then write the current page out as
+    /// a standalone PDF.
+    ShowExportPagesPdfDialog,
+
+    /// Write the active document's current page out as a standalone PDF.
+    ExportPagesPdf {
+        /// Destination file, chosen by the user.
+        path: PathBuf,
+    },
+
+    /// Print the active document. The operating system's dialog chooses the
+    /// printer and, if the user wants one, the page range.
+    Print,
+
+    /// Print only the page currently in view.
+    PrintCurrentPage,
+
+    /// Ask the shell to pick images, and then a destination, before building a
+    /// PDF out of them.
+    ShowImagesToPdfDialog,
+
+    /// Build a PDF with one page per image, each page sized to its image.
+    ImagesToPdf {
+        /// Images to place, one page each.
+        images: Vec<PathBuf>,
+        /// Destination file, chosen by the user.
+        output: PathBuf,
+    },
+
+    /// Ask the shell to pick documents, and then a destination, before merging
+    /// them into one PDF.
+    ShowMergeDialog,
+
+    /// Concatenate documents into one, in the order given.
+    MergePdfs {
+        /// Documents to merge.
+        sources: Vec<PathBuf>,
+        /// Destination file, chosen by the user.
+        output: PathBuf,
     },
 }
 
@@ -380,5 +455,78 @@ pub enum Effect {
         id: crate::annotation::AnnotationId,
         /// The new text.
         contents: String,
+    },
+
+    /// Rasterize one page and write it out as an image file.
+    ExportPageImage {
+        /// Document to read.
+        doc: crate::document::DocumentId,
+        /// Zero-based page index.
+        page: u32,
+        /// Page rotation to bake into the export.
+        rotation: crate::document::Rotation,
+        /// Device pixels per PDF point.
+        scale: f32,
+        /// Format to write.
+        format: crate::export::ImageFormat,
+        /// Destination file.
+        path: PathBuf,
+    },
+
+    /// Rasterize every page into `dir`, one image file per page.
+    ExportAllPages {
+        /// Document to read.
+        doc: crate::document::DocumentId,
+        /// Directory to write into.
+        dir: PathBuf,
+        /// Name stem for the files, e.g. `report` → `report-0001.png`.
+        stem: String,
+        /// Page rotation to bake into the exports.
+        rotation: crate::document::Rotation,
+        /// Device pixels per PDF point.
+        scale: f32,
+        /// Format to write.
+        format: crate::export::ImageFormat,
+    },
+
+    /// Serialise a page range of a document as a standalone PDF.
+    ExportPages {
+        /// Document to read.
+        doc: crate::document::DocumentId,
+        /// Pages to include; `None` means the whole document.
+        range: Option<crate::export::PageRange>,
+        /// Destination file.
+        path: PathBuf,
+    },
+
+    /// Write a page range to a temporary PDF and hand it to the operating
+    /// system's print handler.
+    ///
+    /// The shell invents the spool path, because it owns the temp-file
+    /// lifecycle: the file cannot be deleted when the job finishes, since the
+    /// handler reads it afterwards.
+    Print {
+        /// Document to print.
+        doc: crate::document::DocumentId,
+        /// Pages to print; `None` means the whole document.
+        range: Option<crate::export::PageRange>,
+    },
+
+    /// Build a PDF with one page per image, each page sized to its image.
+    ImagesToPdf {
+        /// Images to place, one page each.
+        images: Vec<PathBuf>,
+        /// Destination file.
+        output: PathBuf,
+        /// Points per pixel for the page size.
+        scale: f32,
+    },
+
+    /// Concatenate documents into one, in the order given.
+    MergePdfs {
+        /// Documents to merge.
+        sources: Vec<PathBuf>,
+        /// Destination file.
+        output: PathBuf,
     },
 }

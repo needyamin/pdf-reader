@@ -13,6 +13,10 @@ pdfreader-core = { workspace = true }
 pdfium-render = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+# Decoding images for "images to PDF" and encoding exported pages. `image` is
+# needed directly because pdfium-render takes a `DynamicImage` but does not
+# re-export the crate that defines it.
+image = { workspace = true }
 
 [lints]
 workspace = true

@@ -12,13 +12,15 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
-use pdfreader_core::{Document, DocumentId, FormInfo, Rotation, TabId};
-use pdfreader_pdf::DocumentInfo;
+use pdfreader_core::{
+    Document, DocumentId, ExportTarget, FormInfo, ImageFormat, PageRange, Rotation, TabId,
+};
 use pdfreader_pdf::engine::{DocumentHandle, PdfEngine, PdfiumEngine, TilePixels, TileRequest};
+use pdfreader_pdf::{DocumentInfo, EngineError, JobProgress};
 use pdfreader_render::TileKey;
 
 /// Work the engine thread can be asked to do.
@@ -149,6 +151,83 @@ pub enum EngineRequest {
         /// the full document.
         generation: u64,
     },
+    /// Write one page out as an image file.
+    ExportPageImage {
+        /// Document to read from.
+        handle: DocumentHandle,
+        /// Zero-based page index.
+        page: u32,
+        /// Page rotation to bake into the export.
+        rotation: Rotation,
+        /// Device pixels per PDF point.
+        scale: f32,
+        /// Image format to write.
+        format: ImageFormat,
+        /// Where to write it.
+        path: PathBuf,
+        /// Job this belongs to.
+        job: u64,
+        /// Set by the shell to stop the job early.
+        cancel: Arc<AtomicBool>,
+    },
+    /// Write every page out as image files in a directory.
+    ExportAllPages {
+        /// Document to read from.
+        handle: DocumentHandle,
+        /// Directory to write into; created if it does not exist.
+        dir: PathBuf,
+        /// Name stem for the files, e.g. `report` → `report-0001.png`.
+        stem: String,
+        /// Page rotation to bake into the exports.
+        rotation: Rotation,
+        /// Device pixels per PDF point.
+        scale: f32,
+        /// Image format to write.
+        format: ImageFormat,
+        /// Job this belongs to.
+        job: u64,
+        /// Set by the shell to stop the job early.
+        cancel: Arc<AtomicBool>,
+    },
+    /// Serialise a page range as a standalone PDF.
+    ExportPages {
+        /// Document to read from.
+        handle: DocumentHandle,
+        /// Pages to include; `None` means the whole document.
+        range: Option<PageRange>,
+        /// Where to write the result.
+        path: PathBuf,
+        /// Why the PDF is being built, which decides what happens next.
+        target: ExportTarget,
+        /// Job this belongs to.
+        job: u64,
+        /// Set by the shell to stop the job early.
+        cancel: Arc<AtomicBool>,
+    },
+    /// Concatenate documents into one, in the order given.
+    MergePdfs {
+        /// Documents to merge.
+        sources: Vec<PathBuf>,
+        /// Where to write the result.
+        output: PathBuf,
+        /// Job this belongs to.
+        job: u64,
+        /// Set by the shell to stop the job early.
+        cancel: Arc<AtomicBool>,
+    },
+    /// Build a PDF with one page per image, each page sized to its image.
+    ImagesToPdf {
+        /// Images to place, one page each.
+        images: Vec<PathBuf>,
+        /// Where to write the result.
+        output: PathBuf,
+        /// Points per pixel for the page size.
+        scale: f32,
+        /// Job this belongs to.
+        job: u64,
+        /// Set by the shell to stop the job early.
+        cancel: Arc<AtomicBool>,
+    },
 }
 
 /// What the engine thread reports back.
@@ -274,6 +353,39 @@ pub enum EngineResponse {
         /// Matching pages in ascending order.
         matches: Vec<pdfreader_search::SearchMatch>,
     },
+    /// One step of a long-running export or composition job.
+    JobProgress {
+        /// Job this belongs to.
+        job: u64,
+        /// Items finished so far.
+        done: u32,
+        /// Items in total.
+        total: u32,
+    },
+    /// A job finished and wrote its output.
+    JobDone {
+        /// Job this belongs to.
+        job: u64,
+        /// What was written, so the shell can report it or hand it to the
+        /// printer.
+        output: PathBuf,
+        /// How many pages or files were produced.
+        pages: u32,
+        /// Why the output was built.
+        target: ExportTarget,
+    },
+    /// A job stopped because the shell asked it to.
+    JobCancelled {
+        /// Job this belongs to.
+        job: u64,
+    },
+    /// A job failed.
+    JobFailed {
+        /// Job this belongs to.
+        job: u64,
+        /// Human-readable reason.
+        reason: String,
+    },
 }
 
 /// Handle to the running engine thread.
@@ -286,6 +398,8 @@ pub struct EngineThread {
     /// invalidations) cannot cancel a running search, and a new search
     /// cancels only searches.
     search_generation: Arc<AtomicU64>,
+    /// Hands out identifiers for export and composition jobs.
+    next_job: AtomicU64,
     worker: Option<JoinHandle<()>>,
 }
 
@@ -326,6 +440,7 @@ impl EngineThread {
             responses: response_rx,
             generation,
             search_generation,
+            next_job: AtomicU64::new(0),
             worker: Some(worker),
         })
     }
@@ -337,6 +452,16 @@ impl EngineThread {
         if let Some(requests) = &self.requests {
             let _ = requests.send(request);
         }
+    }
+
+    /// Allocate an identifier for a new long-running job.
+    ///
+    /// Job ids only exist to match progress and completion reports back to the
+    /// job that produced them, so a plain counter is enough. Cancellation is
+    /// handled by the flag the caller sends alongside the request, not by the
+    /// engine thread, which keeps the two concerns independent.
+    pub fn new_job(&self) -> u64 {
+        self.next_job.fetch_add(1, Ordering::Relaxed) + 1
     }
 
     /// Current viewport generation.
@@ -467,7 +592,10 @@ fn run(
                 // is cheap next to rasterisation but still belongs off the UI
                 // thread. A document without a form simply reports an empty one.
                 let form = engine.form_fields(handle).unwrap_or_default();
-                if responses.send(EngineResponse::FormFields { doc, form }).is_err() {
+                if responses
+                    .send(EngineResponse::FormFields { doc, form })
+                    .is_err()
+                {
                     return;
                 }
             }
@@ -533,7 +661,11 @@ fn run(
             } => {
                 let response = match engine.add_annotation(handle, page, new) {
                     Ok(id) => match engine.annotations(handle) {
-                        Ok(annotations) => EngineResponse::AnnotationAdded { doc, id, annotations },
+                        Ok(annotations) => EngineResponse::AnnotationAdded {
+                            doc,
+                            id,
+                            annotations,
+                        },
                         Err(error) => EngineResponse::AnnotationsFailed {
                             doc,
                             reason: error.to_string(),
@@ -629,8 +761,167 @@ fn run(
                     return;
                 }
             }
+            EngineRequest::ExportPageImage {
+                handle,
+                page,
+                rotation,
+                scale,
+                format,
+                path,
+                job,
+                cancel,
+            } => {
+                // A single page has nothing to report progress against, so the
+                // callback is left alone and only the outcome is sent.
+                let done = run_job(
+                    job,
+                    &cancel,
+                    &responses,
+                    path.clone(),
+                    ExportTarget::SaveFile,
+                    |_| {
+                        engine
+                            .export_page_image(handle, page, rotation, scale, format, &path)
+                            .map(|()| 1)
+                    },
+                );
+                if !done {
+                    return;
+                }
+            }
+            EngineRequest::ExportAllPages {
+                handle,
+                dir,
+                stem,
+                rotation,
+                scale,
+                format,
+                job,
+                cancel,
+            } => {
+                let done = run_job(
+                    job,
+                    &cancel,
+                    &responses,
+                    dir.clone(),
+                    ExportTarget::SaveFile,
+                    |progress| {
+                        engine.export_all_pages(
+                            handle, &dir, &stem, rotation, scale, format, progress,
+                        )
+                    },
+                );
+                if !done {
+                    return;
+                }
+            }
+            EngineRequest::ExportPages {
+                handle,
+                range,
+                path,
+                target,
+                job,
+                cancel,
+            } => {
+                let done = run_job(job, &cancel, &responses, path.clone(), target, |_| {
+                    // Serialising is one indivisible step, so the only
+                    // meaningful progress report is the one at the end.
+                    let bytes = engine.export_pages_to_bytes(handle, range)?;
+                    std::fs::write(&path, &bytes).map_err(|error| EngineError::Io {
+                        path: path.clone(),
+                        reason: error.to_string(),
+                    })?;
+                    Ok(1)
+                });
+                if !done {
+                    return;
+                }
+            }
+            EngineRequest::MergePdfs {
+                sources,
+                output,
+                job,
+                cancel,
+            } => {
+                let done = run_job(
+                    job,
+                    &cancel,
+                    &responses,
+                    output.clone(),
+                    ExportTarget::SaveFile,
+                    |progress| engine.merge_pdfs(&sources, &output, progress),
+                );
+                if !done {
+                    return;
+                }
+            }
+            EngineRequest::ImagesToPdf {
+                images,
+                output,
+                scale,
+                job,
+                cancel,
+            } => {
+                let done = run_job(
+                    job,
+                    &cancel,
+                    &responses,
+                    output.clone(),
+                    ExportTarget::SaveFile,
+                    |progress| engine.images_to_pdf(&images, &output, scale, progress),
+                );
+                if !done {
+                    return;
+                }
+            }
         }
     }
+}
+
+/// Run one long job, reporting progress and exactly one outcome.
+///
+/// Every job answers exactly once, whatever happens, so the shell can always
+/// clear its busy state; a job that reported nothing on the way out would leave
+/// a progress indicator running forever.
+///
+/// Returns `false` when the response channel is gone, which means the UI has
+/// shut down and the worker should stop.
+fn run_job<F>(
+    job: u64,
+    cancel: &AtomicBool,
+    responses: &Sender<EngineResponse>,
+    output: PathBuf,
+    target: ExportTarget,
+    body: F,
+) -> bool
+where
+    F: FnOnce(&mut JobProgress<'_>) -> Result<u32, EngineError>,
+{
+    let result = {
+        let mut report = |done, total| {
+            let _ = responses.send(EngineResponse::JobProgress { job, done, total });
+        };
+        let mut progress = JobProgress::new(cancel, &mut report);
+        body(&mut progress)
+    };
+
+    let response = match result {
+        Ok(pages) => EngineResponse::JobDone {
+            job,
+            output,
+            pages,
+            target,
+        },
+        // A cancellation is a normal outcome, not a failure: the user asked for
+        // it, so it must not surface as an error message.
+        Err(EngineError::Cancelled) => EngineResponse::JobCancelled { job },
+        Err(error) => EngineResponse::JobFailed {
+            job,
+            reason: error.to_string(),
+        },
+    };
+
+    responses.send(response).is_ok()
 }
 
 /// Turn engine metadata into a domain document.

@@ -9,17 +9,17 @@
 //! through a priority queue. Nothing here should ever be called concurrently.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use pdfium_render::prelude::*;
-use pdfium_render::prelude::PdfFormFieldCommon as _;
 use pdfreader_core::{
-    AnnotationId, AnnotationInfo, FormInfo, NewAnnotation, Outline, OutlineNode, PageGeometry,
-    Rotation,
+    AnnotationId, AnnotationInfo, FormInfo, ImageFormat, NewAnnotation, Outline, OutlineNode,
+    PageGeometry, PageRange, Rotation,
 };
 
 use crate::annot;
 use crate::error::EngineError;
+use crate::export::{self, JobProgress};
 use crate::form::read_form;
 use crate::text::{CharBox, TextPage};
 use crate::{DocumentInfo, Result};
@@ -155,6 +155,68 @@ pub trait PdfEngine {
         id: AnnotationId,
         contents: &str,
     ) -> Result<()>;
+
+    /// Rasterize one page and write it to `path` as an image file.
+    ///
+    /// The file is written here rather than returned as bytes: a page at print
+    /// resolution is tens of megabytes, and pushing that through the engine's
+    /// response channel would cost more than writing it once.
+    fn export_page_image(
+        &mut self,
+        handle: DocumentHandle,
+        page: u32,
+        rotation: Rotation,
+        scale: f32,
+        format: ImageFormat,
+        path: &Path,
+    ) -> Result<()>;
+
+    /// Rasterize every page into `dir`, named `<stem>-0001.<ext>` and so on.
+    ///
+    /// The caller supplies the name stem because the engine knows documents by
+    /// handle and would otherwise have to invent a name that could collide.
+    /// Returns the number of files written.
+    fn export_all_pages(
+        &mut self,
+        handle: DocumentHandle,
+        dir: &Path,
+        stem: &str,
+        rotation: Rotation,
+        scale: f32,
+        format: ImageFormat,
+        job: &mut JobProgress<'_>,
+    ) -> Result<u32>;
+
+    /// Serialise a page range as a standalone PDF.
+    ///
+    /// `None` means the whole document, which is a byte copy of the original
+    /// rather than a rebuild.
+    fn export_pages_to_bytes(
+        &mut self,
+        handle: DocumentHandle,
+        range: Option<PageRange>,
+    ) -> Result<Vec<u8>>;
+
+    /// Concatenate `sources` into `output`, in the order given.
+    ///
+    /// Returns the number of pages written.
+    fn merge_pdfs(
+        &mut self,
+        sources: &[PathBuf],
+        output: &Path,
+        job: &mut JobProgress<'_>,
+    ) -> Result<u32>;
+
+    /// Build a PDF with one page per image, each page exactly the image's size.
+    ///
+    /// `scale` is points per pixel. Returns the number of pages written.
+    fn images_to_pdf(
+        &mut self,
+        images: &[PathBuf],
+        output: &Path,
+        scale: f32,
+        job: &mut JobProgress<'_>,
+    ) -> Result<u32>;
 }
 
 /// PDFium-backed engine.
@@ -242,6 +304,15 @@ impl PdfiumEngine {
             .clear_before_rendering(true)
             .set_clear_color(PdfColor::WHITE)
     }
+
+    /// Point size of a page, for the checks that must happen before rendering.
+    ///
+    /// Rotation would swap the two values, but every caller here cares about
+    /// their product, so the unrotated size is the honest answer.
+    fn page_size(&self, handle: DocumentHandle, index: u32) -> Result<(f32, f32)> {
+        let page = page_of(self.document(handle)?, index)?;
+        Ok((page.width().value, page.height().value))
+    }
 }
 
 impl PdfEngine for PdfiumEngine {
@@ -252,38 +323,8 @@ impl PdfEngine for PdfiumEngine {
     ) -> Result<(DocumentHandle, DocumentInfo)> {
         let document = match self.pdfium.load_pdf_from_file(path, passphrase) {
             Ok(document) => document,
-            // PDFium reports both "no password supplied" and "wrong password"
-            // through the same internal code, so disambiguate using whether we
-            // already tried one.
-            Err(PdfiumError::PdfiumLibraryInternalError(PdfiumInternalError::PasswordError)) => {
-                return Err(if passphrase.is_some() {
-                    EngineError::BadPassword
-                } else {
-                    EngineError::PasswordRequired
-                });
-            }
-            // Report failures in terms a user can act on, not PDFium internals.
-            Err(PdfiumError::IoError(inner)) => {
-                return Err(EngineError::Io {
-                    path: path.to_path_buf(),
-                    reason: inner.to_string(),
-                });
-            }
-            Err(PdfiumError::PdfiumLibraryInternalError(inner)) => {
-                let reason = match inner {
-                    PdfiumInternalError::FileError => "the file could not be read",
-                    PdfiumInternalError::FormatError => "the file is damaged or is not a PDF",
-                    PdfiumInternalError::SecurityError => {
-                        "the file uses an unsupported security scheme"
-                    }
-                    _ => "the file could not be opened",
-                };
-                return Err(EngineError::Malformed(reason.to_string()));
-            }
-            Err(_) => {
-                return Err(EngineError::Malformed(
-                    "the file could not be opened".to_string(),
-                ));
+            Err(error) => {
+                return Err(export::map_load_error(path, error, passphrase.is_some()));
             }
         };
 
@@ -613,6 +654,101 @@ impl PdfEngine for PdfiumEngine {
             words: Vec::new(),
             lines: Vec::new(),
         })
+    }
+
+    fn export_page_image(
+        &mut self,
+        handle: DocumentHandle,
+        page: u32,
+        rotation: Rotation,
+        scale: f32,
+        format: ImageFormat,
+        path: &Path,
+    ) -> Result<()> {
+        let (width, height) = self.page_size(handle, page)?;
+        export::check_render_budget(width, height, scale)?;
+
+        let tile = self.render_page(handle, page, rotation, scale)?;
+        export::write_page_image(&tile, format, path)
+    }
+
+    fn export_all_pages(
+        &mut self,
+        handle: DocumentHandle,
+        dir: &Path,
+        stem: &str,
+        rotation: Rotation,
+        scale: f32,
+        format: ImageFormat,
+        job: &mut JobProgress<'_>,
+    ) -> Result<u32> {
+        // A job cancelled before it started should cost nothing at all, not a
+        // full pass of pre-flight checks over a 500-page document.
+        job.check()?;
+
+        // Check every page up front: finding out on page 400 that the last one
+        // is too large would leave the user with a directory of partial output
+        // and no idea which page was the problem.
+        let count = u32::try_from(self.document(handle)?.pages().len()).unwrap_or(0);
+        for index in 0..count {
+            let (width, height) = self.page_size(handle, index)?;
+            export::check_render_budget(width, height, scale)?;
+        }
+
+        std::fs::create_dir_all(dir).map_err(|error| EngineError::Io {
+            path: dir.to_path_buf(),
+            reason: error.to_string(),
+        })?;
+
+        for index in 0..count {
+            job.check()?;
+
+            let tile = self.render_page(handle, index, rotation, scale)?;
+            let path = dir.join(export::page_file_name(stem, index, format));
+            export::write_page_image(&tile, format, &path)?;
+
+            job.step(index + 1, count);
+        }
+
+        Ok(count)
+    }
+
+    fn export_pages_to_bytes(
+        &mut self,
+        handle: DocumentHandle,
+        range: Option<PageRange>,
+    ) -> Result<Vec<u8>> {
+        // Destructured so the document map and the `Pdfium` are borrowed as
+        // disjoint fields; the destination document is created from `pdfium`
+        // while `documents` is still borrowed by the source.
+        let Self {
+            pdfium, documents, ..
+        } = self;
+
+        let document = documents
+            .get(&handle)
+            .ok_or(EngineError::NotOpen(handle.raw()))?;
+
+        export::export_range(pdfium, document, range)
+    }
+
+    fn merge_pdfs(
+        &mut self,
+        sources: &[PathBuf],
+        output: &Path,
+        job: &mut JobProgress<'_>,
+    ) -> Result<u32> {
+        export::merge_pdfs(self.pdfium, sources, output, job)
+    }
+
+    fn images_to_pdf(
+        &mut self,
+        images: &[PathBuf],
+        output: &Path,
+        scale: f32,
+        job: &mut JobProgress<'_>,
+    ) -> Result<u32> {
+        export::images_to_pdf(self.pdfium, images, output, scale, job)
     }
 }
 

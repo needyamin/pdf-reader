@@ -9,9 +9,9 @@ use egui::{
     ViewportCommand,
 };
 use pdfreader_core::{
-    AnnotationId, AnnotationInfo, AnnotationKind, AppState, Command, DocumentId, FieldId, FieldValue,
-    FormFieldInfo, FormFieldType, FormInfo, Outline, OutlineNode, SidebarTab, Tab, ThemeId, Tool,
-    ViewMode, ZoomMode,
+    AnnotationId, AnnotationInfo, AnnotationKind, AppState, Command, DocumentId, FieldId,
+    FieldValue, FormFieldInfo, FormFieldType, FormInfo, ImageFormat, Outline, OutlineNode,
+    SidebarTab, Tab, ThemeId, Tool, ViewMode, ZoomMode,
 };
 
 use crate::theme::Palette;
@@ -54,13 +54,142 @@ pub enum Icon {
     Pan,
     More,
     Undo,
+    Redo,
+}
+
+/// The Edit menu: the annotation history, enabled only when there is history.
+///
+/// Kept out of [`menu_bar`] so that function stays readable; every other menu
+/// follows the same shape.
+fn edit_menu(ui: &mut Ui, state: &AppState) -> Vec<Command> {
+    let mut commands = Vec::new();
+    let undoable = state.active().is_some_and(|tab| !tab.undo_stack.is_empty());
+    let redoable = state.active().is_some_and(|tab| !tab.redo_stack.is_empty());
+    if ui
+        .add_enabled(undoable, menu_item_button("Undo", "Ctrl+Z"))
+        .clicked()
+    {
+        commands.push(Command::Undo);
+        ui.close();
+    }
+    if ui
+        .add_enabled(redoable, menu_item_button("Redo", "Ctrl+Shift+Z"))
+        .clicked()
+    {
+        commands.push(Command::Redo);
+        ui.close();
+    }
+    commands
+}
+
+/// The File menu: documents in and out, and everything that turns what is open
+/// into a new file.
+///
+/// Kept out of [`menu_bar`] for the same reason as [`edit_menu`]: the export
+/// and print entries are longer than the whole rest of the menu bar.
+fn file_menu(ui: &mut Ui, state: &AppState) -> Vec<Command> {
+    let mut commands = Vec::new();
+    let has_doc = state.active().is_some_and(|t| t.document.is_some());
+    let has_tab = state.active_tab.is_some();
+
+    if menu_item(ui, "Open document…", "Ctrl+O").clicked() {
+        commands.push(Command::ShowOpenDialog);
+        ui.close();
+    }
+
+    ui.add_enabled_ui(has_doc, |ui| {
+        if menu_item(ui, "Save", "Ctrl+S").clicked() {
+            commands.push(Command::SaveDocument);
+            ui.close();
+        }
+        if menu_item(ui, "Save as…", "Ctrl+Shift+S").clicked() {
+            commands.push(Command::SaveDocumentAs);
+            ui.close();
+        }
+        if menu_item(ui, "Flatten form and annotations", "").clicked() {
+            commands.push(Command::FlattenDocument);
+            ui.close();
+        }
+
+        ui.separator();
+        ui.menu_button("Export", |ui| {
+            export_menu(ui, &mut commands);
+        });
+
+        ui.separator();
+        if menu_item(ui, "Print…", "Ctrl+P").clicked() {
+            commands.push(Command::Print);
+            ui.close();
+        }
+        if menu_item(ui, "Print current page", "").clicked() {
+            commands.push(Command::PrintCurrentPage);
+            ui.close();
+        }
+    });
+
+    // Composition needs no open document: the inputs are files the user picks
+    // and the result is a new file, so this is available from an empty window.
+    ui.separator();
+    if menu_item(ui, "Create PDF from images…", "").clicked() {
+        commands.push(Command::ShowImagesToPdfDialog);
+        ui.close();
+    }
+    if menu_item(ui, "Merge PDFs…", "").clicked() {
+        commands.push(Command::ShowMergeDialog);
+        ui.close();
+    }
+
+    ui.separator();
+    ui.add_enabled_ui(has_tab, |ui| {
+        if menu_item(ui, "Close tab", "Ctrl+W").clicked() {
+            if let Some(id) = state.active_tab {
+                commands.push(Command::RequestCloseTab(id));
+            }
+            ui.close();
+        }
+    });
+
+    ui.separator();
+    if menu_item(ui, "Exit", "Alt+F4").clicked() {
+        ui.ctx().send_viewport_cmd(ViewportCommand::Close);
+        ui.close();
+    }
+
+    commands
+}
+
+/// The Export submenu. Everything here writes a *new* file rather than
+/// updating the open one, which is what separates it from Save.
+///
+/// The image entries are generated from [`ImageFormat::ALL`] so that adding a
+/// format in the domain model adds its menu entries here.
+fn export_menu(ui: &mut Ui, commands: &mut Vec<Command>) {
+    for format in ImageFormat::ALL {
+        if menu_item(ui, &format!("Page as {}…", format.label()), "").clicked() {
+            commands.push(Command::ShowExportImageDialog(format));
+            ui.close();
+        }
+    }
+
+    ui.separator();
+    for format in ImageFormat::ALL {
+        if menu_item(ui, &format!("All pages as {}…", format.label()), "").clicked() {
+            commands.push(Command::ShowExportAllPagesDialog(format));
+            ui.close();
+        }
+    }
+
+    ui.separator();
+    if menu_item(ui, "Current page as PDF…", "").clicked() {
+        commands.push(Command::ShowExportPagesPdfDialog);
+        ui.close();
+    }
 }
 
 /// Top-level application menu.
 pub fn menu_bar(ui: &mut Ui, state: &AppState, palette: &Palette) -> Vec<Command> {
     let mut commands = Vec::new();
     let has_doc = state.active().is_some_and(|t| t.document.is_some());
-    let has_tab = state.active_tab.is_some();
     let zoom_mode = state.active().map(|t| t.view.zoom_mode);
     let view_mode = state.active().map(|t| t.view.mode);
     let (page, page_count) = state
@@ -78,38 +207,10 @@ pub fn menu_bar(ui: &mut Ui, state: &AppState, palette: &Palette) -> Vec<Command
             );
             ui.add_space(8.0);
             menu_button(ui, palette, "File", |ui| {
-                if menu_item(ui, "Open document…", "Ctrl+O").clicked() {
-                    commands.push(Command::ShowOpenDialog);
-                    ui.close();
-                }
-                ui.add_enabled_ui(has_doc, |ui| {
-                    if menu_item(ui, "Save", "Ctrl+S").clicked() {
-                        commands.push(Command::SaveDocument);
-                        ui.close();
-                    }
-                    if menu_item(ui, "Save as…", "Ctrl+Shift+S").clicked() {
-                        commands.push(Command::SaveDocumentAs);
-                        ui.close();
-                    }
-                    if menu_item(ui, "Flatten form and annotations", "").clicked() {
-                        commands.push(Command::FlattenDocument);
-                        ui.close();
-                    }
-                });
-                ui.separator();
-                ui.add_enabled_ui(has_tab, |ui| {
-                    if menu_item(ui, "Close tab", "Ctrl+W").clicked() {
-                        if let Some(id) = state.active_tab {
-                            commands.push(Command::RequestCloseTab(id));
-                        }
-                        ui.close();
-                    }
-                });
-                ui.separator();
-                if menu_item(ui, "Exit", "Alt+F4").clicked() {
-                    ui.ctx().send_viewport_cmd(ViewportCommand::Close);
-                    ui.close();
-                }
+                commands.extend(file_menu(ui, state));
+            });
+            menu_button(ui, palette, "Edit", |ui| {
+                commands.extend(edit_menu(ui, state));
             });
             menu_button(ui, palette, "Go", |ui| {
                 ui.add_enabled_ui(has_doc, |ui| {
@@ -724,29 +825,35 @@ pub fn annotation_bar(ui: &mut Ui, palette: &Palette, state: &AppState) -> Vec<C
                     }
                 }
                 ui.separator();
-                let undoable = state
-                    .active()
-                    .is_some_and(|tab| !tab.undo_stack.is_empty());
-                let undo_response = ui.add_enabled(
-                    undoable,
-                    egui::Button::new("")
-                        .min_size(Vec2::new(28.0, 22.0))
-                        .fill(if undoable {
-                            palette.accent_soft
-                        } else {
-                            Color32::TRANSPARENT
-                        })
-                        .corner_radius(4.0),
-                );
-                if undo_response.clicked() && undoable {
-                    commands.push(Command::Undo);
+                let undoable = state.active().is_some_and(|tab| !tab.undo_stack.is_empty());
+                let redoable = state.active().is_some_and(|tab| !tab.redo_stack.is_empty());
+                for (enabled, icon, command, tooltip) in [
+                    (undoable, Icon::Undo, Command::Undo, "Undo (Ctrl+Z)"),
+                    (redoable, Icon::Redo, Command::Redo, "Redo (Ctrl+Shift+Z)"),
+                ] {
+                    let response = ui
+                        .add_enabled(
+                            enabled,
+                            egui::Button::new("")
+                                .min_size(Vec2::new(28.0, 22.0))
+                                .fill(if enabled {
+                                    palette.accent_soft
+                                } else {
+                                    Color32::TRANSPARENT
+                                })
+                                .corner_radius(4.0),
+                        )
+                        .on_hover_text(tooltip);
+                    if response.clicked() && enabled {
+                        commands.push(command);
+                    }
+                    draw_icon(
+                        ui.painter(),
+                        response.rect.center(),
+                        icon,
+                        if enabled { palette.text } else { palette.text_dim },
+                    );
                 }
-                draw_icon(
-                    ui.painter(),
-                    undo_response.rect.center(),
-                    Icon::Undo,
-                    if undoable { palette.text } else { palette.text_dim },
-                );
             });
         });
     commands
@@ -1706,6 +1813,27 @@ fn draw_icon(painter: &egui::Painter, center: Pos2, icon: Icon, color: Color32) 
                     c + Vec2::new(-6.5, -6.5),
                     c + Vec2::new(-6.0, -1.5),
                     c + Vec2::new(-1.5, -2.0),
+                ],
+                stroke,
+            );
+        }
+        // The same glyph mirrored: the sweep runs the other way and the
+        // arrowhead sits top-right, which is what "step forward" looks like.
+        Icon::Redo => {
+            let radius = 5.5;
+            let points: Vec<Pos2> = (0..=10)
+                .map(|i| {
+                    let angle = -0.6 + (i as f32 / 10.0) * 4.4; // radians, CCW
+                    c + Vec2::new(-(angle.cos() * radius), -angle.sin() * radius)
+                })
+                .collect();
+            painter.line(points, stroke);
+            // Arrowhead at the sweep's start (top-right), pointing right-down.
+            painter.line(
+                vec![
+                    c + Vec2::new(6.5, -6.5),
+                    c + Vec2::new(6.0, -1.5),
+                    c + Vec2::new(1.5, -2.0),
                 ],
                 stroke,
             );

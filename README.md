@@ -23,6 +23,9 @@ GPU renderer built for large documents.
   ladder, so zoom and scroll reuse cached bitmaps.
 - Continuous and single-page modes.
 - Zoom from 10% to 3200%, with **fit width** and **fit page**.
+- `Ctrl +` / `Ctrl -` / `Ctrl 0` zoom the **page**, not the interface: egui's
+  whole-GUI zoom is switched off at startup, so menus and toolbars keep their
+  size however far the document is scaled.
 - Rotate clockwise / counter-clockwise.
 - Crisp on HiDPI displays (tiles are rendered at the device pixel ratio).
 - Smooth scrolling on large documents; stale tiles are cancelled by a
@@ -46,6 +49,9 @@ GPU renderer built for large documents.
   shift-click the row).
 - Annotations are real PDF annotations, so they survive Save and are visible in
   every other viewer. Flattening bakes them into the page.
+- **Undo** (`Ctrl+Z`) and **Redo** (`Ctrl+Shift+Z`, or `Ctrl+Y`) step through
+  creates, deletes and text edits one at a time. A new edit clears the redo
+  history, so redo can only ever re-apply what was just undone.
 
 ### Form fields
 
@@ -87,12 +93,32 @@ GPU renderer built for large documents.
 - Closing a tab with unsaved changes prompts first — Save and close, Discard,
   or Cancel.
 
+### Export, print and compose
+
+- **Save a page as an image** — PNG or JPEG, rendered at 300 dpi rather than at
+  the on-screen zoom, so the file is the resolution the page deserves instead of
+  a thumbnail of whatever the view happened to be.
+- **Save every page as an image** — one file per page, named
+  `<document>-0001.png` and so on, into a directory you pick.
+- **Export the current page to PDF** — a new one-page document containing just
+  that page.
+- **Print** (`Ctrl+P`) the whole document, or the current page, by handing a
+  temporary PDF to the system print handler. There is no silent printing: the
+  shell always shows its own printer dialog.
+- **Create a PDF from images** — pick any number of PNG/JPEG files; each becomes
+  one page, sized so a 96 dpi image keeps the size it had on screen.
+- **Merge PDFs** — pick several documents and combine them into one, in the
+  order they are listed.
+
+All of these live under the File menu. Long jobs run on the engine thread and
+report progress in the status bar with a Cancel button. Every export refuses to
+start if it would have to render more than 100 megapixels, which is what stops
+an accidental 3200% zoom from allocating gigabytes before failing.
+
 ### Appearance
 
 - Six themes: Dark, Light, Midnight, Rose, Forest, Sunset.
 - Theme and sidebar visibility persist between runs.
-
-##
 
 ## Build and run
 
@@ -113,6 +139,20 @@ To open a file directly:
 
 ```bash
 cargo run -p pdfreader-app -- path/to/document.pdf
+```
+
+### Application icon
+
+`assets/icon.png` is embedded into the binary and handed to the window at
+startup, so the title bar, taskbar and Alt-Tab entries are branded even when the
+executable is moved away from `assets/`. On Windows `assets/icon.ico` is
+additionally compiled into the executable as a resource by
+`crates/app/build.rs`, which is what makes Explorer show the icon for the file
+itself. Both happen automatically on build and rebuild when either asset
+changes. To confirm the resource made it into a built binary:
+
+```bash
+python tools/check_exe_icon.py target/debug/pdf-reader.exe
 ```
 
 ### Try the form features
@@ -155,6 +195,12 @@ type, each with a real appearance stream. The form-detection tests in
 and widget rectangles against it. Tests skip cleanly when the fixtures (or the
   
 PDFium library) are absent.
+
+`crates/pdf/tests/export.rs` covers the output side the same way: it merges a
+document with itself and checks the page count doubles, extracts a single page
+and checks it is a one-page document, writes a page image and decodes it back,
+turns images into a PDF and checks the page count, and cancels a long job
+mid-flight to prove it stops before the next item rather than after the last.
 
 ## Architecture
 
