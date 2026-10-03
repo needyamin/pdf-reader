@@ -419,37 +419,37 @@ impl PdfEngine for PdfiumEngine {
                             .set_value(&text)
                             .map_err(|error| EngineError::Pdfium(error.to_string()))
                     }),
-            pdfreader_core::FieldValue::Checked(on) => {
-                // Selecting a radio button means checking that widget; PDFium's
-                // radio group deselects its siblings. Unchecking one outright
-                // has no setter, so radios are toggle-on only.
-                if let Some(checkbox) = field.as_checkbox_field_mut() {
-                    checkbox
-                        .set_checked(on)
-                        .map_err(|error| EngineError::Pdfium(error.to_string()))
-                } else if let Some(radio) = field.as_radio_button_field_mut() {
-                    if on {
-                        radio
-                            .set_checked()
+                pdfreader_core::FieldValue::Checked(on) => {
+                    // Selecting a radio button means checking that widget; PDFium's
+                    // radio group deselects its siblings. Unchecking one outright
+                    // has no setter, so radios are toggle-on only.
+                    if let Some(checkbox) = field.as_checkbox_field_mut() {
+                        checkbox
+                            .set_checked(on)
                             .map_err(|error| EngineError::Pdfium(error.to_string()))
+                    } else if let Some(radio) = field.as_radio_button_field_mut() {
+                        if on {
+                            radio
+                                .set_checked()
+                                .map_err(|error| EngineError::Pdfium(error.to_string()))
+                        } else {
+                            Err(EngineError::Unsupported(
+                                "clearing a radio button".to_string(),
+                            ))
+                        }
                     } else {
-                        Err(EngineError::Unsupported(
-                            "clearing a radio button".to_string(),
-                        ))
+                        Err(EngineError::Unsupported("editing this widget".to_string()))
                     }
-                } else {
-                    Err(EngineError::Unsupported("editing this widget".to_string()))
                 }
-            }
-            // pdfium-render exposes combo and list box fields read-only, so a
-            // choice cannot be written back through the safe binding.
-            pdfreader_core::FieldValue::Choice(_) => Err(EngineError::Unsupported(
-                "changing a dropdown or list selection".to_string(),
-            )),
-            pdfreader_core::FieldValue::Empty => Err(EngineError::Unsupported(
-                "clearing this widget".to_string(),
-            )),
-        };
+                // pdfium-render exposes combo and list box fields read-only, so a
+                // choice cannot be written back through the safe binding.
+                pdfreader_core::FieldValue::Choice(_) => Err(EngineError::Unsupported(
+                    "changing a dropdown or list selection".to_string(),
+                )),
+                pdfreader_core::FieldValue::Empty => {
+                    Err(EngineError::Unsupported("clearing this widget".to_string()))
+                }
+            };
             (outcome, shared_name)
         };
 

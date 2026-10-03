@@ -32,6 +32,26 @@ const BUTTON_RADIUS: u8 = 7;
 const RAIL_RADIUS: u8 = 2;
 const ICON_SIZE: f32 = 30.0;
 
+/// Height of the find field. It is sized to *fit* the toolbar row rather than
+/// to match the 30 px icon buttons: the toolbar reserves [`TOOLBAR_HEIGHT`]
+/// minus [`TOOLBAR_PAD_Y`] on each side, and a taller box pushes the row past
+/// that and lets the field spill under the strip below it.
+const SEARCH_FIELD_HEIGHT: f32 = 26.0;
+/// Vertical padding the toolbar puts above and below its controls. It is what
+/// is left of [`TOOLBAR_HEIGHT`] once the tallest control has its 32 px, so
+/// the row fits the strip instead of spilling under the section below it.
+const TOOLBAR_PAD_Y: i8 = 4;
+/// Horizontal padding inside the find field, around the addon and the text.
+/// Whole pixels: this is the `Margin` around the text as well as the geometry
+/// of the addon, and `Margin` counts in integers.
+const SEARCH_FIELD_PAD: i8 = 8;
+/// Width reserved for the magnifier glyph in the addon.
+const SEARCH_ICON_WIDTH: f32 = 13.0;
+/// Gap between the magnifier and the "Find" label.
+const SEARCH_ADDON_GAP: f32 = 5.0;
+/// Width of the clear button at the right edge of the field.
+const SEARCH_CLEAR_WIDTH: f32 = 22.0;
+
 /// A small internally drawn icon set. Keeping the icons in one painter-based
 /// system avoids mixing unrelated glyph fonts and keeps stroke weight stable
 /// across Windows, macOS, Linux, and high-DPI displays.
@@ -336,7 +356,7 @@ pub fn toolbar(
 
     egui::Frame::new()
         .fill(palette.panel_bg)
-        .inner_margin(egui::Margin::symmetric(10, 7))
+        .inner_margin(egui::Margin::symmetric(10, TOOLBAR_PAD_Y))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;
@@ -473,32 +493,18 @@ pub fn toolbar(
 
                 separator(ui, palette);
                 ui.add_enabled_ui(has_doc, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new("Find").color(palette.text_dim).size(11.0));
-                        let response = ui.add_sized(
-                            Vec2::new(if compact { 112.0 } else { 168.0 }, 30.0),
-                            egui::TextEdit::singleline(search_query).hint_text("Search document"),
-                        );
-                        if response.has_focus()
-                            && ui.input(|input| input.key_pressed(egui::Key::Enter))
-                        {
-                            commands.push(Command::Search(search_query.trim().to_owned()));
-                        }
-                        if !search_query.is_empty()
-                            && icon_button(
-                                ui,
-                                palette,
-                                Icon::Close,
-                                "Clear",
-                                "Clear search",
-                                false,
-                                true,
-                            )
-                        {
-                            search_query.clear();
-                            commands.push(Command::Search(String::new()));
-                        }
-                    });
+                    // Bootstrap-style input-group: the label lives inside the
+                    // box as its leading addon, so the field carries its own
+                    // caption and the toolbar keeps the space a separate
+                    // "Find" label used to take.
+                    let width = if compact { 186.0 } else { 240.0 };
+                    let outcome = search_field(ui, palette, search_query, width, "Search document");
+                    if outcome.submitted {
+                        commands.push(Command::Search(search_query.trim().to_owned()));
+                    }
+                    if outcome.cleared {
+                        commands.push(Command::Search(String::new()));
+                    }
                 });
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -539,6 +545,156 @@ pub fn toolbar(
         });
 
     commands
+}
+
+/// What the reader did inside a [`search_field`] this frame.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct SearchFieldOutput {
+    /// Enter was pressed while the field had focus: run the query.
+    pub submitted: bool,
+    /// The clear button was pressed. The query has already been emptied, so the
+    /// caller only has to drop the results the old query produced.
+    pub cleared: bool,
+}
+
+/// The find box: a Bootstrap-style `input-group`, so one bordered control holds
+/// the leading addon (a magnifier and the word "Find"), the query itself, and a
+/// clear button that appears only once there is something to clear.
+///
+/// Both the toolbar and the Search sidebar call this. That is deliberate: two
+/// find boxes that are the same call cannot drift apart the way two hand-built
+/// copies do.
+pub fn search_field(
+    ui: &mut Ui,
+    palette: &Palette,
+    query: &mut String,
+    width: f32,
+    hint: &str,
+) -> SearchFieldOutput {
+    let mut output = SearchFieldOutput::default();
+    let addon_width = search_addon_width(ui, palette);
+    let clear_width = if query.is_empty() {
+        0.0
+    } else {
+        SEARCH_CLEAR_WIDTH
+    };
+    let text_width = (width - addon_width - clear_width).max(64.0);
+
+    // Focus is only known once the field has been laid out, but the border
+    // that shows it belongs to the group, so it is remembered and stroked
+    // after the frame.
+    let mut focused = false;
+    let frame = egui::Frame::new()
+        .fill(palette.surface)
+        .corner_radius(BUTTON_RADIUS)
+        .show(ui, |ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            ui.horizontal(|ui| {
+                let (addon, _) = ui.allocate_exact_size(
+                    Vec2::new(addon_width, SEARCH_FIELD_HEIGHT),
+                    Sense::hover(),
+                );
+                // Bootstrap rounds the addon on the outer edge only; its right
+                // side meets the divider at a square corner.
+                ui.painter().rect_filled(
+                    addon,
+                    egui::CornerRadius {
+                        nw: BUTTON_RADIUS,
+                        sw: BUTTON_RADIUS,
+                        ne: 0,
+                        se: 0,
+                    },
+                    palette.surface_hover,
+                );
+                let pad = f32::from(SEARCH_FIELD_PAD);
+                draw_icon(
+                    ui.painter(),
+                    addon.left_center() + Vec2::new(pad + SEARCH_ICON_WIDTH / 2.0, 0.0),
+                    Icon::Search,
+                    palette.text_dim,
+                );
+                ui.painter().text(
+                    Pos2::new(
+                        addon.left() + pad + SEARCH_ICON_WIDTH + SEARCH_ADDON_GAP,
+                        addon.center().y,
+                    ),
+                    Align2::LEFT_CENTER,
+                    "Find",
+                    FontId::new(11.0, egui::FontFamily::Proportional),
+                    palette.text_dim,
+                );
+                ui.painter().line_segment(
+                    [addon.right_top(), addon.right_bottom()],
+                    Stroke::new(1.0, palette.border),
+                );
+
+                let response = ui.add_sized(
+                    Vec2::new(text_width, SEARCH_FIELD_HEIGHT),
+                    egui::TextEdit::singleline(query)
+                        // The group is the frame. A second one would draw a box
+                        // inside the box.
+                        .frame(
+                            egui::Frame::new()
+                                .inner_margin(egui::Margin::symmetric(SEARCH_FIELD_PAD, 0)),
+                        )
+                        .vertical_align(egui::Align::Center)
+                        .font(FontId::new(12.0, egui::FontFamily::Proportional))
+                        .hint_text(hint),
+                );
+                focused = response.has_focus();
+                // A single-line field surrenders focus when Enter is pressed,
+                // so by the time the key is seen it no longer *has* focus —
+                // losing it this frame is what marks the submit. This is the
+                // pairing egui documents for `TextEdit`.
+                if response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+                    output.submitted = true;
+                }
+
+                if !query.is_empty() {
+                    let clear = ui.add_sized(
+                        Vec2::new(SEARCH_CLEAR_WIDTH, SEARCH_FIELD_HEIGHT),
+                        egui::Button::new(RichText::new("×").size(14.0).color(palette.text_dim))
+                            .fill(Color32::TRANSPARENT)
+                            .corner_radius(0.0),
+                    );
+                    if clear.on_hover_text("Clear search").clicked() {
+                        query.clear();
+                        output.cleared = true;
+                    }
+                }
+            });
+        });
+
+    ui.painter().rect_stroke(
+        frame.response.rect,
+        BUTTON_RADIUS,
+        Stroke::new(
+            1.0,
+            if focused {
+                palette.accent
+            } else {
+                palette.border
+            },
+        ),
+        StrokeKind::Inside,
+    );
+
+    output
+}
+
+/// Width of the "Find" addon: pad, magnifier, gap, label, pad. The label is
+/// measured against the real font, so it cannot clip at another UI scale.
+fn search_addon_width(ui: &Ui, palette: &Palette) -> f32 {
+    let label = ui
+        .painter()
+        .layout_no_wrap(
+            "Find".to_owned(),
+            FontId::new(11.0, egui::FontFamily::Proportional),
+            palette.text_dim,
+        )
+        .size()
+        .x;
+    f32::from(SEARCH_FIELD_PAD) * 2.0 + SEARCH_ICON_WIDTH + SEARCH_ADDON_GAP + label
 }
 
 /// Zoom control with reading-friendly presets.
@@ -808,7 +964,11 @@ pub fn annotation_bar(ui: &mut Ui, palette: &Palette, state: &AppState) -> Vec<C
                         palette.text
                     });
                     let button = egui::Button::new(label)
-                        .fill(if active { palette.accent_soft } else { Color32::TRANSPARENT })
+                        .fill(if active {
+                            palette.accent_soft
+                        } else {
+                            Color32::TRANSPARENT
+                        })
                         .corner_radius(4.0);
                     if ui.add(button).clicked() {
                         commands.push(Command::SetTool(tool));
@@ -841,7 +1001,11 @@ pub fn annotation_bar(ui: &mut Ui, palette: &Palette, state: &AppState) -> Vec<C
                         ui.painter(),
                         response.rect.center(),
                         icon,
-                        if enabled { palette.text } else { palette.text_dim },
+                        if enabled {
+                            palette.text
+                        } else {
+                            palette.text_dim
+                        },
                     );
                 }
             });
@@ -897,8 +1061,7 @@ pub fn comments_panel(
                     ui.spacing_mut().item_spacing.y = 2.0;
                     for annotation in annotations {
                         let is_selected = selected == Some(annotation.id);
-                        let response =
-                            show_comment_row(ui, palette, annotation, is_selected);
+                        let response = show_comment_row(ui, palette, annotation, is_selected);
                         if response.clicked() && ui.input(|i| i.modifiers.shift) {
                             // Shift-click deletes: one interaction for the
                             // most common follow-up, without a context menu.
@@ -985,7 +1148,12 @@ fn draw_comment_editor(
                 AnnotationKind::FreeText | AnnotationKind::StickyNote
             );
             if editable {
-                let key = Id::new(("comment-draft", doc.raw(), annotation.id.page, annotation.id.annot_index));
+                let key = Id::new((
+                    "comment-draft",
+                    doc.raw(),
+                    annotation.id.page,
+                    annotation.id.annot_index,
+                ));
                 let current = annotation.display_contents().to_string();
                 let mut draft = ui.memory_mut(|mem| {
                     mem.data
@@ -997,8 +1165,7 @@ fn draw_comment_editor(
                     egui::TextEdit::singleline(&mut draft).desired_width(ui.available_width()),
                 );
                 let changed = draft != current;
-                let submit =
-                    response.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                let submit = response.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                 if changed && (response.lost_focus() || submit) {
                     commands.push(Command::SetAnnotationContents {
                         id: annotation.id,
@@ -1095,9 +1262,8 @@ fn draw_text_editor(
             .clone()
     });
 
-    let response = ui.add(
-        egui::TextEdit::singleline(&mut draft).desired_width(ui.available_width()),
-    );
+    let response =
+        ui.add(egui::TextEdit::singleline(&mut draft).desired_width(ui.available_width()));
     let changed = draft != current;
     let submit = response.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
 
@@ -1128,8 +1294,17 @@ fn draw_choice_editor(
     commands: &mut Vec<Command>,
 ) {
     let current = field.value.as_text();
-    let id = Id::new(("form-choice", doc.raw(), field.id.page, field.id.annot_index));
-    let selection = if current.is_empty() { "—" } else { current.as_str() };
+    let id = Id::new((
+        "form-choice",
+        doc.raw(),
+        field.id.page,
+        field.id.annot_index,
+    ));
+    let selection = if current.is_empty() {
+        "—"
+    } else {
+        current.as_str()
+    };
 
     egui::ComboBox::new(id, "")
         .selected_text(RichText::new(selection).size(11.5))
@@ -1271,7 +1446,11 @@ fn show_form_row(
     let detail = if field.value.is_empty() {
         format!("{} · —", field.kind.label())
     } else {
-        format!("{} · {}", field.kind.label(), truncate(&field.value.as_text(), 24))
+        format!(
+            "{} · {}",
+            field.kind.label(),
+            truncate(&field.value.as_text(), 24)
+        )
     };
     // Read-only fields are marked, because a user who cannot type into a field
     // needs to be told why rather than guessing the app is broken.
@@ -1439,7 +1618,7 @@ fn toolbar_group(ui: &mut Ui, palette: &Palette, add_contents: impl FnOnce(&mut 
     egui::Frame::new()
         .fill(palette.surface.gamma_multiply(0.55))
         .corner_radius(8.0)
-        .inner_margin(egui::Margin::symmetric(3, 2))
+        .inner_margin(egui::Margin::symmetric(3, 1))
         .show(ui, add_contents);
 }
 
@@ -1459,7 +1638,7 @@ fn primary_button(ui: &mut Ui, palette: &Palette, icon: Icon, label: &str, toolt
         )
         .fill(palette.accent_soft)
         .corner_radius(BUTTON_RADIUS)
-        .min_size(Vec2::new(76.0, 32.0)),
+        .min_size(Vec2::new(76.0, 30.0)),
     );
     if response.hovered() {
         ui.painter().rect_stroke(
@@ -1856,13 +2035,178 @@ fn draw_icon(painter: &egui::Painter, center: Pos2, icon: Icon, color: Color32) 
 
 #[cfg(test)]
 mod tests {
-    use super::status_bar;
+    use super::{
+        SEARCH_FIELD_HEIGHT, SearchFieldOutput, TOOLBAR_HEIGHT, TOOLBAR_PAD_Y, search_field,
+        status_bar, toolbar,
+    };
     use crate::theme::Theme;
     use egui::{Context, RawInput, Rect};
     use pdfreader_core::{
         Command, Document, DocumentId, Effect, Outline, PageGeometry, Rotation, Store, ThemeId,
     };
     use std::path::PathBuf;
+
+    /// Width the find field is drawn at in these tests.
+    const TEST_FIELD_WIDTH: f32 = 240.0;
+
+    /// One frame of the find field: what the widget reported, and how many
+    /// primitives it painted. `pointer` is a position plus whether the primary
+    /// button is down — egui reports a click on release, so a test presses one
+    /// frame and releases the next.
+    fn find_frame(
+        ctx: &Context,
+        time: f64,
+        query: &mut String,
+        pointer: Option<(egui::Pos2, bool)>,
+        enter: bool,
+    ) -> (SearchFieldOutput, usize) {
+        let mut raw = RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(TEST_FIELD_WIDTH + 40.0, 120.0),
+            )),
+            time: Some(time),
+            ..Default::default()
+        };
+        if let Some((pos, pressed)) = pointer {
+            raw.events.push(egui::Event::PointerMoved(pos));
+            raw.events.push(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::default(),
+            });
+        }
+        if enter {
+            raw.events.push(egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::default(),
+            });
+        }
+
+        let palette = Theme::from_id(ThemeId::default()).palette;
+        let mut outcome = SearchFieldOutput::default();
+        let mut output = ctx.run_ui(raw, |ui| {
+            outcome = search_field(ui, &palette, query, TEST_FIELD_WIDTH, "Search document");
+        });
+        let shapes = output.shapes.len();
+        output.textures_delta.clear();
+        (outcome, shapes)
+    }
+
+    /// Regression: the toolbar is a `Panel::top` with an exact height of
+    /// [`TOOLBAR_HEIGHT`]. Anything taller is painted over the strip below it,
+    /// which is what made the find box look like it was slipping under the next
+    /// section. The row has to fit the strip it is given.
+    #[test]
+    fn toolbar_row_fits_its_strip() {
+        let ctx = Context::default();
+        let palette = Theme::from_id(ThemeId::default()).palette;
+        let store = store_rotated_to(Rotation::None);
+        let mut query = String::new();
+        let mut pan = false;
+
+        let raw = RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(1200.0, 80.0),
+            )),
+            time: Some(0.0),
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(raw, |ui| {
+            toolbar(ui, store.state(), &palette, &mut query, &mut pan);
+        });
+        let bottom = output
+            .shapes
+            .iter()
+            .map(|s| s.shape.visual_bounding_rect())
+            .filter(egui::Rect::is_finite)
+            .map(|r| r.max.y)
+            .fold(0.0, f32::max);
+        output.textures_delta.clear();
+
+        assert!(
+            bottom <= TOOLBAR_HEIGHT + 1.0,
+            "the toolbar row paints to {bottom:.1} px but only {TOOLBAR_HEIGHT} px are reserved"
+        );
+    }
+
+    /// The find box has to sit inside the toolbar's own padding, which is why
+    /// it is shorter than the 30 px icon buttons rather than the same height.
+    #[test]
+    fn find_field_fits_between_the_toolbar_padding() {
+        let available = TOOLBAR_HEIGHT - f32::from(TOOLBAR_PAD_Y) * 2.0;
+        assert!(
+            SEARCH_FIELD_HEIGHT <= available,
+            "the find box is {SEARCH_FIELD_HEIGHT} px but the toolbar only has {available} px"
+        );
+    }
+
+    /// Presses and releases the primary button at `pos`, which is what egui
+    /// counts as one click.
+    fn click(ctx: &Context, query: &mut String, pos: egui::Pos2) -> (SearchFieldOutput, usize) {
+        // egui ignores the pointer until it has been somewhere for a frame, so
+        // the first press of a run is not a click: warm up, then press, release.
+        find_frame(ctx, 0.0, query, None, false);
+        find_frame(ctx, 0.1, query, Some((pos, true)), false);
+        find_frame(ctx, 0.2, query, Some((pos, false)), false)
+    }
+
+    /// The field is one bordered group: an addon with the magnifier and the
+    /// word "Find", the text, and a clear button that only exists once there is
+    /// a query to clear.
+    #[test]
+    fn find_field_paints_the_group_and_the_clear_button_only_with_a_query() {
+        let ctx = Context::default();
+        let mut empty = String::new();
+        let mut filled = String::from("pdf");
+
+        let (_, empty_shapes) = find_frame(&ctx, 0.0, &mut empty, None, false);
+        let (_, filled_shapes) = find_frame(&ctx, 0.1, &mut filled, None, false);
+
+        assert!(
+            empty_shapes >= 8,
+            "an empty field still paints the group, the addon and the hint: {empty_shapes}"
+        );
+        assert!(
+            filled_shapes > empty_shapes,
+            "a query adds the text and the clear button: {filled_shapes} vs {empty_shapes}"
+        );
+    }
+
+    /// Enter runs the search — the field has no submit button, so the key is
+    /// the only way to run a query.
+    #[test]
+    fn enter_in_the_find_field_submits() {
+        let ctx = Context::default();
+        let mut query = String::from("pdf");
+
+        // Click past the addon, inside the text half, to take focus.
+        click(&ctx, &mut query, egui::pos2(140.0, 15.0));
+        let (outcome, _) = find_frame(&ctx, 0.3, &mut query, None, true);
+
+        assert!(outcome.submitted, "Enter while the field has focus submits");
+        assert!(!outcome.cleared, "submitting is not clearing");
+        assert_eq!(query, "pdf", "submitting leaves the query alone");
+    }
+
+    /// The × lives inside the group's right edge, not beside it as its own
+    /// toolbar button.
+    #[test]
+    fn clicking_the_clear_button_empties_the_query() {
+        let ctx = Context::default();
+        let mut query = String::from("pdf");
+
+        let (outcome, _) = click(&ctx, &mut query, egui::pos2(TEST_FIELD_WIDTH - 11.0, 15.0));
+
+        assert!(outcome.cleared, "the × sits inside the group's right edge");
+        assert!(query.is_empty(), "clearing empties the query itself");
+        assert!(!outcome.submitted, "clearing is not submitting");
+    }
 
     /// A store with one opened three-page document rotated to `rotation`.
     fn store_rotated_to(rotation: Rotation) -> Store {

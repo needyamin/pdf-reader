@@ -262,14 +262,7 @@ impl Store {
                     return Vec::new();
                 }
                 tab.dirty = true;
-                vec![
-                    Effect::SetField {
-                        doc,
-                        id,
-                        value,
-                    },
-                    Effect::InvalidateTiles,
-                ]
+                vec![Effect::SetField { doc, id, value }, Effect::InvalidateTiles]
             }
 
             Command::SetTool(tool) => {
@@ -1354,10 +1347,11 @@ mod tests {
         let tab = s.state().active().unwrap();
         assert_eq!(tab.view.selected_field, Some(FieldId::new(3, 1)));
         assert_eq!(tab.view.current_page, 3);
-        assert!(effects.iter().any(|e| matches!(
-            e,
-            Effect::ScrollToPage { page: 3, .. }
-        )));
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::ScrollToPage { page: 3, .. }))
+        );
 
         // Clearing the selection keeps the page where it is.
         s.dispatch(Command::SelectFormField(None));
@@ -1400,7 +1394,14 @@ mod tests {
         });
         let state = s.state();
         assert_eq!(
-            state.tab(tab).unwrap().form().unwrap().field(FieldId::new(0, 0)).unwrap().value,
+            state
+                .tab(tab)
+                .unwrap()
+                .form()
+                .unwrap()
+                .field(FieldId::new(0, 0))
+                .unwrap()
+                .value,
             FieldValue::Text("typed".into())
         );
         assert!(state.tab(tab).unwrap().dirty);
@@ -1427,7 +1428,9 @@ mod tests {
         // Clean tab: closes immediately, no prompt.
         let effects = s.dispatch(Command::RequestCloseTab(tab));
         assert!(
-            !effects.iter().any(|e| matches!(e, Effect::ConfirmClose { .. })),
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::ConfirmClose { .. })),
             "a clean tab must not prompt"
         );
         assert!(s.state().tabs.is_empty());
@@ -1442,7 +1445,11 @@ mod tests {
             t.dirty = true;
         }
         let effects = s.dispatch(Command::RequestCloseTab(tab));
-        assert!(effects.iter().any(|e| matches!(e, Effect::ConfirmClose { .. })));
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::ConfirmClose { .. }))
+        );
         assert_eq!(s.state().tabs.len(), 1, "the tab must still be open");
 
         s.dispatch(Command::ConfirmCloseTab(tab));
@@ -1475,9 +1482,7 @@ mod tests {
 
         let effects = s.dispatch(Command::AddAnnotation {
             page: 0,
-            new: crate::annotation::NewAnnotation::Highlight(Rect::from_xywh(
-                0.0, 0.0, 10.0, 10.0,
-            )),
+            new: crate::annotation::NewAnnotation::Highlight(Rect::from_xywh(0.0, 0.0, 10.0, 10.0)),
         });
         assert!(
             effects.iter().any(|e| matches!(e, Effect::InvalidateTiles)),
@@ -1499,9 +1504,9 @@ mod tests {
             "SetAnnotationContents must invalidate tiles"
         );
 
-        let effects = s.dispatch(Command::DeleteAnnotation(crate::annotation::AnnotationId::new(
-            0, 0,
-        )));
+        let effects = s.dispatch(Command::DeleteAnnotation(
+            crate::annotation::AnnotationId::new(0, 0),
+        ));
         assert!(
             effects.iter().any(|e| matches!(e, Effect::InvalidateTiles)),
             "DeleteAnnotation must invalidate tiles"
@@ -1531,13 +1536,15 @@ mod tests {
         s.state.tabs[0].annotations = Some(annotations);
 
         // Selecting an id that does not resolve is a no-op, not a selection.
-        s.dispatch(Command::SelectAnnotation(Some(crate::annotation::AnnotationId::new(
-            0, 99,
-        ))));
+        s.dispatch(Command::SelectAnnotation(Some(
+            crate::annotation::AnnotationId::new(0, 99),
+        )));
         assert_eq!(s.state.active().unwrap().view.selected_annotation, None);
 
         // A valid selection sticks.
-        s.dispatch(Command::SelectAnnotation(Some(crate::annotation::AnnotationId::new(0, 1))));
+        s.dispatch(Command::SelectAnnotation(Some(
+            crate::annotation::AnnotationId::new(0, 1),
+        )));
         assert_eq!(
             s.state.active().unwrap().view.selected_annotation,
             Some(crate::annotation::AnnotationId::new(0, 1))
@@ -1597,7 +1604,13 @@ mod tests {
         }]);
         s.dispatch(Command::AnnotationsLoadFailed { doc });
         assert_eq!(
-            s.state.tab(tab).unwrap().annotations.as_ref().unwrap().len(),
+            s.state
+                .tab(tab)
+                .unwrap()
+                .annotations
+                .as_ref()
+                .unwrap()
+                .len(),
             1,
             "an existing list survives a failed operation"
         );

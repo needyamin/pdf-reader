@@ -17,8 +17,8 @@ pub use error::EngineError;
 pub use export::{JobProgress, MAX_EXPORT_MEGAPIXELS};
 // The annotation and form domain types live in `core` so the UI can use them
 // without PDFium; this crate only converts PDFium's objects into them.
-pub use pdfreader_core::{AnnotationId, AnnotationInfo, AnnotationKind, NewAnnotation};
 pub use geometry::Rect;
+pub use pdfreader_core::{AnnotationId, AnnotationInfo, AnnotationKind, NewAnnotation};
 pub use text::{CharBox, Line, Span, TextPage};
 
 /// Result type used throughout this crate.

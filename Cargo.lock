@@ -4894,6 +4894,7 @@ dependencies = [
  "anyhow",
  "clap",
  "flate2",
+ "image",
  "sha2",
  "tar",
  "ureq",

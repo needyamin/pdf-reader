@@ -270,12 +270,24 @@ mod tests {
     fn drag_tools_and_click_tools_are_distinct() {
         for tool in Tool::ALL {
             if matches!(tool, Tool::StickyNote | Tool::Select) {
-                assert!(!tool.annotation_kind().is_some_and(AnnotationKind::is_drag_created));
+                assert!(
+                    !tool
+                        .annotation_kind()
+                        .is_some_and(AnnotationKind::is_drag_created)
+                );
             }
         }
         // The drag tools all report drag-created markup kinds.
-        assert!(Tool::Highlight.annotation_kind().is_some_and(AnnotationKind::is_drag_created));
-        assert!(Tool::Square.annotation_kind().is_some_and(AnnotationKind::is_drag_created));
+        assert!(
+            Tool::Highlight
+                .annotation_kind()
+                .is_some_and(AnnotationKind::is_drag_created)
+        );
+        assert!(
+            Tool::Square
+                .annotation_kind()
+                .is_some_and(AnnotationKind::is_drag_created)
+        );
         // Sticky notes are placed by click, not drag.
         assert!(!AnnotationKind::StickyNote.is_drag_created());
     }
@@ -283,9 +295,15 @@ mod tests {
     #[test]
     fn new_annotation_reports_its_kind_and_rect() {
         let rect = Rect::from_xywh(0.0, 0.0, 10.0, 10.0);
-        assert_eq!(NewAnnotation::Highlight(rect).kind(), AnnotationKind::Highlight);
+        assert_eq!(
+            NewAnnotation::Highlight(rect).kind(),
+            AnnotationKind::Highlight
+        );
         assert_eq!(NewAnnotation::Square(rect).rect(), Some(rect));
-        assert_eq!(NewAnnotation::StickyNote((5.0, 5.0), "n".into()).rect(), None);
+        assert_eq!(
+            NewAnnotation::StickyNote((5.0, 5.0), "n".into()).rect(),
+            None
+        );
     }
 
     #[test]

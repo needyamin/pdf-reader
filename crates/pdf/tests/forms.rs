@@ -35,10 +35,7 @@ fn find_pdfium() -> Option<PathBuf> {
 
 /// Skip a test with a clear message when its fixture is missing.
 fn require_fixture(name: &str) -> PathBuf {
-    let path = workspace_root()
-        .join("target")
-        .join("test-pdfs")
-        .join(name);
+    let path = workspace_root().join("target").join("test-pdfs").join(name);
     if !path.exists() {
         eprintln!(
             "SKIP: fixture {} not found (run: python3 tools/generate_fixtures.py target/test-pdfs)",
@@ -93,11 +90,9 @@ fn form_fields_are_detected_with_types_and_values() {
     assert_eq!(text.2, &FieldValue::Text("Jane Doe".into()));
 
     assert!(
-        kinds
-            .iter()
-            .any(|(name, kind, value)| name == "Subscribe"
-                && *kind == FormFieldType::CheckBox
-                && **value == FieldValue::Checked(true)),
+        kinds.iter().any(|(name, kind, value)| name == "Subscribe"
+            && *kind == FormFieldType::CheckBox
+            && **value == FieldValue::Checked(true)),
         "checked checkbox missing, got {kinds:?}"
     );
 
@@ -106,7 +101,11 @@ fn form_fields_are_detected_with_types_and_values() {
         .iter()
         .filter(|(name, kind, _)| name == "Colour" && *kind == FormFieldType::RadioButton)
         .collect();
-    assert_eq!(radios.len(), 2, "radio group widgets missing, got {kinds:?}");
+    assert_eq!(
+        radios.len(),
+        2,
+        "radio group widgets missing, got {kinds:?}"
+    );
 
     let combo = kinds
         .iter()
@@ -306,11 +305,8 @@ fn unwritable_fields_are_refused() {
 
     // Combo/list selection has no write path in the safe binding.
     let combo = form.fields.iter().find(|f| f.name == "Delivery").unwrap();
-    let result = engine.set_field_value(
-        handle,
-        combo.id,
-        FieldValue::Choice(Some("Pickup".into())),
-    );
+    let result =
+        engine.set_field_value(handle, combo.id, FieldValue::Choice(Some("Pickup".into())));
     assert!(result.is_err(), "combo write must be refused");
 
     // An annotation index that is not a widget at all.
@@ -334,11 +330,15 @@ fn flatten_produces_a_loadable_document() {
     let path = require_fixture("forms.pdf");
     let (handle, _info) = engine.open(&path, None).expect("open");
 
-    let bytes = engine.save_to_bytes(handle, true).expect("flatten+serialise");
+    let bytes = engine
+        .save_to_bytes(handle, true)
+        .expect("flatten+serialise");
     let flattened_path = std::env::temp_dir().join("pdf-reader-flatten-test.pdf");
     std::fs::write(&flattened_path, &bytes).expect("write flattened file");
 
-    let (handle2, info2) = engine.open(&flattened_path, None).expect("reopen flattened");
+    let (handle2, info2) = engine
+        .open(&flattened_path, None)
+        .expect("reopen flattened");
     assert_eq!(info2.page_count(), 1, "flattening preserves the page");
 
     // A flattened document has no interactive widgets left to enumerate.
@@ -378,7 +378,11 @@ fn created_annotations_survive_a_save_round_trip() {
         .expect("create highlight");
     // A sticky note with text.
     engine
-        .add_annotation(handle, 0, NewAnnotation::StickyNote((420.0, 700.0), "Reviewed later".into()))
+        .add_annotation(
+            handle,
+            0,
+            NewAnnotation::StickyNote((420.0, 700.0), "Reviewed later".into()),
+        )
         .expect("create note");
     // Typewriter text.
     engine
@@ -418,8 +422,16 @@ fn created_annotations_survive_a_save_round_trip() {
         .iter()
         .find(|a| a.kind == pdfreader_core::AnnotationKind::Highlight)
         .expect("highlight present");
-    assert!((highlight.rect.min_x - 60.0).abs() < 2.0, "{:?}", highlight.rect);
-    assert!((highlight.rect.max_y - 748.0).abs() < 2.0, "{:?}", highlight.rect);
+    assert!(
+        (highlight.rect.min_x - 60.0).abs() < 2.0,
+        "{:?}",
+        highlight.rect
+    );
+    assert!(
+        (highlight.rect.max_y - 748.0).abs() < 2.0,
+        "{:?}",
+        highlight.rect
+    );
 
     // Save, reopen, verify everything round-tripped.
     let bytes = engine.save_to_bytes(handle, false).expect("serialise");
@@ -545,7 +557,10 @@ fn job_application_form_fills_and_saves() {
     let after_write = engine.form_fields(handle).expect("list after write");
     for name in ["partner_name", "email_from", "salary_expected"] {
         for f in after_write.fields.iter().filter(|f| f.name == name) {
-            println!("DBG after write: {} id=({},{}) value={:?}", f.name, f.id.page, f.id.annot_index, f.value);
+            println!(
+                "DBG after write: {} id=({},{}) value={:?}",
+                f.name, f.id.page, f.id.annot_index, f.value
+            );
         }
     }
 

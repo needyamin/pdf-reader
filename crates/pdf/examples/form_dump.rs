@@ -2,8 +2,8 @@
 //!
 //! Usage: cargo run -p pdfreader-pdf --example form_dump -- path/to/file.pdf
 
-use pdfreader_pdf::engine::PdfiumEngine;
 use pdfreader_pdf::PdfEngine;
+use pdfreader_pdf::engine::PdfiumEngine;
 
 fn main() {
     let path = std::env::args().nth(1).expect("pass a PDF path");

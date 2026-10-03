@@ -31,20 +31,28 @@ use pdfreader_ui::Palette;
 const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg"];
 
 /// Width of the whole window, in points.
-const WINDOW_WIDTH: f32 = 812.0;
+const WINDOW_WIDTH: f32 = 980.0;
+
+/// Minimum height of the task-strip / settings row.
+///
+/// The window is a modal sized by its content, so a short task (Page to image
+/// is two sections) used to produce a squat window next to a tall one (Merge
+/// PDFs, with the file list). Pinning the row's height keeps every task the
+/// same shape and gives the whole window real height.
+const BODY_HEIGHT: f32 = 380.0;
 
 /// Width of the task strip on the left.
-const STRIP_WIDTH: f32 = 186.0;
+const STRIP_WIDTH: f32 = 210.0;
 
 /// Height of the scrollable file list for the composition tasks.
-const LIST_HEIGHT: f32 = 232.0;
+const LIST_HEIGHT: f32 = 320.0;
 
 /// Size of the square the page preview is fitted into.
 ///
 /// Public because the shell has to ask the engine for a thumbnail at least this
 /// wide; keeping the two numbers in one place is what stops the preview from
 /// arriving blurry after someone enlarges the box.
-pub const PREVIEW_WIDTH: f32 = 168.0;
+pub const PREVIEW_WIDTH: f32 = 224.0;
 
 /// One file the user added to a composition task.
 struct SourceEntry {
@@ -497,6 +505,7 @@ impl ExportWindow {
                 ui.add_space(14.0);
 
                 ui.horizontal_top(|ui| {
+                    ui.set_min_height(BODY_HEIGHT);
                     ui.vertical(|ui| {
                         ui.set_width(STRIP_WIDTH);
                         self.task_strip(ui, palette, doc);
@@ -1754,6 +1763,7 @@ mod tests {
     /// It is the only check that covers the drawing code itself, and it catches
     /// what a compile cannot: a panic inside a layout helper, or two widgets
     /// fighting over one id.
+
     #[test]
     fn every_task_draws_a_frame_without_panicking() {
         let palette = pdfreader_ui::Theme::from_id(pdfreader_core::ThemeId::Dark).palette;
@@ -1810,6 +1820,59 @@ mod tests {
                     }
                     output.drop_without_applying_deltas();
                 }
+            }
+        }
+    }
+
+    /// The export window is a big pane: a task strip, per-task settings, a
+    /// preview and a footer side by side, not a compact dialog. Measured off
+    /// the painted shapes so a constant drifting back down fails here.
+    #[test]
+    fn export_window_is_a_large_pane() {
+        let palette = pdfreader_ui::Theme::from_id(pdfreader_core::ThemeId::Dark).palette;
+        let screen = egui::vec2(1280.0, 900.0);
+
+        for task in ExportTask::ALL {
+            let mut window = ExportWindow::new(task, &doc(3, 1));
+            let ctx = Context::default();
+            for frame in 0..2 {
+                let open = doc(3, 1);
+                let input = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, screen)),
+                    max_texture_side: Some(2048),
+                    time: Some(f64::from(frame) * 0.016),
+                    ..egui::RawInput::default()
+                };
+                let output = ctx.run_ui(input, |ui| {
+                    window.show(ui.ctx(), &palette, &open, None);
+                });
+                if frame == 0 {
+                    output.drop_without_applying_deltas();
+                    continue;
+                }
+
+                // The backdrop is painted across the whole viewport; everything
+                // narrower than it belongs to the window itself.
+                let rects: Vec<egui::Rect> = output
+                    .shapes
+                    .iter()
+                    .map(|s| s.shape.visual_bounding_rect())
+                    .filter(|r| r.is_finite() && r.width() < screen.x - 1.0)
+                    .collect();
+                let width = rects.iter().map(egui::Rect::width).fold(0.0, f32::max);
+                let top = rects.iter().map(|r| r.min.y).fold(f32::MAX, f32::min);
+                let bottom = rects.iter().map(|r| r.max.y).fold(0.0, f32::max);
+                output.drop_without_applying_deltas();
+
+                assert!(
+                    width >= WINDOW_WIDTH,
+                    "{task:?} painted only {width:.0} px wide, expected at least {WINDOW_WIDTH}"
+                );
+                assert!(
+                    bottom - top >= BODY_HEIGHT,
+                    "{task:?} painted only {:.0} px tall, expected at least {BODY_HEIGHT}",
+                    bottom - top
+                );
             }
         }
     }

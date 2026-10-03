@@ -13,13 +13,11 @@
 //!   appearance could still be baked into cached tiles after a change.
 
 use pdfium_render::prelude::{
-    PdfColor, PdfDocument, PdfFormFieldCommon as _, PdfPageAnnotationCommon,
-    PdfPageAnnotationType, PdfPoints, PdfQuadPoints,
+    PdfColor, PdfDocument, PdfFormFieldCommon as _, PdfPageAnnotationCommon, PdfPageAnnotationType,
+    PdfPoints, PdfQuadPoints,
 };
 
-use pdfreader_core::{
-    AnnotationId, AnnotationInfo, AnnotationKind, NewAnnotation, Rect,
-};
+use pdfreader_core::{AnnotationId, AnnotationInfo, AnnotationKind, NewAnnotation, Rect};
 
 /// Read every non-widget annotation in the document, in page order.
 ///
@@ -38,7 +36,8 @@ pub(crate) fn list_annotations(document: &PdfDocument<'_>) -> Vec<AnnotationInfo
         };
         for (annot_index, annotation) in page.annotations().iter().enumerate() {
             let kind = classify(annotation.annotation_type());
-            if matches!(kind, AnnotationKind::Other) && is_hidden_type(annotation.annotation_type()) {
+            if matches!(kind, AnnotationKind::Other) && is_hidden_type(annotation.annotation_type())
+            {
                 continue;
             }
             let Ok(bounds) = annotation.bounds() else {
@@ -94,13 +93,12 @@ pub(crate) fn create_annotation(
     new: &NewAnnotation,
 ) -> Result<AnnotationId, pdfium_render::prelude::PdfiumError> {
     let page_index = page;
-    let mut page = document
-        .pages_mut()
-        .get(page as i32)
-        .map_err(|error| pdfium_render::prelude::PdfiumError::IoError(std::io::Error::new(
+    let mut page = document.pages_mut().get(page as i32).map_err(|error| {
+        pdfium_render::prelude::PdfiumError::IoError(std::io::Error::new(
             std::io::ErrorKind::Other,
             error.to_string(),
-        )))?;
+        ))
+    })?;
     let annotations = page.annotations_mut();
 
     match new {
@@ -190,7 +188,9 @@ trait MarkupAnnotation<'a> {
         &mut self,
         color: PdfColor,
     ) -> Result<(), pdfium_render::prelude::PdfiumError>;
-    fn attachment_points_mut(&mut self) -> &mut pdfium_render::prelude::PdfPageAnnotationAttachmentPoints<'a>;
+    fn attachment_points_mut(
+        &mut self,
+    ) -> &mut pdfium_render::prelude::PdfPageAnnotationAttachmentPoints<'a>;
 }
 
 macro_rules! impl_markup {
@@ -267,8 +267,9 @@ pub(crate) fn sync_shared_text_fields(
         };
         for index in targets {
             if let Ok(mut annotation) = page.annotations_mut().get(index) {
-                if let Some(text) =
-                    annotation.as_form_field_mut().and_then(|f| f.as_text_field_mut())
+                if let Some(text) = annotation
+                    .as_form_field_mut()
+                    .and_then(|f| f.as_text_field_mut())
                 {
                     text.set_value(value)?;
                 }

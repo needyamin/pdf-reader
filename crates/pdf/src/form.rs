@@ -10,7 +10,9 @@ use pdfium_render::prelude::{
     PdfPageAnnotation, PdfPageAnnotationCommon,
 };
 
-use pdfreader_core::{FieldId, FieldOption, FieldValue, FormFieldInfo, FormFieldType, FormInfo, FormKind};
+use pdfreader_core::{
+    FieldId, FieldOption, FieldValue, FormFieldInfo, FormFieldType, FormInfo, FormKind,
+};
 
 /// Read a document's interactive form.
 ///
@@ -123,7 +125,11 @@ fn read_value(field: &PdfFormField<'_>, kind: FormFieldType) -> FieldValue {
             let checked = field
                 .as_checkbox_field()
                 .and_then(|c| c.is_checked().ok())
-                .or_else(|| field.as_radio_button_field().and_then(|r| r.is_checked().ok()));
+                .or_else(|| {
+                    field
+                        .as_radio_button_field()
+                        .and_then(|r| r.is_checked().ok())
+                });
             FieldValue::Checked(checked.unwrap_or(false))
         }
 

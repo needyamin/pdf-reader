@@ -45,13 +45,7 @@ pub struct PageBox {
 impl PageBox {
     /// Build a box from a position and size.
     pub const fn new(index: u32, x: f32, y: f32, w: f32, h: f32) -> Self {
-        Self {
-            index,
-            x,
-            y,
-            w,
-            h,
-        }
+        Self { index, x, y, w, h }
     }
 
     /// Whether a layout-space point falls inside the page.
@@ -167,10 +161,7 @@ impl PageSpace {
             _ => (h - y, w - x),
         };
 
-        (
-            self.origin.0 + u * self.zoom,
-            self.origin.1 + v * self.zoom,
-        )
+        (self.origin.0 + u * self.zoom, self.origin.1 + v * self.zoom)
     }
 
     /// Convert a PDF-space rect to the axis-aligned layout-space rect that
@@ -372,5 +363,4 @@ mod tests {
         // Overlapping boxes: the later (frontmost) one must win.
         assert_eq!(hit_page(&pages, (200.0, 200.0)).unwrap().index, 1);
     }
-
 }

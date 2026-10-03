@@ -31,6 +31,9 @@ renderer built for large documents.
 - Page thumbnails sidebar (lazy, cached) and a document outline with click-to-jump.
 - Previous/next page, jump to page, Page Up/Down, Home/End.
 - Full-document text search with matching-page results and click-to-jump.
+- **Find**: one `input-group` box — a magnifier and the word *Find* in a leading
+  addon, the query, and a clear button that appears once there is a query. It is
+  the same control in the toolbar and in the Search sidebar; **Enter** runs it.
 
 **Annotations**
 
@@ -128,7 +131,7 @@ A Cargo workspace of focused crates:
 | `app`               | Window, panels, the tile canvas, the engine thread and the export window                                                           |
 | `search`            | Pure text matching primitives used by the asynchronous search flow                                                                 |
 | `platform`, `store` | Platform adapters and persistence reserved for later phases                                                                        |
-| `xtask`             | Build automation: PDFium fetch, build, run, inspect                                                                                |
+| `xtask`             | Build automation: PDFium fetch, build, run, inspect, and Windows packaging (`dist:*`)                                              |
 
 State flows one way. The UI emits a `Command`, the pure reducer turns it into
 `Effect`s, and the shell executes them and feeds results back as further commands.
@@ -242,6 +245,42 @@ doubles, extracts a single page and checks it is a one-page document, writes a p
 image and decodes it back, turns images into a PDF and checks the page count, lays
 images onto standard sheets, and cancels a long job mid-flight to prove it stops
 before the next item rather than after the last.
+
+### Packaging (Windows)
+
+Four `xtask` tasks turn a release build into shippable Windows artifacts. Each one
+stages PDFium, builds the release binary, and assembles the ship set —
+`pdf-reader.exe`, `pdfium.dll`, `LICENSE`, and PDFium's third-party licence texts —
+into `target/dist/stage`, then packages it:
+
+```bash
+cargo xtask dist:portable   # target/dist/pdf-reader-<version>-portable-x64.zip
+cargo xtask dist:nsis       # target/dist/pdf-reader-<version>-setup.exe
+cargo xtask dist:inno       # target/dist/pdf-reader-<version>-inno-setup.exe
+cargo xtask dist:msix       # target/dist/pdf-reader-<version>-x64.msix (signed)
+cargo xtask dist:msix -- --no-sign
+```
+
+- **Portable** — a zip with one top-level folder; unpack anywhere and run. Settings
+  still live in `%APPDATA%\pdf-reader`.
+- **NSIS** (`makensis`) and **Inno Setup** (`ISCC`) — installers for `Program Files`
+  with a Start Menu shortcut, an Add/Remove Programs entry, an uninstaller, and `.pdf`
+  advertised under "Open with" and Default Programs (they never steal the existing
+  default viewer). Both tools install with `winget install -e --id NSIS.NSIS` and
+  `winget install -e --id JRSoftware.InnoSetup`.
+- **MSIX** — a full-trust desktop package built with the Windows SDK's `makeappx` and
+  signed with a self-signed certificate (`CN=YAMiN HOSSAIN`) that xtask creates in the
+  current-user store and reuses. Because it is self-signed, a machine must trust the
+  certificate before installing — the task prints the exact `certutil` command;
+  side-load with `Add-AppxPackage`.
+
+The version in every artifact name comes from `[workspace.package] version` in the root
+`Cargo.toml`. The installer definitions are generated into `target/dist` at run time,
+so they cannot drift from the manifest; to change the packaging itself, edit
+`xtask/src/dist.rs`.
+
+Release builds are windowed (`windows_subsystem`), so launching from Explorer or a
+shortcut shows no console window; debug builds keep the console for tracing output.
 
 ## License
 

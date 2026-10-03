@@ -404,7 +404,8 @@ impl Canvas {
         let cache_key = (doc, rotation, key);
         self.inflight.remove(&cache_key);
         self.stale_tiles.remove(&cache_key);
-        self.pending.retain(|s| !(s.doc == doc && s.page == key.page));
+        self.pending
+            .retain(|s| !(s.doc == doc && s.page == key.page));
 
         let image = bgra_to_color_image(pixels.width, pixels.height, &pixels.data);
         let name = format!(
@@ -807,15 +808,13 @@ impl Canvas {
                                 .and_then(|space| {
                                     let (sx, sy) = space.to_page(start);
                                     let (ex, ey) = space.to_page(end);
-                                    let rect =
-                                        PdfSpaceRect::from_corners((sx, sy), (ex, ey));
+                                    let rect = PdfSpaceRect::from_corners((sx, sy), (ex, ey));
                                     // Clamp to the page: a drag that ends over
                                     // another page converts through the start
                                     // page's transform, and nothing may extend
                                     // past the page it was drawn on.
                                     let (w, h) = space.geom.oriented(space.rotation);
-                                    let page_bounds =
-                                        PdfSpaceRect::from_xywh(0.0, 0.0, w, h);
+                                    let page_bounds = PdfSpaceRect::from_xywh(0.0, 0.0, w, h);
                                     let rect = page_bounds.intersection(rect)?;
                                     match kind {
                                         AnnotationKind::Highlight => {
@@ -830,12 +829,10 @@ impl Canvas {
                                         AnnotationKind::Squiggly => {
                                             Some(NewAnnotation::Squiggly(rect))
                                         }
-                                        AnnotationKind::Square => {
-                                            Some(NewAnnotation::Square(rect))
+                                        AnnotationKind::Square => Some(NewAnnotation::Square(rect)),
+                                        AnnotationKind::FreeText => {
+                                            Some(NewAnnotation::FreeText(rect, "Text".into()))
                                         }
-                                        AnnotationKind::FreeText => Some(
-                                            NewAnnotation::FreeText(rect, "Text".into()),
-                                        ),
                                         _ => None,
                                     }
                                 }),
@@ -849,8 +846,7 @@ impl Canvas {
                                 pos2(start.0.min(end.0), start.1.min(end.1)),
                                 pos2(start.0.max(end.0), start.1.max(end.1)),
                             );
-                            self.edits
-                                .push(Command::AddAnnotation { page, new });
+                            self.edits.push(Command::AddAnnotation { page, new });
                             self.pending.push(PendingEcho {
                                 doc: doc.id,
                                 page,
@@ -864,7 +860,6 @@ impl Canvas {
                     self.draw_page = None;
                 }
             }
-
 
             painter.rect_filled(ui.clip_rect(), 0.0, background);
 
@@ -949,13 +944,7 @@ impl Canvas {
             // PDFium does not render live field values without a form-fill
             // environment, so the overlay is what makes filling visible.
             if let Some(form) = form {
-                draw_form_values(
-                    &painter,
-                    form,
-                    selected,
-                    &page_spaces,
-                    content_origin,
-                );
+                draw_form_values(&painter, form, selected, &page_spaces, content_origin);
             }
 
             // Form field overlay, drawn after the tiles so it sits on top of
@@ -1055,10 +1044,8 @@ impl Canvas {
                                         response.request_focus();
                                         note.opened = false;
                                     }
-                                    let escape =
-                                        ui.input(|i| i.key_pressed(egui::Key::Escape));
-                                    let enter =
-                                        ui.input(|i| i.key_pressed(egui::Key::Enter));
+                                    let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
+                                    let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
                                     // Enter always commits; a click-away commits
                                     // only when there is text, otherwise it
                                     // discards the placement. Esc discards.
@@ -1119,7 +1106,13 @@ impl Canvas {
             // Echoes of shapes the user just drew, drawn last so they sit on
             // top of everything. They disappear on their own when the page's
             // fresh tiles land.
-            draw_pending_echoes(&painter, &self.pending, doc.id, &page_spaces, content_origin);
+            draw_pending_echoes(
+                &painter,
+                &self.pending,
+                doc.id,
+                &page_spaces,
+                content_origin,
+            );
 
             // Write the note popup state back for the next frame.
             self.note_input = note_input;
@@ -1360,7 +1353,12 @@ fn draw_shape_preview(
     if fill != Color32::TRANSPARENT {
         painter.rect_filled(rect, 1.0, fill);
     }
-    painter.rect_stroke(rect, 1.0, Stroke::new(1.5, stroke_color), StrokeKind::Inside);
+    painter.rect_stroke(
+        rect,
+        1.0,
+        Stroke::new(1.5, stroke_color),
+        StrokeKind::Inside,
+    );
 }
 
 /// Draw the current values of text-like form fields on top of the page.
@@ -1468,7 +1466,10 @@ fn draw_field_editor(
     let Some(field_id) = selected else {
         return;
     };
-    let Some(space) = page_spaces.iter().find(|space| space.index == field_id.page) else {
+    let Some(space) = page_spaces
+        .iter()
+        .find(|space| space.index == field_id.page)
+    else {
         return;
     };
     let Some(field) = form.fields.iter().find(|f| f.id == field_id) else {
@@ -1485,18 +1486,26 @@ fn draw_field_editor(
     )
     .translate(content_origin.to_vec2());
 
-    let editor_id = egui::Id::new(("form-editor", doc.raw(), field_id.page, field_id.annot_index));
+    let editor_id = egui::Id::new((
+        "form-editor",
+        doc.raw(),
+        field_id.page,
+        field_id.annot_index,
+    ));
     // Focus the editor exactly once when it opens, so selecting a text field
     // by clicking it is enough to start typing. Re-requesting every frame
     // would fight the user's own focus changes.
-    let just_opened =
-        ui.ctx().memory(|mem| mem.data.get_temp::<FieldId>(editor_owner_key(doc))) != Some(field_id);
+    let just_opened = ui
+        .ctx()
+        .memory(|mem| mem.data.get_temp::<FieldId>(editor_owner_key(doc)))
+        != Some(field_id);
 
-    let mut editor = ui.new_child(
-        egui::UiBuilder::new()
-            .max_rect(rect)
-            .id_salt(("form-editor", doc.raw(), field_id.page, field_id.annot_index)),
-    );
+    let mut editor = ui.new_child(egui::UiBuilder::new().max_rect(rect).id_salt((
+        "form-editor",
+        doc.raw(),
+        field_id.page,
+        field_id.annot_index,
+    )));
 
     let response = match field.kind {
         FormFieldType::Text => {
@@ -1509,12 +1518,11 @@ fn draw_field_editor(
             // editor font follows the field height. The text stays dark in
             // every theme — the page underneath is always white.
             let font_size = (rect.height() * 0.62).clamp(7.0, 15.0);
-            editor.style_mut().text_styles.insert(
-                egui::TextStyle::Body,
-                egui::FontId::proportional(font_size),
-            );
-            editor.visuals_mut().override_text_color =
-                Some(Color32::from_rgb(25, 25, 25));
+            editor
+                .style_mut()
+                .text_styles
+                .insert(egui::TextStyle::Body, egui::FontId::proportional(font_size));
+            editor.visuals_mut().override_text_color = Some(Color32::from_rgb(25, 25, 25));
 
             let inner = editor.add(
                 egui::TextEdit::singleline(&mut draft)
@@ -1552,7 +1560,10 @@ fn draw_field_editor(
                 .width(rect.width())
                 .show_ui(&mut editor, |ui| {
                     for option in &field.options {
-                        if ui.selectable_label(option.selected, option.label.as_str()).clicked() {
+                        if ui
+                            .selectable_label(option.selected, option.label.as_str())
+                            .clicked()
+                        {
                             edits.push(Command::SetFormFieldValue {
                                 id: field.id,
                                 value: FieldValue::Choice(Some(option.label.clone())),
@@ -2208,9 +2219,9 @@ mod tests {
                     Color32::BLACK,
                     Color32::BLACK,
                     scroll_to_page.take(),
-                                    None,
-                                    None,
-                                    Color32::TRANSPARENT,
+                    None,
+                    None,
+                    Color32::TRANSPARENT,
                     Tool::Select,
                 );
                 if !jumping_now {
@@ -2723,15 +2734,19 @@ mod tests {
         canvas.tiles.insert(key_page0, texture.clone());
         canvas.tiles.insert(key_page1, texture.clone());
         canvas.tiles.insert(key_docb, texture.clone());
-        canvas
-            .thumbs
-            .insert((doc_a, Rotation::None, 0), texture);
+        canvas.thumbs.insert((doc_a, Rotation::None, 0), texture);
 
         canvas.invalidate_page(doc_a, 0);
 
         assert!(canvas.stale_tiles.contains(&key_page0), "edited page stale");
-        assert!(!canvas.stale_tiles.contains(&key_page1), "other pages untouched");
-        assert!(!canvas.stale_tiles.contains(&key_docb), "other docs untouched");
+        assert!(
+            !canvas.stale_tiles.contains(&key_page1),
+            "other pages untouched"
+        );
+        assert!(
+            !canvas.stale_tiles.contains(&key_docb),
+            "other docs untouched"
+        );
         assert!(
             canvas.stale_thumbs.contains(&(doc_a, Rotation::None, 0)),
             "the page's thumbnail is stale too"

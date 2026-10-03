@@ -12,6 +12,8 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use sha2::{Digest, Sha256};
 
+mod dist;
+
 /// Pinned PDFium build. The upstream release is marked immutable, so this tag
 /// keeps resolving to the same bytes.
 const PDFIUM_TAG: &str = "chromium/8066";
@@ -58,6 +60,22 @@ enum Cmd {
         /// Directory containing the PDFium library.
         #[arg(long)]
         pdfium_dir: Option<PathBuf>,
+    },
+    /// Build the portable zip package.
+    #[command(name = "dist:portable")]
+    DistPortable,
+    /// Build the NSIS setup installer.
+    #[command(name = "dist:nsis")]
+    DistNsis,
+    /// Build the Inno Setup installer.
+    #[command(name = "dist:inno")]
+    DistInno,
+    /// Build (and by default sign) the MSIX package.
+    #[command(name = "dist:msix")]
+    DistMsix {
+        /// Skip signing with the self-signed certificate.
+        #[arg(long)]
+        no_sign: bool,
     },
 }
 
@@ -106,6 +124,18 @@ fn main() -> Result<()> {
             if !status.success() {
                 bail!("inspect failed");
             }
+        }
+        Cmd::DistPortable => {
+            dist::portable()?;
+        }
+        Cmd::DistNsis => {
+            dist::nsis()?;
+        }
+        Cmd::DistInno => {
+            dist::inno()?;
+        }
+        Cmd::DistMsix { no_sign } => {
+            dist::msix(no_sign)?;
         }
     }
 

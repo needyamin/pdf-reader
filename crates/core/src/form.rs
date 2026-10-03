@@ -205,7 +205,9 @@ impl FormFieldInfo {
 
     /// The tooltip, falling back to the display name.
     pub fn description(&self) -> &str {
-        self.alternate_name.as_deref().unwrap_or_else(|| self.display_name())
+        self.alternate_name
+            .as_deref()
+            .unwrap_or_else(|| self.display_name())
     }
 
     /// Whether the user may edit this field.

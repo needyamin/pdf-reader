@@ -4,6 +4,11 @@
 //! is the only place that executes effects. The UI produces commands; this file
 //! makes things happen and feeds results back as more commands.
 
+// Release builds are real windowed applications: no console window flashes
+// behind the GUI when the exe is launched from Explorer or an installer
+// shortcut. Debug builds keep the console so tracing output stays visible.
+#![cfg_attr(all(not(debug_assertions), windows), windows_subsystem = "windows")]
+
 mod canvas;
 mod engine_thread;
 mod export_window;
@@ -47,10 +52,14 @@ fn write_pdf_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result
     let directory = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
-        .map_or_else(|| std::path::PathBuf::from("."), std::path::Path::to_path_buf);
-    let file_name = path
-        .file_name()
-        .map_or_else(|| std::ffi::OsString::from("document.pdf"), std::ffi::OsString::from);
+        .map_or_else(
+            || std::path::PathBuf::from("."),
+            std::path::Path::to_path_buf,
+        );
+    let file_name = path.file_name().map_or_else(
+        || std::ffi::OsString::from("document.pdf"),
+        std::ffi::OsString::from,
+    );
 
     let mut temp = directory.join(format!(
         ".{}.tmp-{}",
@@ -675,7 +684,11 @@ impl App {
                 Effect::ConfirmClose { tab } => {
                     self.pending_close = Some(tab);
                 }
-                Effect::ScrollToPoint { tab: _, page, point } => {
+                Effect::ScrollToPoint {
+                    tab: _,
+                    page,
+                    point,
+                } => {
                     self.scroll_to_point = Some((page, point));
                 }
                 Effect::LoadAnnotations { doc } => {
@@ -702,7 +715,8 @@ impl App {
                 }
                 Effect::DeleteAnnotation { doc, id } => {
                     if let Some(handle) = self.handles.get(&doc).copied() {
-                        self.engine.send(EngineRequest::DeleteAnnotation { doc, handle, id });
+                        self.engine
+                            .send(EngineRequest::DeleteAnnotation { doc, handle, id });
                     }
                     self.canvas.invalidate_page(doc, id.page);
                 }
@@ -886,7 +900,11 @@ impl App {
         // for `drain_engine` to populate the handle avoids a wasted pass.
         if self.initial_search_pending
             && !self.search_query.is_empty()
-            && self.store.state().active().is_some_and(|t| t.document.is_some())
+            && self
+                .store
+                .state()
+                .active()
+                .is_some_and(|t| t.document.is_some())
         {
             self.initial_search_pending = false;
             self.start_search(self.search_query.clone());
@@ -996,9 +1014,7 @@ impl App {
                     self.engine.bump_generation();
                 }
                 EngineResponse::FormFields { doc, form } => {
-                    let effects = self
-                        .store
-                        .dispatch(Command::FormFieldsLoaded { doc, form });
+                    let effects = self.store.dispatch(Command::FormFieldsLoaded { doc, form });
                     self.execute(effects);
                 }
                 EngineResponse::FieldSet {
@@ -1027,8 +1043,7 @@ impl App {
                         match write_pdf_atomically(&path, &bytes) {
                             Ok(()) => {
                                 self.save_error = None;
-                                let effects =
-                                    self.store.dispatch(Command::DocumentSaved { doc });
+                                let effects = self.store.dispatch(Command::DocumentSaved { doc });
                                 self.execute(effects);
                                 // A "save and close" prompt finishes here, once
                                 // the bytes are actually on disk.
@@ -1077,9 +1092,7 @@ impl App {
                     tracing::warn!("annotation operation failed on {doc:?}: {reason}");
                     self.save_error = Some(format!("Annotation failed: {reason}"));
                     // If the list was never read, un-stick the Comments panel.
-                    let effects = self
-                        .store
-                        .dispatch(Command::AnnotationsLoadFailed { doc });
+                    let effects = self.store.dispatch(Command::AnnotationsLoadFailed { doc });
                     self.execute(effects);
                     // An echoed shape whose creation failed must not haunt the
                     // page until the next re-render.
@@ -1387,7 +1400,12 @@ impl App {
                 }
             }
             if ctrl && input.key_pressed(egui::Key::S) {
-                if self.store.state().active().is_some_and(|tab| tab.document.is_some()) {
+                if self
+                    .store
+                    .state()
+                    .active()
+                    .is_some_and(|tab| tab.document.is_some())
+                {
                     if input.modifiers.shift {
                         commands.push(Command::SaveDocumentAs);
                     } else {
@@ -1949,7 +1967,11 @@ impl eframe::App for App {
                     // The annotation tool strip sits above the page; it only
                     // exists while a document is open, so an empty launch shows
                     // just the welcome card.
-                    if store.state().active().is_some_and(|tab| tab.document.is_some()) {
+                    if store
+                        .state()
+                        .active()
+                        .is_some_and(|tab| tab.document.is_some())
+                    {
                         commands.extend(annotation_bar(ui, &palette, store.state()));
                         ui.separator();
                     }
@@ -1996,20 +2018,20 @@ impl eframe::App for App {
                                 // Resolve a click on the page into a form field
                                 // selection — but only in Select mode, where a
                                 // click cannot mean "place an annotation".
-                                if let Some(point) = canvas.take_click().filter(|_| {
-                                    store.state().tool.annotation_kind().is_none()
-                                }) {
-                                    let hit = pdfreader_render::hit_page(
-                                        canvas.page_spaces(),
-                                        point,
-                                    )
-                                    .and_then(|space| {
-                                        let (x, y) = space.to_page(point);
-                                        tab.form.as_ref()?.fields.iter().find(|f| {
-                                            f.id.page == space.index && f.rect.contains(x, y)
-                                        })
-                                    })
-                                    .cloned();
+                                if let Some(point) = canvas
+                                    .take_click()
+                                    .filter(|_| store.state().tool.annotation_kind().is_none())
+                                {
+                                    let hit =
+                                        pdfreader_render::hit_page(canvas.page_spaces(), point)
+                                            .and_then(|space| {
+                                                let (x, y) = space.to_page(point);
+                                                tab.form.as_ref()?.fields.iter().find(|f| {
+                                                    f.id.page == space.index
+                                                        && f.rect.contains(x, y)
+                                                })
+                                            })
+                                            .cloned();
                                     commands
                                         .push(Command::SelectFormField(hit.as_ref().map(|f| f.id)));
 
@@ -2024,7 +2046,8 @@ impl eframe::App for App {
                                                     commands.push(Command::SetFormFieldValue {
                                                         id: field.id,
                                                         value: FieldValue::Checked(
-                                                            field.value != FieldValue::Checked(true),
+                                                            field.value
+                                                                != FieldValue::Checked(true),
                                                         ),
                                                     });
                                                 }
@@ -2494,40 +2517,20 @@ fn draw_search_results(
 
     // The query field lives here as well as in the toolbar: the toolbar one is
     // easy to miss once you are reading the results, and re-running a search
-    // should not mean hunting for the box again.
-    // Match the toolbar search box: a contained, padded field rather than a
-    // full-bleed bar, so it reads as part of the chrome instead of oversized.
+    // should not mean hunting for the box again. It is the same input-group
+    // control the toolbar draws, so the two are identical by construction; the
+    // frame only adds breathing room inside the sidebar.
     egui::Frame::new()
         .inner_margin(egui::Margin::symmetric(10, 6))
         .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                let clear_w = 26.0;
-                let input_w = (ui.available_width() - clear_w).max(60.0).min(168.0);
-                let response = ui.add_sized(
-                    egui::vec2(input_w, 30.0),
-                    egui::TextEdit::singleline(query)
-                        .hint_text("Find in document")
-                        .font(egui::FontId::new(12.0, egui::FontFamily::Proportional)),
-                );
-                if response.has_focus()
-                    && ui.input(|input| input.key_pressed(egui::Key::Enter))
-                {
-                    commands.push(Command::Search(query.trim().to_owned()));
-                }
-                if !query.is_empty()
-                    && ui
-                        .add(
-                            egui::Button::new(egui::RichText::new("×").size(14.0))
-                                .fill(egui::Color32::TRANSPARENT)
-                                .min_size(egui::vec2(22.0, 22.0)),
-                        )
-                        .on_hover_text("Clear search")
-                        .clicked()
-                {
-                    query.clear();
-                    commands.push(Command::Search(String::new()));
-                }
-            });
+            let width = ui.available_width().min(240.0);
+            let outcome = pdfreader_ui::search_field(ui, palette, query, width, "Search document");
+            if outcome.submitted {
+                commands.push(Command::Search(query.trim().to_owned()));
+            }
+            if outcome.cleared {
+                commands.push(Command::Search(String::new()));
+            }
         });
     ui.add_space(6.0);
 
@@ -2650,13 +2653,17 @@ fn confirm_close_dialog(
             ui.add_space(14.0);
             ui.horizontal(|ui| {
                 if ui
-                    .add(egui::Button::new(egui::RichText::new("Save and close").size(12.5)))
+                    .add(egui::Button::new(
+                        egui::RichText::new("Save and close").size(12.5),
+                    ))
                     .clicked()
                 {
                     choice = Some(CloseChoice::SaveAndClose);
                 }
                 if ui
-                    .add(egui::Button::new(egui::RichText::new("Discard changes").size(12.5)))
+                    .add(egui::Button::new(
+                        egui::RichText::new("Discard changes").size(12.5),
+                    ))
                     .clicked()
                 {
                     choice = Some(CloseChoice::Discard);
@@ -2785,7 +2792,8 @@ fn empty_state(ui: &mut egui::Ui, palette: &pdfreader_ui::Palette, commands: &mu
         ((outer.x - card_w) * 0.5).max(0.0),
         ((outer.y - card_h) * 0.5).max(0.0),
     );
-    let frame_rect = egui::Rect::from_min_size(ui.cursor().min + offset, egui::vec2(card_w, card_h));
+    let frame_rect =
+        egui::Rect::from_min_size(ui.cursor().min + offset, egui::vec2(card_w, card_h));
 
     // Reserve the Frame's outer rect in the parent so subsequent widgets don't
     // overlap it.
