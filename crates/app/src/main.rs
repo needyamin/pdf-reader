@@ -12,7 +12,10 @@
 mod canvas;
 mod engine_thread;
 mod export_window;
+mod fonts;
+mod lens;
 mod print;
+mod settings;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -160,6 +163,10 @@ fn main() {
             // fire on the same keypress and the menus and toolbars scale along
             // with the page, which is what a PDF reader must never do.
             cc.egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
+            // Register the bundled Noto fonts so Bengali and other scripts
+            // render instead of missing-glyph boxes. Safe to call before the
+            // first frame; a missing assets/fonts directory is harmless.
+            fonts::install(&cc.egui_ctx);
             Ok(Box::new(App::new(engine_thread, initial)))
         }),
     ) {
@@ -179,7 +186,7 @@ fn init_tracing() {
 }
 
 /// Directory the executable lives in, where PDFium is staged.
-fn exe_dir() -> Option<PathBuf> {
+pub(crate) fn exe_dir() -> Option<PathBuf> {
     std::env::current_exe()
         .ok()
         .and_then(|path| path.parent().map(std::path::Path::to_path_buf))
@@ -190,6 +197,28 @@ fn exe_dir() -> Option<PathBuf> {
 struct Settings {
     theme: Option<String>,
     sidebar_visible: Option<bool>,
+    /// Language the lookup popup's Google Translate button links to. It does
+    /// not affect the offline answer, which is fixed to Bangla by the bundled
+    /// dictionaries.
+    lens_target: Option<String>,
+    /// Whether the offline word-lookup popup is enabled.
+    lookup_enabled: Option<bool>,
+    /// Whether the popup's "Speak" (text-to-speech) button is enabled.
+    speak_enabled: Option<bool>,
+    /// Whether the selection is read aloud automatically when the card opens.
+    auto_speak: Option<bool>,
+    /// Whether the popup's "Google Translate" link is enabled.
+    translate_enabled: Option<bool>,
+    /// Interface scale (egui zoom factor), 1.0 = 100%.
+    ui_scale: Option<f32>,
+    /// View mode new documents open in: "single" or "continuous".
+    default_view_mode: Option<String>,
+    /// Zoom new documents open at: "fit-width", "fit-page" or "100".
+    default_zoom: Option<String>,
+    /// Whether the on-screen performance overlay is shown.
+    show_stats: Option<bool>,
+    /// Whether tiles just outside the viewport are prefetched.
+    prefetch: Option<bool>,
 }
 
 /// State for the non-blocking encrypted-document password prompt.
@@ -234,6 +263,24 @@ fn load_settings() -> Settings {
             }
             Settings::default()
         }
+    }
+}
+
+/// Map the persisted view-mode name to its enum. Anything unrecognised — an
+/// old file, a hand edit — falls back to the default rather than failing.
+fn view_mode_from_name(name: Option<&str>) -> ViewMode {
+    match name {
+        Some("single") => ViewMode::Single,
+        _ => ViewMode::Continuous,
+    }
+}
+
+/// Map the persisted zoom name to its enum, with the same fallback rule.
+fn zoom_mode_from_name(name: Option<&str>) -> ZoomMode {
+    match name {
+        Some("fit-page") => ZoomMode::FitPage,
+        Some("100") => ZoomMode::Fixed(1.0),
+        _ => ZoomMode::FitWidth,
     }
 }
 
@@ -423,6 +470,10 @@ struct RunningJob {
 }
 
 /// The eframe application.
+///
+/// The many booleans are independent feature flags and view toggles; grouping
+/// them into sub-structs would not make the shell any clearer.
+#[allow(clippy::struct_excessive_bools)]
 struct App {
     /// Application state and the reducer.
     store: Store,
@@ -485,6 +536,48 @@ struct App {
     /// encrypted documents can fail at once; a single slot would silently
     /// discard the passphrase a user is halfway through typing.
     password_prompts: HashMap<pdfreader_core::TabId, PasswordPrompt>,
+    /// The bundled dictionaries, once the background thread has read them.
+    ///
+    /// `None` until the load finishes, which is why a lookup made in the first
+    /// moment after launch answers "loading" rather than "not found".
+    lens: Option<pdfreader_lens::Dictionaries>,
+    /// Receives the dictionaries from the loading thread, exactly once.
+    ///
+    /// A `crossbeam` receiver rather than the `std::sync::mpsc` one the dialogs
+    /// use, because this one is polled every frame and must be non-blocking.
+    lens_rx: Option<crossbeam_channel::Receiver<Result<pdfreader_lens::Dictionaries, String>>>,
+    /// Why the dictionaries are unavailable, shown in the popup when it is.
+    lens_error: Option<String>,
+    /// Extracted text for the pages that have been on screen.
+    page_text: lens::PageTextCache,
+    /// The floating card that answers a selected word.
+    lens_popup: lens::LensPopup,
+    /// Language the Google Translate button links to.
+    lens_target: String,
+    /// Whether the offline word-lookup popup is enabled (default true).
+    lookup_enabled: bool,
+    /// Whether the popup's "Speak" (text-to-speech) button is enabled.
+    speak_enabled: bool,
+    /// Whether the selection is read aloud automatically when the card opens.
+    auto_speak: bool,
+    /// Whether the popup's "Google Translate" link is enabled.
+    translate_enabled: bool,
+    /// Interface scale (egui zoom factor), 1.0 = 100%.
+    ui_scale: f32,
+    /// View mode new documents open in.
+    default_view_mode: ViewMode,
+    /// Zoom new documents open at.
+    default_zoom: ZoomMode,
+    /// Whether the on-screen performance overlay is shown.
+    show_stats: bool,
+    /// Whether tiles just outside the viewport are prefetched.
+    prefetch: bool,
+    /// State of the full Settings window (open flag and selected category).
+    settings_window: settings::SettingsWindow,
+    /// Set by Edit → Find… so the toolbar's find box takes focus next frame.
+    focus_search: bool,
+    /// Whether the keyboard-shortcuts reference window is open.
+    shortcuts_open: bool,
     /// Current full-text search query from the toolbar.
     search_query: String,
     /// Pages matching the last completed search.
@@ -563,6 +656,37 @@ impl App {
             pre_fullscreen_maximized: None,
             scroll_to_point: None,
             password_prompts: HashMap::new(),
+            lens: None,
+            lens_rx: Some(lens::spawn_load(
+                pdfreader_lens::load::find_dir(exe_dir()).as_deref(),
+            )),
+            lens_error: None,
+            page_text: lens::PageTextCache::new(),
+            lens_popup: lens::LensPopup::new(),
+            lens_target: settings
+                .lens_target
+                .as_deref()
+                .filter(|target| pdfreader_lens::is_valid_target(target))
+                .unwrap_or(pdfreader_lens::DEFAULT_TARGET)
+                .to_owned(),
+            // The helper tools default to on; an absent value means "use the
+            // default", not "off", so the popup does not surprise a new user
+            // by being hidden.
+            lookup_enabled: settings.lookup_enabled.unwrap_or(true),
+            speak_enabled: settings.speak_enabled.unwrap_or(true),
+            auto_speak: settings.auto_speak.unwrap_or(true),
+            translate_enabled: settings.translate_enabled.unwrap_or(true),
+            ui_scale: settings
+                .ui_scale
+                .filter(|scale| (0.5..=3.0).contains(scale))
+                .unwrap_or(1.0),
+            default_view_mode: view_mode_from_name(settings.default_view_mode.as_deref()),
+            default_zoom: zoom_mode_from_name(settings.default_zoom.as_deref()),
+            show_stats: settings.show_stats.unwrap_or(false),
+            prefetch: settings.prefetch.unwrap_or(true),
+            settings_window: settings::SettingsWindow::new(),
+            focus_search: false,
+            shortcuts_open: false,
             search_query: seeded_query.unwrap_or_default(),
             search_results: Vec::new(),
             search_doc: None,
@@ -581,6 +705,24 @@ impl App {
             screenshot_sent: false,
             frames_total: 0,
         };
+
+        // The canvas owns the prefetch flag (it is what draws the tiles), so
+        // seed it from the persisted preference now that `app` exists.
+        app.canvas.set_prefetch(app.prefetch);
+
+        // Debug: open the Settings window on launch so its layout can be
+        // captured without a human clicking through the menu (pair with
+        // `PDFREADER_SCREENSHOT`). `PDFREADER_SETTINGS_PAGE` picks the page.
+        if std::env::var_os("PDFREADER_OPEN_SETTINGS").is_some() {
+            app.settings_window.open = true;
+            if let Ok(page) = std::env::var("PDFREADER_SETTINGS_PAGE") {
+                app.settings_window.select_by_name(&page);
+            }
+        }
+        // Debug: open the keyboard-shortcuts reference on launch (screenshot QA).
+        if std::env::var_os("PDFREADER_SHOW_SHORTCUTS").is_some() {
+            app.shortcuts_open = true;
+        }
 
         // Open whatever path was given, even if it is missing — the engine will
         // report a clear error rather than the UI silently doing nothing.
@@ -624,6 +766,29 @@ impl App {
         let settings = Settings {
             theme: Some(self.store.state().theme.name().to_string()),
             sidebar_visible: Some(self.store.state().sidebar_visible),
+            lens_target: Some(self.lens_target.clone()),
+            lookup_enabled: Some(self.lookup_enabled),
+            speak_enabled: Some(self.speak_enabled),
+            auto_speak: Some(self.auto_speak),
+            translate_enabled: Some(self.translate_enabled),
+            ui_scale: Some(self.ui_scale),
+            default_view_mode: Some(
+                match self.default_view_mode {
+                    ViewMode::Single => "single",
+                    ViewMode::Continuous => "continuous",
+                }
+                .to_owned(),
+            ),
+            default_zoom: Some(
+                match self.default_zoom {
+                    ZoomMode::FitWidth => "fit-width",
+                    ZoomMode::FitPage => "fit-page",
+                    ZoomMode::Fixed(_) => "100",
+                }
+                .to_owned(),
+            ),
+            show_stats: Some(self.show_stats),
+            prefetch: Some(self.prefetch),
         };
         if let Ok(text) = serde_json::to_string_pretty(&settings) {
             let _ = std::fs::write(path, text);
@@ -642,6 +807,7 @@ impl App {
                     });
                 }
                 Effect::CloseDocument { doc } => {
+                    self.page_text.drop_document(doc);
                     if let Some(handle) = self.handles.remove(&doc) {
                         self.engine.send(EngineRequest::Close { handle });
                     }
@@ -985,6 +1151,18 @@ impl App {
                         .dispatch(Command::DocumentOpened { tab, document });
                     self.execute(effects);
 
+                    // Apply the default view mode and zoom (Settings → Reading)
+                    // to the freshly opened document. `SetViewMode`/`SetZoom`
+                    // act on the active tab, and opening made this tab active.
+                    if self.store.state().active_tab == Some(tab) {
+                        let mode = self.default_view_mode;
+                        let zoom = self.default_zoom;
+                        let effects = self.store.dispatch(Command::SetViewMode(mode));
+                        self.execute(effects);
+                        let effects = self.store.dispatch(Command::SetZoom(zoom));
+                        self.execute(effects);
+                    }
+
                     // The store assigns the real id, so read it back rather than
                     // inventing a second id here.
                     let assigned = self
@@ -1161,6 +1339,16 @@ impl App {
                 } => {
                     self.canvas.thumbnail_failed(doc, rotation, page);
                 }
+                EngineResponse::PageText { doc, page, text } => {
+                    self.page_text.insert(doc, page, text);
+                }
+                EngineResponse::PageTextFailed { doc, page, reason } => {
+                    // A page PDFium could not read is stored as empty text, so
+                    // it reads as "nothing selectable here" rather than being
+                    // asked for again every frame.
+                    self.page_text.failed(doc, page);
+                    tracing::warn!("text extraction failed for page {page} ({reason})");
+                }
                 EngineResponse::SearchResults {
                     doc,
                     query,
@@ -1295,6 +1483,10 @@ impl App {
 
             if ctrl && input.key_pressed(egui::Key::O) {
                 commands.push(Command::ShowOpenDialog);
+            }
+            // Ctrl+F focuses the find box, the same as Edit → Find….
+            if ctrl && input.key_pressed(egui::Key::F) {
+                commands.push(Command::FocusSearch);
             }
             if ctrl && input.key_pressed(egui::Key::B) {
                 commands.push(Command::ToggleSidebar);
@@ -1717,6 +1909,60 @@ impl App {
                 self.show_dialog(intent);
                 continue;
             }
+            // The helper-tool toggles and the translate target are app-local
+            // preferences, like the dictionaries path: the reducer has nothing
+            // to decide, so the shell flips the flag and persists it here.
+            match command {
+                Command::ToggleLookup => {
+                    self.lookup_enabled = !self.lookup_enabled;
+                    if !self.lookup_enabled {
+                        self.lens_popup.close();
+                        self.canvas.clear_selection();
+                    }
+                    self.persist();
+                    continue;
+                }
+                Command::ToggleSpeak => {
+                    self.speak_enabled = !self.speak_enabled;
+                    self.persist();
+                    continue;
+                }
+                Command::ToggleAutoSpeak => {
+                    self.auto_speak = !self.auto_speak;
+                    self.persist();
+                    continue;
+                }
+                Command::ToggleTranslate => {
+                    self.translate_enabled = !self.translate_enabled;
+                    self.persist();
+                    continue;
+                }
+                Command::SetLensTarget(target) => {
+                    if pdfreader_lens::is_valid_target(&target) {
+                        self.lens_target = target.clone();
+                        self.persist();
+                    }
+                    continue;
+                }
+                Command::ShowSettings => {
+                    self.settings_window.open = true;
+                    continue;
+                }
+                Command::ShowAbout => {
+                    self.settings_window.open = true;
+                    self.settings_window.select_by_name("about");
+                    continue;
+                }
+                Command::ShowShortcuts => {
+                    self.shortcuts_open = true;
+                    continue;
+                }
+                Command::FocusSearch => {
+                    self.focus_search = true;
+                    continue;
+                }
+                _ => {}
+            }
             let is_scroll_by = matches!(command, Command::ScrollBy { .. });
             let fullscreen = matches!(command, Command::ToggleFullscreen);
             let effects = self.store.dispatch(command);
@@ -1763,7 +2009,49 @@ impl App {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+
+        // Apply the persisted interface scale before anything is laid out, so
+        // the pixels-per-point read below already reflects it.
+        if (ctx.zoom_factor() - self.ui_scale).abs() > 1e-4 {
+            ctx.set_zoom_factor(self.ui_scale);
+        }
         let dpr = ctx.pixels_per_point();
+
+        // Snapshot the helper-tool preferences up front. They are read-only
+        // during this frame, but `self` is borrowed for most of the draw, so a
+        // local copy lets the menu and canvas closures read them without a
+        // second borrow of `self`.
+        let lookup_enabled = self.lookup_enabled;
+        let speak_enabled = self.speak_enabled;
+        let auto_speak = self.auto_speak;
+        let translate_enabled = self.translate_enabled;
+        let lens_target = self.lens_target.clone();
+        // Edit → Find… asks the toolbar's find box to take focus. Consume the
+        // flag here so the request lasts exactly one frame.
+        let focus_search = self.focus_search;
+        self.focus_search = false;
+
+        // The dictionaries are read on a background thread. Take them the frame
+        // they arrive, so a lookup stops answering "loading" as soon as it can.
+        if let Some(rx) = self.lens_rx.take() {
+            match rx.try_recv() {
+                Ok(Ok(dictionaries)) => {
+                    tracing::info!(
+                        entries = dictionaries.entry_count(),
+                        "dictionaries loaded"
+                    );
+                    self.lens = Some(dictionaries);
+                }
+                Ok(Err(reason)) => {
+                    tracing::warn!("the dictionaries could not be loaded ({reason})");
+                    self.lens_error = Some(reason);
+                }
+                Err(crossbeam_channel::TryRecvError::Empty) => self.lens_rx = Some(rx),
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    self.lens_error = Some("the dictionary thread stopped".to_owned());
+                }
+            }
+        }
 
         let drained = self.pump(&ctx);
 
@@ -1778,9 +2066,19 @@ impl eframe::App for App {
         // Draw every panel. Fields are borrowed separately so the closures that
         // need the canvas do not conflict with those that read the store.
         {
+            // More fields are borrowed here than read: everything the canvas
+            // closure touches has to come through this destructuring, because
+            // reaching for `self.…` inside the closure while it also captures
+            // these mutable borrows is a second borrow of the same value.
             let App {
                 store,
                 canvas,
+                page_text,
+                lens_popup,
+                handles,
+                engine,
+                lens,
+                lens_error,
                 scroll_to_page,
                 scroll_to_point,
                 search_query,
@@ -1826,6 +2124,7 @@ impl eframe::App for App {
                         &palette,
                         search_query,
                         &mut pan_tool,
+                        focus_search,
                     ));
                     if pan_tool != canvas.pan_tool() {
                         canvas.set_pan_tool(pan_tool);
@@ -2012,15 +2311,35 @@ impl eframe::App for App {
                                     tab.view.selected_field,
                                     palette.accent,
                                     store.state().tool,
+                                    page_text,
                                 );
                                 tiles.extend(pending);
+
+                                // Text for every page on screen, so a click can
+                                // be hit-tested to a character. Extraction is
+                                // the cheap part of PDFium's work and the cache
+                                // asks only once per page, so this does not
+                                // compete with tiles in any meaningful way.
+                                if let Some(handle) = handles.get(&doc.id).copied() {
+                                    for space in canvas.page_spaces() {
+                                        if page_text.request(doc.id, space.index) {
+                                            engine.send(EngineRequest::PageText {
+                                                doc: doc.id,
+                                                handle,
+                                                page: space.index,
+                                            });
+                                        }
+                                    }
+                                }
 
                                 // Resolve a click on the page into a form field
                                 // selection — but only in Select mode, where a
                                 // click cannot mean "place an annotation".
-                                if let Some(point) = canvas
+                                let mut field_hit = false;
+                                let clicked = canvas
                                     .take_click()
-                                    .filter(|_| store.state().tool.annotation_kind().is_none())
+                                    .filter(|_| store.state().tool.annotation_kind().is_none());
+                                if let Some(point) = clicked
                                 {
                                     let hit =
                                         pdfreader_render::hit_page(canvas.page_spaces(), point)
@@ -2032,6 +2351,7 @@ impl eframe::App for App {
                                                 })
                                             })
                                             .cloned();
+                                    field_hit = hit.is_some();
                                     commands
                                         .push(Command::SelectFormField(hit.as_ref().map(|f| f.id)));
 
@@ -2064,6 +2384,43 @@ impl eframe::App for App {
                                         }
                                     }
                                 }
+                                // A word or phrase picked off the page opens the
+                                // lookup popup. A click that landed on a form
+                                // field already means "select this field", so it
+                                // does not also open the card. When word lookup
+                                // is switched off in Settings, the pick is
+                                // dropped so no card appears.
+                                match canvas.take_lookup() {
+                                    Some(request) if !field_hit && lookup_enabled => {
+                                        let answer = match lens.as_ref() {
+                                            Some(dictionaries) => lens::Answer::from_lookup(
+                                                dictionaries.lookup(&request.text),
+                                            ),
+                                            None => lens_error
+                                                .clone()
+                                                .map_or(lens::Answer::Loading, lens::Answer::Missing),
+                                        };
+                                        // Auto-speak only when the whole TTS
+                                        // tool is on; the setting alone does
+                                        // not override a disabled Speak button.
+                                        lens_popup.open(
+                                            request,
+                                            answer,
+                                            speak_enabled && auto_speak,
+                                        );
+                                    }
+                                    Some(_) => canvas.clear_selection(),
+                                    // A click that picked up no word — blank
+                                    // paper, or a scanned page with no text
+                                    // layer — dismisses the card rather than
+                                    // leaving a stale answer on screen.
+                                    None if clicked.is_some() => {
+                                        canvas.clear_selection();
+                                        lens_popup.close();
+                                    }
+                                    None => {}
+                                }
+
                                 commands.extend(canvas.take_edits());
 
                                 // A comment click wants the exact noted area
@@ -2291,6 +2648,25 @@ impl eframe::App for App {
                 self.save_error = None;
                 self.job_notice = None;
             }
+        }
+
+        // The lookup card. Drawn last as a top-level area so it sits above
+        // every panel and is never clipped by the canvas or the scroll area.
+        self.lens_popup.show(
+            &ctx,
+            &palette,
+            &lens_target,
+            speak_enabled,
+            translate_enabled,
+        );
+
+        // The full Settings window (when open), the keyboard-shortcuts
+        // reference, and the optional performance overlay — all above the
+        // panels.
+        self.draw_settings_window(&ctx, &palette);
+        self.draw_shortcuts_window(&ctx, &palette);
+        if self.show_stats {
+            self.draw_stats_overlay(&ctx, &palette);
         }
 
         self.canvas_size = canvas_size;
@@ -2524,7 +2900,8 @@ fn draw_search_results(
         .inner_margin(egui::Margin::symmetric(10, 6))
         .show(ui, |ui| {
             let width = ui.available_width().min(240.0);
-            let outcome = pdfreader_ui::search_field(ui, palette, query, width, "Search document");
+            let outcome =
+                pdfreader_ui::search_field(ui, palette, query, width, "Search document", false);
             if outcome.submitted {
                 commands.push(Command::Search(query.trim().to_owned()));
             }
@@ -2968,5 +3345,66 @@ fn save_screenshot(path: &std::path::Path, image: &egui::ColorImage) {
             Err(error) => eprintln!("screenshot save failed: {error}"),
         },
         None => eprintln!("screenshot: unexpected buffer size"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn helper_toggles_round_trip_through_settings() {
+        let settings = Settings {
+            theme: Some("dark".to_owned()),
+            sidebar_visible: Some(true),
+            lens_target: Some("zh-CN".to_owned()),
+            lookup_enabled: Some(false),
+            speak_enabled: Some(false),
+            auto_speak: Some(false),
+            translate_enabled: Some(true),
+            ui_scale: Some(1.25),
+            default_view_mode: Some("single".to_owned()),
+            default_zoom: Some("fit-page".to_owned()),
+            show_stats: Some(true),
+            prefetch: Some(false),
+        };
+        let json = serde_json::to_string(&settings).expect("settings serialise");
+        let back: Settings = serde_json::from_str(&json).expect("settings deserialise");
+        assert_eq!(back.lookup_enabled, Some(false));
+        assert_eq!(back.speak_enabled, Some(false));
+        assert_eq!(back.auto_speak, Some(false));
+        assert_eq!(back.translate_enabled, Some(true));
+        assert_eq!(back.lens_target.as_deref(), Some("zh-CN"));
+        assert_eq!(back.ui_scale, Some(1.25));
+        assert_eq!(back.default_view_mode.as_deref(), Some("single"));
+        assert_eq!(back.default_zoom.as_deref(), Some("fit-page"));
+        assert_eq!(back.show_stats, Some(true));
+        assert_eq!(back.prefetch, Some(false));
+    }
+
+    #[test]
+    fn absent_toggles_read_as_defaults_not_off() {
+        // A settings file written before these options existed must not read
+        // back as "every tool off": an absent field is the default (on).
+        let settings: Settings = serde_json::from_str("{}").expect("empty settings parse");
+        assert_eq!(settings.lookup_enabled, None);
+        assert!(settings.lookup_enabled.unwrap_or(true));
+        assert!(settings.speak_enabled.unwrap_or(true));
+        assert!(settings.auto_speak.unwrap_or(true));
+        assert!(settings.translate_enabled.unwrap_or(true));
+    }
+
+    #[test]
+    fn view_and_zoom_names_map_with_a_default_fallback() {
+        assert_eq!(view_mode_from_name(Some("single")), ViewMode::Single);
+        assert_eq!(view_mode_from_name(Some("continuous")), ViewMode::Continuous);
+        assert_eq!(view_mode_from_name(None), ViewMode::Continuous);
+        assert_eq!(view_mode_from_name(Some("nonsense")), ViewMode::Continuous);
+
+        assert_eq!(zoom_mode_from_name(Some("fit-page")), ZoomMode::FitPage);
+        assert_eq!(zoom_mode_from_name(Some("fit-width")), ZoomMode::FitWidth);
+        assert_eq!(zoom_mode_from_name(Some("100")), ZoomMode::Fixed(1.0));
+        assert_eq!(zoom_mode_from_name(None), ZoomMode::FitWidth);
+        assert_eq!(zoom_mode_from_name(Some("nonsense")), ZoomMode::FitWidth);
     }
 }

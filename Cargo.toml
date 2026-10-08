@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/core",
+    "crates/lens",
     "crates/pdf",
     "crates/render",
     "crates/search",
@@ -13,7 +14,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "3.0.0"
 edition = "2024"
 rust-version = "1.98"
 license = "MIT"
@@ -25,6 +26,7 @@ authors = ["YAMiN HOSSAIN"]
 pdfreader-core = { path = "crates/core" }
 pdfreader-pdf = { path = "crates/pdf" }
 pdfreader-render = { path = "crates/render" }
+pdfreader-lens = { path = "crates/lens" }
 pdfreader-search = { path = "crates/search" }
 pdfreader-store = { path = "crates/store" }
 pdfreader-platform = { path = "crates/platform" }

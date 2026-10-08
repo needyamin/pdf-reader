@@ -99,6 +99,12 @@ fn edit_menu(ui: &mut Ui, state: &AppState) -> Vec<Command> {
         commands.push(Command::Redo);
         ui.close();
     }
+
+    ui.separator();
+    if menu_item(ui, "Find…", "Ctrl+F").clicked() {
+        commands.push(Command::FocusSearch);
+        ui.close();
+    }
     commands
 }
 
@@ -112,49 +118,56 @@ fn file_menu(ui: &mut Ui, state: &AppState) -> Vec<Command> {
     let has_doc = state.active().is_some_and(|t| t.document.is_some());
     let has_tab = state.active_tab.is_some();
 
-    if menu_item(ui, "Open document…", "Ctrl+O").clicked() {
+    if menu_item(ui, "Open…", "Ctrl+O").clicked() {
         commands.push(Command::ShowOpenDialog);
         ui.close();
     }
 
+    ui.separator();
     ui.add_enabled_ui(has_doc, |ui| {
         if menu_item(ui, "Save", "Ctrl+S").clicked() {
             commands.push(Command::SaveDocument);
             ui.close();
         }
-        if menu_item(ui, "Save as…", "Ctrl+Shift+S").clicked() {
+        if menu_item(ui, "Save As…", "Ctrl+Shift+S").clicked() {
             commands.push(Command::SaveDocumentAs);
-            ui.close();
-        }
-        if menu_item(ui, "Flatten form and annotations", "").clicked() {
-            commands.push(Command::FlattenDocument);
-            ui.close();
-        }
-
-        ui.separator();
-        if menu_item(ui, "Print…", "Ctrl+P").clicked() {
-            commands.push(Command::Print);
-            ui.close();
-        }
-        if menu_item(ui, "Print current page", "").clicked() {
-            commands.push(Command::PrintCurrentPage);
             ui.close();
         }
     });
 
-    // Export is outside the block above: two of its five tasks work from files
-    // the user picks and need no open document, which is exactly when someone
-    // wants to merge two PDFs they have not opened. It carries the Ctrl+E hint
-    // on the submenu button itself, since the five tasks inside have no single
-    // shortcut of their own.
+    ui.separator();
+    ui.add_enabled_ui(has_doc, |ui| {
+        if menu_item(ui, "Flatten Document", "").clicked() {
+            commands.push(Command::FlattenDocument);
+            ui.close();
+        }
+    });
+
+    // Export sits outside the enabled blocks: two of its five tasks work from
+    // files the user picks and need no open document, which is exactly when
+    // someone wants to merge two PDFs they have not opened. It carries the
+    // Ctrl+E hint on the submenu button itself, since the tasks inside have no
+    // single shortcut of their own.
     ui.separator();
     SubMenuButton::from_button(menu_item_button("Export", "Ctrl+E")).ui(ui, |ui| {
         commands.extend(export_menu(ui, has_doc));
     });
 
     ui.separator();
+    ui.add_enabled_ui(has_doc, |ui| {
+        if menu_item(ui, "Print…", "Ctrl+P").clicked() {
+            commands.push(Command::Print);
+            ui.close();
+        }
+        if menu_item(ui, "Print Current Page", "").clicked() {
+            commands.push(Command::PrintCurrentPage);
+            ui.close();
+        }
+    });
+
+    ui.separator();
     ui.add_enabled_ui(has_tab, |ui| {
-        if menu_item(ui, "Close tab", "Ctrl+W").clicked() {
+        if menu_item(ui, "Close Tab", "Ctrl+W").clicked() {
             if let Some(id) = state.active_tab {
                 commands.push(Command::RequestCloseTab(id));
             }
@@ -222,97 +235,71 @@ pub fn menu_bar(ui: &mut Ui, state: &AppState, palette: &Palette) -> Vec<Command
             menu_button(ui, palette, "Edit", |ui| {
                 commands.extend(edit_menu(ui, state));
             });
-            menu_button(ui, palette, "Go", |ui| {
-                ui.add_enabled_ui(has_doc, |ui| {
-                    if menu_item(ui, "First page", "Home").clicked() {
-                        commands.push(Command::GoToPage(0));
-                        ui.close();
-                    }
-                    if ui
-                        .add_enabled(page > 0, menu_item_button("Previous page", "Page Up"))
-                        .clicked()
-                    {
-                        commands.push(Command::PrevPage);
-                        ui.close();
-                    }
-                    if ui
-                        .add_enabled(
-                            page_count > 0 && page + 1 < page_count,
-                            menu_item_button("Next page", "Page Down"),
-                        )
-                        .clicked()
-                    {
-                        commands.push(Command::NextPage);
-                        ui.close();
-                    }
-                    if menu_item(ui, "Last page", "End").clicked() {
-                        commands.push(Command::GoToPage(u32::MAX));
-                        ui.close();
-                    }
-                });
-            });
             menu_button(ui, palette, "View", |ui| {
                 ui.add_enabled_ui(has_doc, |ui| {
-                    if menu_item(ui, "Zoom in", "Ctrl+=").clicked() {
+                    if menu_item(ui, "Zoom In", "Ctrl+=").clicked() {
                         commands.push(Command::ZoomIn);
                         ui.close();
                     }
-                    if menu_item(ui, "Zoom out", "Ctrl+-").clicked() {
+                    if menu_item(ui, "Zoom Out", "Ctrl+-").clicked() {
                         commands.push(Command::ZoomOut);
                         ui.close();
                     }
-                    if menu_item(ui, "Actual size", "Ctrl+0").clicked() {
+                    if menu_item(ui, "Actual Size", "Ctrl+0").clicked() {
                         commands.push(Command::ZoomReset);
                         ui.close();
                     }
                     ui.separator();
                     if ui
-                        .radio(matches!(zoom_mode, Some(ZoomMode::FitWidth)), "Fit width")
+                        .radio(matches!(zoom_mode, Some(ZoomMode::FitWidth)), "Fit Width")
                         .clicked()
                     {
                         commands.push(Command::SetZoom(ZoomMode::FitWidth));
                         ui.close();
                     }
                     if ui
-                        .radio(matches!(zoom_mode, Some(ZoomMode::FitPage)), "Fit page")
+                        .radio(matches!(zoom_mode, Some(ZoomMode::FitPage)), "Fit Page")
                         .clicked()
                     {
                         commands.push(Command::SetZoom(ZoomMode::FitPage));
                         ui.close();
                     }
                     ui.separator();
-                    if menu_item(ui, "Rotate clockwise", "").clicked() {
-                        commands.push(Command::RotateCw);
-                        ui.close();
-                    }
-                    if menu_item(ui, "Rotate counter-clockwise", "").clicked() {
-                        commands.push(Command::RotateCcw);
-                        ui.close();
-                    }
-                    ui.separator();
-                    if ui
-                        .radio(
-                            matches!(view_mode, Some(ViewMode::Continuous)),
-                            "Continuous reading",
-                        )
-                        .clicked()
-                    {
-                        commands.push(Command::SetViewMode(ViewMode::Continuous));
-                        ui.close();
-                    }
-                    if ui
-                        .radio(matches!(view_mode, Some(ViewMode::Single)), "Single page")
-                        .clicked()
-                    {
-                        commands.push(Command::SetViewMode(ViewMode::Single));
-                        ui.close();
-                    }
+                    ui.menu_button("Page Display", |ui| {
+                        if ui
+                            .radio(matches!(view_mode, Some(ViewMode::Single)), "Single Page")
+                            .clicked()
+                        {
+                            commands.push(Command::SetViewMode(ViewMode::Single));
+                            ui.close();
+                        }
+                        if ui
+                            .radio(
+                                matches!(view_mode, Some(ViewMode::Continuous)),
+                                "Continuous",
+                            )
+                            .clicked()
+                        {
+                            commands.push(Command::SetViewMode(ViewMode::Continuous));
+                            ui.close();
+                        }
+                    });
+                    ui.menu_button("Rotate View", |ui| {
+                        if menu_item(ui, "Clockwise", "").clicked() {
+                            commands.push(Command::RotateCw);
+                            ui.close();
+                        }
+                        if menu_item(ui, "Counterclockwise", "").clicked() {
+                            commands.push(Command::RotateCcw);
+                            ui.close();
+                        }
+                    });
                 });
                 ui.separator();
                 let label = if state.sidebar_visible {
-                    "Hide sidebar"
+                    "Hide Sidebar"
                 } else {
-                    "Show sidebar"
+                    "Show Sidebar"
                 };
                 if menu_item(ui, label, "Ctrl+B").clicked() {
                     commands.push(Command::ToggleSidebar);
@@ -334,6 +321,51 @@ pub fn menu_bar(ui: &mut Ui, state: &AppState, palette: &Palette) -> Vec<Command
                     }
                 });
             });
+            menu_button(ui, palette, "Go", |ui| {
+                ui.add_enabled_ui(has_doc, |ui| {
+                    if menu_item(ui, "First Page", "Home").clicked() {
+                        commands.push(Command::GoToPage(0));
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(page > 0, menu_item_button("Previous Page", "Page Up"))
+                        .clicked()
+                    {
+                        commands.push(Command::PrevPage);
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(
+                            page_count > 0 && page + 1 < page_count,
+                            menu_item_button("Next Page", "Page Down"),
+                        )
+                        .clicked()
+                    {
+                        commands.push(Command::NextPage);
+                        ui.close();
+                    }
+                    if menu_item(ui, "Last Page", "End").clicked() {
+                        commands.push(Command::GoToPage(u32::MAX));
+                        ui.close();
+                    }
+                });
+            });
+            // Settings is a direct action, not a submenu: clicking it opens the
+            // full Settings window.
+            if menu_action(ui, palette, "Settings").clicked() {
+                commands.push(Command::ShowSettings);
+            }
+            menu_button(ui, palette, "Help", |ui| {
+                if menu_item(ui, "Keyboard Shortcuts", "").clicked() {
+                    commands.push(Command::ShowShortcuts);
+                    ui.close();
+                }
+                ui.separator();
+                if menu_item(ui, "About PDF Reader", "").clicked() {
+                    commands.push(Command::ShowAbout);
+                    ui.close();
+                }
+            });
         });
     });
 
@@ -347,6 +379,7 @@ pub fn toolbar(
     palette: &Palette,
     search_query: &mut String,
     pan_tool: &mut bool,
+    focus_search: bool,
 ) -> Vec<Command> {
     let mut commands = Vec::new();
     let tab = state.active();
@@ -498,7 +531,8 @@ pub fn toolbar(
                     // caption and the toolbar keeps the space a separate
                     // "Find" label used to take.
                     let width = if compact { 186.0 } else { 240.0 };
-                    let outcome = search_field(ui, palette, search_query, width, "Search document");
+                    let outcome =
+                        search_field(ui, palette, search_query, width, "Search document", focus_search);
                     if outcome.submitted {
                         commands.push(Command::Search(search_query.trim().to_owned()));
                     }
@@ -570,6 +604,7 @@ pub fn search_field(
     query: &mut String,
     width: f32,
     hint: &str,
+    focus: bool,
 ) -> SearchFieldOutput {
     let mut output = SearchFieldOutput::default();
     let addon_width = search_addon_width(ui, palette);
@@ -642,6 +677,10 @@ pub fn search_field(
                         .hint_text(hint),
                 );
                 focused = response.has_focus();
+                // Edit → Find… (Ctrl+F) asks the field to take focus this frame.
+                if focus {
+                    response.request_focus();
+                }
                 // A single-line field surrenders focus when Enter is pressed,
                 // so by the time the key is seen it no longer *has* focus —
                 // losing it this frame is what marks the submit. This is the
@@ -1598,6 +1637,14 @@ fn menu_button(ui: &mut Ui, palette: &Palette, label: &str, add_contents: impl F
     );
 }
 
+/// A top-level menu-bar item that performs an action directly, styled like the
+/// dropdown labels beside it (dim text, no frame until hover).
+fn menu_action(ui: &mut Ui, palette: &Palette, label: &str) -> egui::Response {
+    ui.add(
+        egui::Button::new(RichText::new(label).color(palette.text_dim).size(11.5)).frame(false),
+    )
+}
+
 fn menu_item(ui: &mut Ui, label: &str, shortcut: &str) -> egui::Response {
     let mut button = egui::Button::new(label);
     if !shortcut.is_empty() {
@@ -2090,7 +2137,7 @@ mod tests {
         let palette = Theme::from_id(ThemeId::default()).palette;
         let mut outcome = SearchFieldOutput::default();
         let mut output = ctx.run_ui(raw, |ui| {
-            outcome = search_field(ui, &palette, query, TEST_FIELD_WIDTH, "Search document");
+            outcome = search_field(ui, &palette, query, TEST_FIELD_WIDTH, "Search document", false);
         });
         let shapes = output.shapes.len();
         output.textures_delta.clear();
@@ -2118,7 +2165,7 @@ mod tests {
             ..Default::default()
         };
         let mut output = ctx.run_ui(raw, |ui| {
-            toolbar(ui, store.state(), &palette, &mut query, &mut pan);
+            toolbar(ui, store.state(), &palette, &mut query, &mut pan, false);
         });
         let bottom = output
             .shapes

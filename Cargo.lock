@@ -2633,7 +2633,7 @@ dependencies = [
 
 [[package]]
 name = "pdfreader-app"
-version = "0.1.0"
+version = "3.0.0"
 dependencies = [
  "crossbeam-channel",
  "eframe",
@@ -2641,7 +2641,9 @@ dependencies = [
  "embed-resource",
  "image",
  "pdfreader-core",
+ "pdfreader-lens",
  "pdfreader-pdf",
+ "pdfreader-platform",
  "pdfreader-render",
  "pdfreader-search",
  "pdfreader-ui",
@@ -2655,14 +2657,23 @@ dependencies = [
 
 [[package]]
 name = "pdfreader-core"
-version = "0.1.0"
+version = "3.0.0"
 dependencies = [
  "serde",
 ]
 
 [[package]]
+name = "pdfreader-lens"
+version = "3.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "pdfreader-pdf"
-version = "0.1.0"
+version = "3.0.0"
 dependencies = [
  "image",
  "pdfium-render",
@@ -2673,14 +2684,14 @@ dependencies = [
 
 [[package]]
 name = "pdfreader-platform"
-version = "0.1.0"
+version = "3.0.0"
 dependencies = [
  "thiserror 2.0.21",
 ]
 
 [[package]]
 name = "pdfreader-render"
-version = "0.1.0"
+version = "3.0.0"
 dependencies = [
  "pdfreader-core",
  "thiserror 2.0.21",
@@ -2688,7 +2699,7 @@ dependencies = [
 
 [[package]]
 name = "pdfreader-search"
-version = "0.1.0"
+version = "3.0.0"
 dependencies = [
  "pdfreader-core",
  "thiserror 2.0.21",
@@ -2696,7 +2707,7 @@ dependencies = [
 
 [[package]]
 name = "pdfreader-store"
-version = "0.1.0"
+version = "3.0.0"
 dependencies = [
  "pdfreader-core",
  "serde",
@@ -2706,7 +2717,7 @@ dependencies = [
 
 [[package]]
 name = "pdfreader-ui"
-version = "0.1.0"
+version = "3.0.0"
 dependencies = [
  "egui",
  "pdfreader-core",
@@ -4889,7 +4900,7 @@ checksum = "e450f9b2ed1dff33c94c12589a87338689467b9c4f5d8a5710bd09a847d2c8a7"
 
 [[package]]
 name = "xtask"
-version = "0.1.0"
+version = "3.0.0"
 dependencies = [
  "anyhow",
  "clap",

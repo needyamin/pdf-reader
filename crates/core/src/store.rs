@@ -191,7 +191,20 @@ impl Store {
         match command {
             // The shell handles the dialog and search; neither changes reducer
             // state directly. Search runs against the active engine handle.
-            Command::ShowOpenDialog | Command::Search(_) => Vec::new(),
+            // The helper-tool toggles and translate target are app-local
+            // preferences the shell reads from disk, so the reducer has no
+            // state for them either.
+            Command::ShowOpenDialog
+            | Command::Search(_)
+            | Command::ToggleLookup
+            | Command::ToggleSpeak
+            | Command::ToggleAutoSpeak
+            | Command::ToggleTranslate
+            | Command::SetLensTarget(_)
+            | Command::ShowSettings
+            | Command::ShowAbout
+            | Command::ShowShortcuts
+            | Command::FocusSearch => Vec::new(),
 
             Command::FormFieldsLoaded { doc, form } => {
                 if let Some(tab) = self

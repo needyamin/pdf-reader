@@ -336,6 +336,38 @@ pub enum Command {
         /// Destination file, chosen by the user.
         output: PathBuf,
     },
+
+    /// Turn the offline word-lookup popup on or off. App-local preference,
+    /// intercepted by the shell (like `ShowExportWindow`): the reducer has no
+    /// say in a feature that lives entirely in the shell.
+    ToggleLookup,
+
+    /// Turn the popup's "Speak" (text-to-speech) button on or off.
+    ToggleSpeak,
+
+    /// Turn reading the selection aloud automatically on or off.
+    ToggleAutoSpeak,
+
+    /// Turn the popup's "Google Translate" link on or off.
+    ToggleTranslate,
+
+    /// Set the language the Google Translate button links to (an ISO code such
+    /// as `bn` or `zh-CN`). Invalid codes fall back to Bangla in the link
+    /// builder; the shell stores the raw value and validates on use.
+    SetLensTarget(String),
+
+    /// Open the full Settings window. Shell-only, like the toggles above.
+    ShowSettings,
+
+    /// Open the Settings window on its About page (Help → About). Shell-only.
+    ShowAbout,
+
+    /// Open the keyboard-shortcuts reference (Help → Keyboard Shortcuts).
+    ShowShortcuts,
+
+    /// Move focus to the find box. Shell-only: focus is a view concern, so the
+    /// reducer has nothing to say about it.
+    FocusSearch,
 }
 
 /// Work the shell must perform after a state transition.

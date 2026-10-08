@@ -42,7 +42,7 @@ const MSIX_ASSETS: &[(&str, u32)] = &[
 
 /// One release build plus the staged ship set shared by all packagers.
 struct Stage {
-    /// Workspace version, e.g. `0.1.0`.
+    /// Workspace version, e.g. `3.0.0`.
     version: String,
     /// Directory holding `pdf-reader.exe`, `pdfium.dll`, `LICENSE`, `licenses/`.
     dir: PathBuf,
@@ -266,6 +266,49 @@ fn stage() -> Result<Stage> {
     fs::copy(&dll, dir.join("pdfium.dll"))
         .with_context(|| format!("copying {}", dll.display()))?;
     fs::copy("LICENSE", dir.join("LICENSE")).context("copying LICENSE")?;
+
+    // The offline word-lookup dictionaries ship beside the executable so the
+    // popup's meaning, IPA and Google Translate link work in the packaged
+    // build (the loader checks the exe directory first).
+    const LENS_FILES: [&str; 3] = [
+        "E2Bdatabase.json",
+        "bangla_dictionary.txt",
+        "cmudict-0.7b-ipa.txt",
+    ];
+    let lens_src = PathBuf::from("assets/lens");
+    if lens_src.is_dir() {
+        for file in LENS_FILES {
+            let source = lens_src.join(file);
+            if source.is_file() {
+                fs::copy(&source, dir.join(file))
+                    .with_context(|| format!("copying {}", source.display()))?;
+            }
+        }
+    }
+
+    // The bundled Noto fonts ship in a `fonts/` directory beside the exe so
+    // Bengali and other scripts render in the packaged build (the loader looks
+    // in `<exe_dir>/fonts`). A missing directory is harmless.
+    let fonts_src = PathBuf::from("assets/fonts");
+    if fonts_src.is_dir() {
+        let fonts_dest = dir.join("fonts");
+        fs::create_dir_all(&fonts_dest)?;
+        for entry in fs::read_dir(&fonts_src).context("listing bundled fonts")? {
+            let entry = entry?;
+            let path = entry.path();
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if ext == "ttf" || ext == "otf" {
+                if let Some(name) = path.file_name() {
+                    fs::copy(&path, fonts_dest.join(name))
+                        .with_context(|| format!("copying {}", path.display()))?;
+                }
+            }
+        }
+    }
 
     // PDFium's third-party licence texts ship beside the app so binary
     // redistribution keeps the attributions.
@@ -535,6 +578,13 @@ Section "Install"
   File "@STAGE@\pdf-reader.exe"
   File "@STAGE@\pdfium.dll"
   File "@STAGE@\LICENSE"
+  ; Offline dictionaries for the word-lookup popup.
+  File "@STAGE@\E2Bdatabase.json"
+  File "@STAGE@\bangla_dictionary.txt"
+  File "@STAGE@\cmudict-0.7b-ipa.txt"
+  ; Bundled Noto fonts so Bengali and the other scripts render.
+  SetOutPath "$INSTDIR\fonts"
+  File "@STAGE@\fonts\*.*"
   SetOutPath "$INSTDIR\licenses"
   File "@STAGE@\licenses\*.*"
 
@@ -552,17 +602,35 @@ Section "Install"
   WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\${PRODUCT}" "NoModify" 1
   WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\${PRODUCT}" "NoRepair" 1
 
-  ; Advertise .pdf in "Open with" and Default Programs without stealing the
-  ; user's current default viewer.
+  ; --- PDF file association ----------------------------------------------
+  ; Register as a first-class PDF handler so the app appears, named
+  ; "PDF Reader", in right-click -> Open with, in the Open with submenu, and
+  ; in Settings -> Default apps.
   WriteRegStr HKLM "Software\Classes\PDFReader.PDF" "" "PDF Document"
   WriteRegStr HKLM "Software\Classes\PDFReader.PDF\DefaultIcon" "" "$INSTDIR\${EXE},0"
   WriteRegStr HKLM "Software\Classes\PDFReader.PDF\shell\open\command" "" '"$INSTDIR\${EXE}" "%1"'
+
+  ; FriendlyAppName is the label Explorer shows in "Open with" (without it the
+  ; list shows the bare file name "pdf-reader.exe").
+  WriteRegStr HKLM "Software\Classes\Applications\${EXE}" "FriendlyAppName" "${PRODUCT}"
+  WriteRegStr HKLM "Software\Classes\Applications\${EXE}\DefaultIcon" "" "$INSTDIR\${EXE},0"
   WriteRegStr HKLM "Software\Classes\Applications\${EXE}\shell\open\command" "" '"$INSTDIR\${EXE}" "%1"'
   WriteRegStr HKLM "Software\Classes\Applications\${EXE}\SupportedTypes" ".pdf" ""
+
+  ; List the app directly in the "Open with" submenu for .pdf.
+  WriteRegStr HKLM "Software\Classes\.pdf\OpenWithProgids" "PDFReader.PDF" ""
+
+  ; Default Programs (Settings -> Default apps) entry.
   WriteRegStr HKLM "Software\${PRODUCT}\Capabilities" "ApplicationName" "${PRODUCT}"
   WriteRegStr HKLM "Software\${PRODUCT}\Capabilities" "ApplicationDescription" "A fast, native PDF reader."
   WriteRegStr HKLM "Software\${PRODUCT}\Capabilities\FileAssociations" ".pdf" "PDFReader.PDF"
   WriteRegStr HKLM "Software\RegisteredApplications" "${PRODUCT}" "Software\${PRODUCT}\Capabilities"
+
+  ; Best-effort default handler for the current user: a double-clicked PDF
+  ; opens this reader. Windows keeps an explicit per-user choice (UserChoice)
+  ; ahead of this, so it only wins when no other reader has been pinned, and
+  ; the user can always change it in Default apps.
+  WriteRegStr HKCU "Software\Classes\.pdf" "" "PDFReader.PDF"
 
   WriteUninstaller "$INSTDIR\Uninstall.exe"
 SectionEnd
@@ -573,10 +641,15 @@ Section "Uninstall"
   DeleteRegKey HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\${PRODUCT}"
   DeleteRegKey HKLM "Software\Classes\PDFReader.PDF"
   DeleteRegKey HKLM "Software\Classes\Applications\${EXE}"
+  DeleteRegValue HKLM "Software\Classes\.pdf\OpenWithProgids" "PDFReader.PDF"
   DeleteRegValue HKLM "Software\RegisteredApplications" "${PRODUCT}"
   DeleteRegKey /ifempty HKLM "Software\${PRODUCT}\Capabilities\FileAssociations"
   DeleteRegKey /ifempty HKLM "Software\${PRODUCT}\Capabilities"
   DeleteRegKey /ifempty HKLM "Software\${PRODUCT}"
+  ; Remove the per-user default only if it still points at us.
+  ReadRegStr $0 HKCU "Software\Classes\.pdf" ""
+  StrCmp $0 "PDFReader.PDF" 0 +2
+  DeleteRegValue HKCU "Software\Classes\.pdf" ""
 SectionEnd
 "#;
 
@@ -607,6 +680,12 @@ LicenseFile=@LICENSE@
 Source: "@STAGE@\pdf-reader.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "@STAGE@\pdfium.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "@STAGE@\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
+; Offline dictionaries for the word-lookup popup.
+Source: "@STAGE@\E2Bdatabase.json"; DestDir: "{app}"; Flags: ignoreversion
+Source: "@STAGE@\bangla_dictionary.txt"; DestDir: "{app}"; Flags: ignoreversion
+Source: "@STAGE@\cmudict-0.7b-ipa.txt"; DestDir: "{app}"; Flags: ignoreversion
+; Bundled Noto fonts so every script renders.
+Source: "@STAGE@\fonts\*"; DestDir: "{app}\fonts"; Flags: ignoreversion
 Source: "@STAGE@\licenses\*"; DestDir: "{app}\licenses"; Flags: ignoreversion
 
 [Icons]
@@ -614,17 +693,23 @@ Name: "{group}\@PRODUCT@"; Filename: "{app}\pdf-reader.exe"
 Name: "{group}\Uninstall @PRODUCT@"; Filename: "{uninstallexe}"
 
 [Registry]
-; Advertise .pdf in "Open with" and Default Programs without stealing the
-; user's current default viewer.
+; Register as a first-class PDF handler so the app appears, named "PDF Reader",
+; in right-click -> Open with, in the Open with submenu, and in Default apps.
 Root: HKLM; Subkey: "Software\Classes\PDFReader.PDF"; ValueType: string; ValueData: "PDF Document"; Flags: uninsdeletekey
 Root: HKLM; Subkey: "Software\Classes\PDFReader.PDF\DefaultIcon"; ValueType: string; ValueData: "{app}\pdf-reader.exe,0"; Flags: uninsdeletekey
 Root: HKLM; Subkey: "Software\Classes\PDFReader.PDF\shell\open\command"; ValueType: string; ValueData: """{app}\pdf-reader.exe"" ""%1"""; Flags: uninsdeletekey
+; FriendlyAppName is the label Explorer shows in "Open with".
+Root: HKLM; Subkey: "Software\Classes\Applications\pdf-reader.exe"; ValueType: string; ValueName: "FriendlyAppName"; ValueData: "@PRODUCT@"; Flags: uninsdeletekey
+Root: HKLM; Subkey: "Software\Classes\Applications\pdf-reader.exe\DefaultIcon"; ValueType: string; ValueData: "{app}\pdf-reader.exe,0"; Flags: uninsdeletekey
 Root: HKLM; Subkey: "Software\Classes\Applications\pdf-reader.exe\shell\open\command"; ValueType: string; ValueData: """{app}\pdf-reader.exe"" ""%1"""; Flags: uninsdeletekey
 Root: HKLM; Subkey: "Software\Classes\Applications\pdf-reader.exe\SupportedTypes"; ValueType: string; ValueName: ".pdf"; ValueData: ""; Flags: uninsdeletekey
+Root: HKLM; Subkey: "Software\Classes\.pdf\OpenWithProgids"; ValueType: string; ValueName: "PDFReader.PDF"; ValueData: ""; Flags: uninsdeletevalue
 Root: HKLM; Subkey: "Software\@PRODUCT@\Capabilities"; ValueType: string; ValueName: "ApplicationName"; ValueData: "@PRODUCT@"; Flags: uninsdeletekey
 Root: HKLM; Subkey: "Software\@PRODUCT@\Capabilities"; ValueType: string; ValueName: "ApplicationDescription"; ValueData: "A fast, native PDF reader."
 Root: HKLM; Subkey: "Software\@PRODUCT@\Capabilities\FileAssociations"; ValueType: string; ValueName: ".pdf"; ValueData: "PDFReader.PDF"
 Root: HKLM; Subkey: "Software\RegisteredApplications"; ValueType: string; ValueName: "@PRODUCT@"; ValueData: "Software\@PRODUCT@\Capabilities"; Flags: uninsdeletevalue
+; Best-effort per-user default (wins only when no reader is pinned).
+Root: HKCU; Subkey: "Software\Classes\.pdf"; ValueType: string; ValueData: "PDFReader.PDF"; Flags: uninsdeletevalue
 
 [Run]
 Filename: "{app}\pdf-reader.exe"; Description: "Launch @PRODUCT@"; Flags: nowait postinstall skipifsilent

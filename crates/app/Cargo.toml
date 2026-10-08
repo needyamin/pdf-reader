@@ -29,7 +29,9 @@ windows-sys = { version = "0.59", features = [
 
 [dependencies]
 pdfreader-core = { workspace = true }
+pdfreader-lens = { workspace = true }
 pdfreader-pdf = { workspace = true }
+pdfreader-platform = { workspace = true }
 pdfreader-render = { workspace = true }
 pdfreader-search = { workspace = true }
 pdfreader-ui = { workspace = true }

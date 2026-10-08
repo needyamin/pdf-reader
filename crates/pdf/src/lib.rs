@@ -19,7 +19,7 @@ pub use export::{JobProgress, MAX_EXPORT_MEGAPIXELS};
 // without PDFium; this crate only converts PDFium's objects into them.
 pub use geometry::Rect;
 pub use pdfreader_core::{AnnotationId, AnnotationInfo, AnnotationKind, NewAnnotation};
-pub use text::{CharBox, Line, Span, TextPage};
+pub use text::{CharBox, CharRange, Line, Span, TextPage};
 
 /// Result type used throughout this crate.
 pub type Result<T> = std::result::Result<T, EngineError>;

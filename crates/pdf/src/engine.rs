@@ -650,11 +650,9 @@ impl PdfEngine for PdfiumEngine {
             });
         }
 
-        Ok(TextPage {
-            chars,
-            words: Vec::new(),
-            lines: Vec::new(),
-        })
+        // Words and lines are derived here rather than at selection time so a
+        // click can widen to a word without rescanning the page.
+        Ok(crate::text::build(chars))
     }
 
     fn export_page_image(

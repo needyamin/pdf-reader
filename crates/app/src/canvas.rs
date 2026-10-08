@@ -14,17 +14,21 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use egui::{
-    Color32, ColorImage, Context, Rect, Sense, Stroke, StrokeKind, TextureHandle, TextureOptions,
-    Ui, Vec2, pos2, vec2,
+    Color32, ColorImage, Context, Pos2, Rect, Sense, Stroke, StrokeKind, TextureHandle,
+    TextureOptions, Ui, Vec2, pos2, vec2,
 };
 use pdfreader_core::{
     AnnotationKind, Command, Document, DocumentId, FieldId, FieldValue, FormFieldType, FormInfo,
     NewAnnotation, Rect as PdfSpaceRect, Rotation, Tool, ViewMode, ViewState,
 };
 use pdfreader_pdf::engine::{TilePixels, TileRequest};
+use pdfreader_pdf::CharRange;
 use pdfreader_render::{
-    PageBox, PageSpace, TILE_SIZE, TileKey, level_scale, tile_grid, tile_pixel_rect, zoom_level,
+    PageBox, PageSpace, TILE_SIZE, TileKey, hit_page, level_scale, tile_grid, tile_pixel_rect,
+    zoom_level,
 };
+
+use crate::lens::{LookupRequest, PageTextCache};
 
 /// Logical gap between consecutive pages, in points.
 pub const PAGE_GAP: f32 = 16.0;
@@ -132,6 +136,11 @@ pub struct ThumbnailResult {
 }
 
 /// Texture caches for tiles and thumbnails.
+///
+/// The booleans are independent interaction and rendering flags (pan tool,
+/// selection in progress, prefetch); they read better as named fields than as
+/// a packed bitflag.
+#[allow(clippy::struct_excessive_bools)]
 pub struct Canvas {
     tiles: HashMap<TileCacheKey, TextureHandle>,
     order: VecDeque<TileCacheKey>,
@@ -210,6 +219,29 @@ pub struct Canvas {
     pending: Vec<PendingEcho>,
     /// Open text input for a note being placed.
     note_input: Option<NoteInput>,
+    /// Start of an in-progress text selection: the page and the layout-space
+    /// point the press landed on.
+    select_start: Option<(u32, (f32, f32))>,
+    /// Whether the current press actually began a selection on a page. Persists
+    /// across frames so the release can commit it; stays false for clicks that
+    /// landed on the popup or blank paper, which must not re-open the card.
+    selecting: bool,
+    /// Whether the primary button is currently held down on the page area.
+    /// Tracks the edge so a selection starts on the press frame, not on every
+    /// frame of the drag.
+    pressing_page: bool,
+    /// Whether tiles just outside the viewport are requested ahead of time.
+    /// Turning this off (Settings → Performance) saves memory and bandwidth at
+    /// the cost of a brief blank flash when scrolling into a new area.
+    prefetch: bool,
+    /// The text selection: the page and the characters covered.
+    ///
+    /// Held here rather than in the store because it is transient widget state
+    /// tied to what is on screen, not part of the document.
+    selection: Option<(u32, CharRange)>,
+    /// A word or phrase the user just picked, taken by the shell to open the
+    /// lookup popup.
+    lookup: Option<LookupRequest>,
 }
 
 impl Default for Canvas {
@@ -251,8 +283,39 @@ impl Canvas {
             stale_thumbs: HashSet::new(),
             pending: Vec::new(),
             note_input: None,
+            select_start: None,
+            selecting: false,
+            pressing_page: false,
+            prefetch: true,
+            selection: None,
+            lookup: None,
         }
     }
+
+    /// Take the word or phrase the user just picked, if any.
+    ///
+    /// One pick is handled once, the same as [`Self::take_click`].
+    pub fn take_lookup(&mut self) -> Option<LookupRequest> {
+        self.lookup.take()
+    }
+
+    /// Drop the current text selection.
+    ///
+    /// Called when the popup closes and when the document changes: a selection
+    /// is a highlight over one page's text, so it cannot outlive the view it
+    /// was made in.
+    pub fn clear_selection(&mut self) {
+        self.select_start = None;
+        self.selecting = false;
+        self.pressing_page = false;
+        self.selection = None;
+    }
+
+    /// Turn look-ahead tile prefetching on or off (Settings → Performance).
+    pub fn set_prefetch(&mut self, on: bool) {
+        self.prefetch = on;
+    }
+
 
     /// Page spaces from the last draw, in document layout space.
     ///
@@ -289,6 +352,9 @@ impl Canvas {
         self.draw_start = None;
         self.draw_page = None;
         self.pending.clear();
+        // A selection is tied to the text of one document; carrying it to the
+        // next would highlight the wrong characters.
+        self.clear_selection();
     }
 
     /// Drop the echoes for one document, e.g. when their creation failed.
@@ -571,6 +637,7 @@ impl Canvas {
         selected: Option<FieldId>,
         accent: Color32,
         tool: Tool,
+        page_text: &PageTextCache,
     ) -> Vec<PendingTile> {
         let mut candidates: Vec<(f32, PendingTile)> = Vec::new();
         let rotation = view.rotation;
@@ -861,9 +928,85 @@ impl Canvas {
                 }
             }
 
+            // Text selection. With no annotation tool active, a click widens to
+            // the word under it and a drag selects a phrase. Neither is
+            // interpreted here: the pick is handed to the shell, which owns the
+            // dictionaries and the popup.
+            if tool.annotation_kind().is_none() && !self.pan_tool {
+                let pointer = ui.input(|i| i.pointer.clone());
+                let in_view = pointer
+                    .latest_pos()
+                    .is_some_and(|pos| ui.clip_rect().contains(pos));
+
+                // Match against the page area's own interaction, not the raw
+                // pointer, so a click that lands on the lookup popup (or any
+                // other widget painted on top) does not also start a selection
+                // underneath it — that leak made the popup jump to whatever text
+                // sat behind the card.
+                let down_on_page = page_area.is_pointer_button_down_on();
+                // Detect the rising edge of a press against the page area only.
+                // Comparing to the previous frame's state keeps a click that
+                // lands on the popup (or any widget above the page) from also
+                // starting a selection underneath it.
+                let press = down_on_page && !self.pressing_page;
+                self.pressing_page = down_on_page;
+                if press {
+                    self.select_start = in_view
+                        .then(|| page_area.interact_pointer_pos())
+                        .flatten()
+                        .map(|pos| (pos.x - content_origin.x, pos.y - content_origin.y))
+                        .and_then(|local| {
+                            hit_page(&page_spaces, local).map(|space| (space.index, local))
+                        });
+                    // A press that missed every page clears what was selected.
+                    self.selecting = self.select_start.is_some();
+                    if !self.selecting {
+                        self.selection = None;
+                    }
+                }
+
+                let released = pointer.primary_released();
+                if (pointer.primary_down() || released) && self.select_start.is_some() {
+                    if let Some((page, start)) = self.select_start {
+                        if let Some(pos) = pointer.interact_pos().or(pointer.latest_pos()) {
+                            let end = (pos.x - content_origin.x, pos.y - content_origin.y);
+                            self.selection =
+                                selection_range(&page_spaces, page, page_text, doc.id, start, end);
+                        }
+                    }
+                }
+
+                if released {
+                    self.select_start = None;
+                    // Only commit when this gesture actually began on a page.
+                    // Otherwise a click on the popup (which leaves the existing
+                    // selection intact) would re-emit it and re-open the card.
+                    if self.selecting {
+                        if let Some((page, range)) = self.selection {
+                            self.lookup = emit_lookup(
+                                &page_spaces,
+                                page,
+                                range,
+                                page_text,
+                                doc.id,
+                                content_origin,
+                            );
+                        }
+                        self.selecting = false;
+                    }
+                }
+            }
+
             painter.rect_filled(ui.clip_rect(), 0.0, background);
 
-            let prefetch = viewport.expand2(vec2(viewport.width() * 0.5, viewport.height() * 0.5));
+            // Look-ahead region. When prefetching is off, only what is actually
+            // on screen is drawn and requested, so a fast scroll can show a
+            // brief blank before the tiles arrive.
+            let prefetch = if self.prefetch {
+                viewport.expand2(vec2(viewport.width() * 0.5, viewport.height() * 0.5))
+            } else {
+                viewport
+            };
             let center = viewport.center();
 
             for pb in &boxes {
@@ -1099,6 +1242,34 @@ impl Canvas {
                             pos2(start.0.max(end.0), start.1.max(end.1)),
                         );
                         draw_shape_preview(&painter, kind, rect, content_origin);
+                    }
+                }
+            }
+
+            // The text selection, one box per line so a multi-line pick follows
+            // the text instead of covering the gutter. Drawn above the opaque
+            // tiles and below the tool preview.
+            if let Some((page, range)) = self.selection {
+                if let Some(space) = page_spaces.iter().find(|space| space.index == page) {
+                    if let Some(text) = page_text.get(doc.id, page) {
+                        let fill = Color32::from_rgba_unmultiplied(
+                            accent.r(),
+                            accent.g(),
+                            accent.b(),
+                            80,
+                        );
+                        for rect in text.range_rects(range) {
+                            let screen = space.to_screen(rect);
+                            painter.rect_filled(
+                                Rect::from_min_size(
+                                    pos2(screen.x, screen.y),
+                                    vec2(screen.w.max(1.0), screen.h.max(1.0)),
+                                )
+                                .translate(content_origin.to_vec2()),
+                                1.0,
+                                fill,
+                            );
+                        }
                     }
                 }
             }
@@ -1454,6 +1625,83 @@ fn draw_pending_echoes(
 /// Text commits on Enter or blur and is buffered in egui memory meanwhile;
 /// every keystroke would otherwise round-trip through the engine thread and
 /// re-rasterize the page. Dropdowns commit on selection, which is discrete.
+/// How far a press may land from a glyph and still count as hitting it, in
+/// points. Wide enough for the gap beside a word, narrow enough that a click in
+/// the margin selects nothing.
+const SELECT_TOLERANCE_PT: f32 = 6.0;
+
+/// Resolve a press and a release into the characters they cover.
+///
+/// A press that never really moved selects the word under it, which is the
+/// single-click case; anything further becomes the characters between the two
+/// ends, whichever way the drag went.
+fn selection_range(
+    spaces: &[PageSpace],
+    page: u32,
+    cache: &PageTextCache,
+    doc: DocumentId,
+    start: (f32, f32),
+    end: (f32, f32),
+) -> Option<(u32, CharRange)> {
+    let space = spaces.iter().find(|space| space.index == page)?;
+    let text = cache.get(doc, page)?;
+    if text.is_empty() {
+        return None;
+    }
+
+    let (sx, sy) = space.to_page(start);
+    let anchor = text
+        .char_at(sx, sy)
+        .or_else(|| text.nearest_char(sx, sy, SELECT_TOLERANCE_PT))?;
+
+    let dragged = (end.0 - start.0).abs() > 3.0 || (end.1 - start.1).abs() > 3.0;
+    if !dragged {
+        return Some((page, text.word_range(anchor)));
+    }
+
+    let (ex, ey) = space.to_page(end);
+    let other = text
+        .char_at(ex, ey)
+        .or_else(|| text.nearest_char(ex, ey, SELECT_TOLERANCE_PT))?;
+    Some((page, CharRange::spanning(anchor, other)))
+}
+
+/// Turn a finished selection into a request the shell can answer.
+///
+/// Returns `None` when the selection holds no real text, which is what stops a
+/// click on a blank part of the page from opening an empty popup.
+fn emit_lookup(
+    spaces: &[PageSpace],
+    page: u32,
+    range: CharRange,
+    cache: &PageTextCache,
+    doc: DocumentId,
+    origin: Pos2,
+) -> Option<LookupRequest> {
+    let space = spaces.iter().find(|space| space.index == page)?;
+    let text = cache.get(doc, page)?;
+    let selected = text.range_text(range);
+    if selected.trim().is_empty() {
+        return None;
+    }
+
+    // Anchored under the last line of the selection, so a pick that spans
+    // several lines puts the card at the end of what was chosen.
+    let anchor = text
+        .range_rects(range)
+        .last()
+        .copied()
+        .or_else(|| text.range_rect(range))
+        .map(|rect| space.to_screen_point((rect.min_x, rect.min_y)))
+        .unwrap_or(space.origin);
+
+    Some(LookupRequest {
+        page,
+        text: selected,
+        anchor: pos2(anchor.0 + origin.x, anchor.1 + origin.y + 6.0),
+    })
+}
+
 fn draw_field_editor(
     ui: &mut Ui,
     form: &FormInfo,
@@ -1675,6 +1923,48 @@ fn bgra_to_color_image(width: u32, height: u32, data: &[u8]) -> ColorImage {
 mod tests {
     use super::*;
     use pdfreader_core::{Outline, PageGeometry};
+    use pdfreader_pdf::TextPage;
+
+    /// One line of text laid out on a 200×100 point page, plus the page space
+    /// that maps it to layout coordinates at 1:1 zoom with no rotation.
+    fn text_fixture() -> (TextPage, PageSpace) {
+        let mut chars = Vec::new();
+        let mut x = 10.0;
+        for ch in "hello world".chars() {
+            let width = if ch == ' ' { 3.0 } else { 8.0 };
+            chars.push(pdfreader_pdf::CharBox {
+                ch,
+                rect: PdfSpaceRect::from_xywh(x, 50.0, width, 10.0),
+                line: 0,
+                word: 0,
+            });
+            x += width;
+        }
+        let page = pdfreader_pdf::text::build(chars);
+        let space = PageSpace::new(
+            PageBox::new(0, 0.0, 0.0, 200.0, 100.0),
+            PageGeometry {
+                width_pt: 200.0,
+                height_pt: 100.0,
+            },
+            Rotation::None,
+            1.0,
+        );
+        (page, space)
+    }
+
+    /// A cache holding that one page of text.
+    fn text_cache(page: TextPage) -> PageTextCache {
+        let mut cache = PageTextCache::new();
+        cache.insert(DocumentId::from_raw(1), 0, page);
+        cache
+    }
+
+    /// The layout-space point over the first glyph: PDF (14, 55) at 1:1.
+    const ON_HELLO: (f32, f32) = (14.0, 45.0);
+    /// A point over the last glyph of "world", so a drag to here covers both
+    /// words. PDF x 89 is inside `d` (85–93); at 1:1 zoom layout x is the same.
+    const ON_WORLD: (f32, f32) = (89.0, 45.0);
 
     fn doc(pages: usize) -> Document {
         Document {
@@ -1824,6 +2114,7 @@ mod tests {
                     None,
                     Color32::TRANSPARENT,
                     Tool::Select,
+                    &PageTextCache::new(),
                 );
             });
             out.textures_delta.clear();
@@ -1884,6 +2175,7 @@ mod tests {
                     None,
                     Color32::TRANSPARENT,
                     Tool::Select,
+                    &PageTextCache::new(),
                 );
             });
             out.textures_delta.clear();
@@ -1931,6 +2223,7 @@ mod tests {
                 None,
                 Color32::TRANSPARENT,
                 Tool::Select,
+                &PageTextCache::new(),
             );
         });
         // The GPU backend would normally apply these; clear them so dropping the
@@ -1987,6 +2280,7 @@ mod tests {
                 None,
                 Color32::TRANSPARENT,
                 Tool::Select,
+                &PageTextCache::new(),
             );
         });
         out.textures_delta.clear();
@@ -2018,6 +2312,7 @@ mod tests {
                 None,
                 Color32::TRANSPARENT,
                 Tool::Select,
+                &PageTextCache::new(),
             );
         });
         out2.textures_delta.clear();
@@ -2059,6 +2354,7 @@ mod tests {
                     None,
                     Color32::TRANSPARENT,
                     Tool::Select,
+                    &PageTextCache::new(),
                 );
             });
             out.textures_delta.clear();
@@ -2116,6 +2412,7 @@ mod tests {
                         None,
                         Color32::TRANSPARENT,
                         Tool::Select,
+                        &PageTextCache::new(),
                     );
                 });
                 output.textures_delta.clear();
@@ -2223,6 +2520,7 @@ mod tests {
                     None,
                     Color32::TRANSPARENT,
                     Tool::Select,
+                    &PageTextCache::new(),
                 );
                 if !jumping_now {
                     center = canvas.center_page();
@@ -2378,6 +2676,7 @@ mod tests {
                     None,
                     Color32::TRANSPARENT,
                     Tool::Select,
+                    &PageTextCache::new(),
                 );
             });
             out.textures_delta.clear();
@@ -2411,6 +2710,7 @@ mod tests {
                     None,
                     Color32::TRANSPARENT,
                     Tool::Select,
+                    &PageTextCache::new(),
                 );
             });
             out2.textures_delta.clear();
@@ -2826,5 +3126,96 @@ mod tests {
         });
         canvas.cancel_pending(doc);
         assert!(canvas.pending.is_empty(), "failed creation drops the echo");
+    }
+
+    #[test]
+    fn a_click_selects_the_word_under_it() {
+        let (page, space) = text_fixture();
+        let cache = text_cache(page.clone());
+        let doc = DocumentId::from_raw(1);
+
+        let (selected_page, range) =
+            selection_range(&[space], 0, &cache, doc, ON_HELLO, ON_HELLO).expect("a word is hit");
+        assert_eq!(selected_page, 0);
+        assert_eq!(page.range_text(range), "hello", "a click widens to the word");
+    }
+
+    #[test]
+    fn a_drag_selects_every_character_between_the_ends() {
+        let (page, space) = text_fixture();
+        let cache = text_cache(page.clone());
+        let doc = DocumentId::from_raw(1);
+
+        let (_, range) =
+            selection_range(&[space], 0, &cache, doc, ON_HELLO, ON_WORLD).expect("both ends hit");
+        assert_eq!(page.range_text(range), "hello world");
+    }
+
+    #[test]
+    fn a_drag_backwards_selects_the_same_text() {
+        let (page, space) = text_fixture();
+        let cache = text_cache(page.clone());
+        let doc = DocumentId::from_raw(1);
+
+        let forward = selection_range(&[space], 0, &cache, doc, ON_HELLO, ON_WORLD);
+        let backward = selection_range(&[space], 0, &cache, doc, ON_WORLD, ON_HELLO);
+        assert_eq!(forward, backward, "the direction of the drag must not matter");
+    }
+
+    #[test]
+    fn a_page_with_no_text_selects_nothing() {
+        let (_, space) = text_fixture();
+        let cache = text_cache(TextPage::default());
+        let doc = DocumentId::from_raw(1);
+        assert!(selection_range(&[space], 0, &cache, doc, ON_HELLO, ON_HELLO).is_none());
+    }
+
+    #[test]
+    fn a_page_never_extracted_selects_nothing() {
+        let (_, space) = text_fixture();
+        let empty = PageTextCache::new();
+        assert!(selection_range(&[space], 0, &empty, DocumentId::from_raw(1), ON_HELLO, ON_WORLD)
+            .is_none());
+    }
+
+    #[test]
+    fn a_pick_becomes_a_request_anchored_under_the_selection() {
+        let (page, space) = text_fixture();
+        let cache = text_cache(page.clone());
+        let doc = DocumentId::from_raw(1);
+        let (_, range) =
+            selection_range(&[space], 0, &cache, doc, ON_HELLO, ON_HELLO).expect("a word is hit");
+
+        let request = emit_lookup(&[space], 0, range, &cache, doc, Pos2::ZERO)
+            .expect("a word of text makes a request");
+        assert_eq!(request.text, "hello");
+        // PDF y is up, so the bottom of the glyph box is below it on screen:
+        // PDF y 50 on a 100pt page lands at layout y 50, plus the 6pt offset.
+        assert!((request.anchor.x - 10.0).abs() < 1.0);
+        assert!((request.anchor.y - 56.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn an_empty_selection_produces_no_request() {
+        let (page, space) = text_fixture();
+        let cache = text_cache(page);
+        assert!(emit_lookup(
+            &[space],
+            0,
+            CharRange::default(),
+            &cache,
+            DocumentId::from_raw(1),
+            Pos2::ZERO
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn clearing_a_selection_drops_the_highlight() {
+        let mut canvas = Canvas::new();
+        canvas.selection = Some((0, CharRange::spanning(0, 4)));
+        canvas.clear_selection();
+        assert!(canvas.selection.is_none());
+        assert!(canvas.select_start.is_none());
     }
 }

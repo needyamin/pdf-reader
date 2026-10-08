@@ -21,7 +21,7 @@ use pdfreader_core::{
     TabId,
 };
 use pdfreader_pdf::engine::{DocumentHandle, PdfEngine, PdfiumEngine, TilePixels, TileRequest};
-use pdfreader_pdf::{DocumentInfo, EngineError, JobProgress};
+use pdfreader_pdf::{DocumentInfo, EngineError, JobProgress, TextPage};
 use pdfreader_render::TileKey;
 
 /// Work the engine thread can be asked to do.
@@ -151,6 +151,19 @@ pub enum EngineRequest {
         /// abandoned mid-extraction instead of starving tile rendering for
         /// the full document.
         generation: u64,
+    },
+    /// Extract one page's text geometry.
+    ///
+    /// Requested for the pages on screen so a click can be hit-tested to a
+    /// character without touching PDFium from the UI thread. The result is
+    /// cached by the shell; this is asked for once per page, not per click.
+    PageText {
+        /// Document the page belongs to.
+        doc: DocumentId,
+        /// Document to read from.
+        handle: DocumentHandle,
+        /// Zero-based page index.
+        page: u32,
     },
     /// Write one page out as an image file.
     ExportPageImage {
@@ -353,6 +366,27 @@ pub enum EngineResponse {
         query: String,
         /// Matching pages in ascending order.
         matches: Vec<pdfreader_search::SearchMatch>,
+    },
+    /// One page's text geometry, ready for hit-testing.
+    PageText {
+        /// Document the page belongs to.
+        doc: DocumentId,
+        /// Zero-based page index.
+        page: u32,
+        /// Characters, words and lines in PDF page space.
+        text: TextPage,
+    },
+    /// Text extraction failed for a page.
+    ///
+    /// Reported, rather than silently dropped, so the shell can stop waiting
+    /// for a result that will never arrive.
+    PageTextFailed {
+        /// Document the page belongs to.
+        doc: DocumentId,
+        /// Zero-based page index.
+        page: u32,
+        /// Human-readable reason.
+        reason: String,
     },
     /// One step of a long-running export or composition job.
     JobProgress {
@@ -759,6 +793,19 @@ fn run(
                     })
                     .is_err()
                 {
+                    return;
+                }
+            }
+            EngineRequest::PageText { doc, handle, page } => {
+                let response = match engine.page_text(handle, page) {
+                    Ok(text) => EngineResponse::PageText { doc, page, text },
+                    Err(error) => EngineResponse::PageTextFailed {
+                        doc,
+                        page,
+                        reason: error.to_string(),
+                    },
+                };
+                if responses.send(response).is_err() {
                     return;
                 }
             }

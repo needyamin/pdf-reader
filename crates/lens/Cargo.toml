@@ -1,0 +1,17 @@
+[package]
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+name = "pdfreader-lens"
+description = "Offline word lookup: English-Bangla dictionary, IPA, and translate links"
+publish = false
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true
