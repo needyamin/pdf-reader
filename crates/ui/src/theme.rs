@@ -47,7 +47,7 @@ impl Theme {
     /// Build the theme for a given id.
     pub fn from_id(id: ThemeId) -> Self {
         match id {
-            ThemeId::Acrobat => Self::build_flat(false, acrobat_palette()),
+            ThemeId::AnsNew => Self::build_flat(false, ansnew_palette()),
             ThemeId::Dark => Self::build(false, dark_palette()),
             ThemeId::Light => Self::build(true, light_palette()),
             ThemeId::Midnight => Self::build(false, midnight_palette()),
@@ -62,8 +62,7 @@ impl Theme {
         Self::build_with_radius(light, palette, 7)
     }
 
-    /// Build a flat theme: near-zero corner radii, in the spirit of Adobe
-    /// Acrobat Pro DC's squared chrome.
+    /// Build a flat theme: near-zero corner radii, for squared chrome.
     fn build_flat(light: bool, palette: Palette) -> Self {
         Self::build_with_radius(light, palette, 2)
     }
@@ -137,9 +136,9 @@ pub fn apply(ctx: &Context, id: ThemeId) {
     Theme::from_id(id).apply(ctx);
 }
 
-/// Adobe Acrobat Pro DC–style palette: dark gray chrome, near-black canvas,
-/// and the signature red accent.
-const fn acrobat_palette() -> Palette {
+/// The default (`AnsNew`) palette: dark gray chrome, near-black canvas, and a
+/// red accent.
+const fn ansnew_palette() -> Palette {
     Palette {
         window_bg: Color32::from_rgb(0x25, 0x25, 0x26),
         panel_bg: Color32::from_rgb(0x2e, 0x2e, 0x30),

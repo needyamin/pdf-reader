@@ -135,6 +135,41 @@ pub struct ThumbnailResult {
     pub clicked: Option<u32>,
 }
 
+/// Font used to draw form field text and the on-page editor.
+///
+/// The app owns the setting (Settings → Text) and pushes it here so the canvas
+/// can render typed values in the chosen face and size — the PDF's own font is
+/// not enough for scripts like Bengali, and the size a form hard-codes is often
+/// too small to read.
+#[derive(Clone, Debug, Default)]
+pub struct FormFont {
+    /// Named egui font family, or empty for the default proportional face.
+    pub family: String,
+    /// Point size, or `0.0` to fit the field's height.
+    pub size: f32,
+}
+
+impl FormFont {
+    /// The egui family to draw with, falling back to the default proportional
+    /// face when no family is chosen.
+    pub fn family(&self) -> egui::FontFamily {
+        if self.family.is_empty() {
+            egui::FontFamily::Proportional
+        } else {
+            egui::FontFamily::Name(self.family.clone().into())
+        }
+    }
+
+    /// The size to draw at, given the field's on-screen height.
+    pub fn size_for(&self, rect_height: f32) -> f32 {
+        if self.size > 0.0 {
+            self.size
+        } else {
+            (rect_height * 0.62).clamp(6.0, 15.0)
+        }
+    }
+}
+
 /// Texture caches for tiles and thumbnails.
 ///
 /// The booleans are independent interaction and rendering flags (pan tool,
@@ -234,6 +269,8 @@ pub struct Canvas {
     /// Turning this off (Settings → Performance) saves memory and bandwidth at
     /// the cost of a brief blank flash when scrolling into a new area.
     prefetch: bool,
+    /// Font used to draw form field text and the on-page editor.
+    form_font: FormFont,
     /// The text selection: the page and the characters covered.
     ///
     /// Held here rather than in the store because it is transient widget state
@@ -287,6 +324,7 @@ impl Canvas {
             selecting: false,
             pressing_page: false,
             prefetch: true,
+            form_font: FormFont::default(),
             selection: None,
             lookup: None,
         }
@@ -314,6 +352,12 @@ impl Canvas {
     /// Turn look-ahead tile prefetching on or off (Settings → Performance).
     pub fn set_prefetch(&mut self, on: bool) {
         self.prefetch = on;
+    }
+
+    /// Set the font used for form field text and the on-page editor
+    /// (Settings → Text).
+    pub fn set_form_font(&mut self, font: FormFont) {
+        self.form_font = font;
     }
 
 
@@ -1087,7 +1131,14 @@ impl Canvas {
             // PDFium does not render live field values without a form-fill
             // environment, so the overlay is what makes filling visible.
             if let Some(form) = form {
-                draw_form_values(&painter, form, selected, &page_spaces, content_origin);
+                draw_form_values(
+                    &painter,
+                    form,
+                    selected,
+                    &page_spaces,
+                    content_origin,
+                    &self.form_font,
+                );
             }
 
             // Form field overlay, drawn after the tiles so it sits on top of
@@ -1141,6 +1192,7 @@ impl Canvas {
                     &page_spaces,
                     content_origin,
                     &mut self.edits,
+                    &self.form_font,
                 );
             }
 
@@ -1292,8 +1344,8 @@ impl Canvas {
         self.scroll_offset = output.state.offset;
 
         // Drag-to-pan. With the hand tool engaged — or the middle button held,
-        // which is what Acrobat, Chrome and every other viewer bind — dragging
-        // on the page moves the viewport. Without this a page zoomed in past
+        // which every other viewer binds — dragging on the page moves the
+        // viewport. Without this a page zoomed in past
         // the viewport can only be nudged with the scrollbars, which reads as
         // "the app is stuck" on a trackpad.
         let (panning, pan_delta) = ui.input(|input| {
@@ -1534,7 +1586,7 @@ fn draw_shape_preview(
 
 /// Draw the current values of text-like form fields on top of the page.
 ///
-/// PDFium renders a field's static appearance stream — which is empty until a
+/// `PDFium` renders a field's static appearance stream — which is empty until a
 /// form-fill environment runs, and `pdfium-render` does not wrap one. Drawing
 /// the values ourselves keeps typed text visible at all times and lets the
 /// font size adapt to each field's height, which is what real forms need
@@ -1545,6 +1597,7 @@ fn draw_form_values(
     selected: Option<FieldId>,
     page_spaces: &[PageSpace],
     content_origin: egui::Pos2,
+    font: &FormFont,
 ) {
     for field in &form.fields {
         // The selected field's own editor is on top; drawing the value under
@@ -1552,11 +1605,6 @@ fn draw_form_values(
         if selected == Some(field.id) {
             continue;
         }
-        let value = match &field.value {
-            FieldValue::Text(text) if !text.is_empty() => text,
-            FieldValue::Choice(Some(label)) if !label.is_empty() => label,
-            _ => continue,
-        };
         let Some(space) = page_spaces.iter().find(|sp| sp.index == field.id.page) else {
             continue;
         };
@@ -1570,16 +1618,72 @@ fn draw_form_values(
             continue;
         }
 
-        let painter = painter.with_clip_rect(rect);
-        let font_size = (rect.height() * 0.62).clamp(6.0, 15.0);
-        painter.text(
-            rect.left_top() + vec2(2.0, rect.height() / 2.0),
-            egui::Align2::LEFT_CENTER,
-            value,
-            egui::FontId::proportional(font_size),
-            Color32::from_rgb(25, 25, 25),
-        );
+        match &field.value {
+            // Checkboxes and radios: PDFium rasterizes the widget's *original*
+            // appearance but does not regenerate it after a value is written,
+            // so a checked box kept looking empty. Drawing the tick/dot here is
+            // what makes the state visible.
+            FieldValue::Checked(on)
+                if matches!(field.kind, FormFieldType::CheckBox | FormFieldType::RadioButton) =>
+            {
+                draw_boolean_widget(painter, rect, field.kind, *on);
+            }
+            FieldValue::Text(text) if !text.is_empty() => {
+                draw_field_text(painter, rect, text, font);
+            }
+            FieldValue::Choice(Some(label)) if !label.is_empty() => {
+                draw_field_text(painter, rect, label, font);
+            }
+            _ => {}
+        }
     }
+}
+
+/// Draw one field's typed text (or chosen option) inside its rectangle, in the
+/// user's chosen form font.
+fn draw_field_text(painter: &egui::Painter, rect: Rect, text: &str, font: &FormFont) {
+    let painter = painter.with_clip_rect(rect);
+    painter.text(
+        rect.left_top() + vec2(2.0, rect.height() / 2.0),
+        egui::Align2::LEFT_CENTER,
+        text,
+        egui::FontId::new(font.size_for(rect.height()), font.family()),
+        Color32::from_rgb(25, 25, 25),
+    );
+}
+
+/// Draw a checkbox or radio button reflecting its current value.
+///
+/// The rectangle matches the widget's own, so the outline lands on top of the
+/// one `PDFium` drew and reads as a single box; the tick (or dot) is the part
+/// `PDFium` leaves out.
+fn draw_boolean_widget(painter: &egui::Painter, rect: Rect, kind: FormFieldType, checked: bool) {
+    let ink = Color32::from_rgb(28, 28, 28);
+    let stroke = egui::Stroke::new(1.2, ink);
+    if kind == FormFieldType::RadioButton {
+        let radius = rect.width().min(rect.height()) * 0.5;
+        let center = rect.center();
+        painter.circle_filled(center, radius, Color32::WHITE);
+        painter.circle_stroke(center, radius, stroke);
+        if checked {
+            painter.circle_filled(center, radius * 0.5, ink);
+        }
+        return;
+    }
+
+    painter.rect_filled(rect, 2.0, Color32::WHITE);
+    painter.rect_stroke(rect, 2.0, stroke, egui::StrokeKind::Inside);
+    if !checked {
+        return;
+    }
+    let width = rect.width();
+    let height = rect.height();
+    let start = rect.left_top() + vec2(0.20 * width, 0.52 * height);
+    let middle = rect.left_top() + vec2(0.42 * width, 0.76 * height);
+    let end = rect.left_top() + vec2(0.80 * width, 0.24 * height);
+    let tick = egui::Stroke::new((height * 0.14).clamp(1.4, 3.0), ink);
+    painter.line_segment([start, middle], tick);
+    painter.line_segment([middle, end], tick);
 }
 
 /// Draw the just-drawn shapes that are still waiting for their real pixels.
@@ -1702,6 +1806,7 @@ fn emit_lookup(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_field_editor(
     ui: &mut Ui,
     form: &FormInfo,
@@ -1710,6 +1815,7 @@ fn draw_field_editor(
     page_spaces: &[PageSpace],
     content_origin: egui::Pos2,
     edits: &mut Vec<Command>,
+    font: &FormFont,
 ) {
     let Some(field_id) = selected else {
         return;
@@ -1762,14 +1868,16 @@ fn draw_field_editor(
                 .memory(|mem| mem.data.get_temp::<String>(editor_id))
                 .unwrap_or_else(|| field.value.as_text());
 
-            // Auto size: real form fields are often 10–14 pt tall, so the
-            // editor font follows the field height. The text stays dark in
-            // every theme — the page underneath is always white.
-            let font_size = (rect.height() * 0.62).clamp(7.0, 15.0);
+            // The editor follows the chosen form font: by default it sizes to
+            // the field height (real fields are often 10–14 pt tall), but the
+            // user can pin a family and size (Settings → Text) so Bengali and
+            // other scripts are legible. The text stays dark in every theme —
+            // the page underneath is always white.
+            let font_size = font.size_for(rect.height()).max(7.0);
             editor
                 .style_mut()
                 .text_styles
-                .insert(egui::TextStyle::Body, egui::FontId::proportional(font_size));
+                .insert(egui::TextStyle::Body, egui::FontId::new(font_size, font.family()));
             editor.visuals_mut().override_text_color = Some(Color32::from_rgb(25, 25, 25));
 
             let inner = editor.add(

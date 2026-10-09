@@ -16,11 +16,11 @@ use anyhow::{Context, Result, bail};
 use crate::{binary_name, cargo, fetch_pdfium, host_triple, staged_dir};
 
 /// Product name shared by every package format.
-const PRODUCT: &str = "PDF Reader";
+const PRODUCT: &str = "AnsNew PDF Reader";
 /// Publisher shared by every package format.
 const PUBLISHER: &str = "YAMiN HOSSAIN";
 /// MSIX identity name; per the Appx schema it must not contain spaces.
-const MSIX_IDENTITY: &str = "YAMinHossain.PDFReader";
+const MSIX_IDENTITY: &str = "AnsNew.PDFReader";
 /// MSIX publisher; must match the signing certificate subject exactly.
 const MSIX_PUBLISHER: &str = "CN=YAMiN HOSSAIN";
 /// Subject name `signtool` matches against (the bare CN, no prefix).

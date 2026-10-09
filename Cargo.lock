@@ -4909,6 +4909,7 @@ dependencies = [
  "sha2",
  "tar",
  "ureq",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

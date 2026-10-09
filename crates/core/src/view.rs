@@ -89,9 +89,9 @@ impl Default for ViewState {
 /// Named colour themes carried over from the previous version.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default, Serialize, Deserialize)]
 pub enum ThemeId {
-    /// Adobe Acrobat Pro DC–style dark chrome with a red accent.
+    /// The default: dark chrome with a red accent.
     #[default]
-    Acrobat,
+    AnsNew,
     /// Dark.
     Dark,
     /// Light.
@@ -109,7 +109,7 @@ pub enum ThemeId {
 impl ThemeId {
     /// Every theme, in display order.
     pub const ALL: [ThemeId; 7] = [
-        ThemeId::Acrobat,
+        ThemeId::AnsNew,
         ThemeId::Dark,
         ThemeId::Light,
         ThemeId::Midnight,
@@ -121,7 +121,7 @@ impl ThemeId {
     /// Stable name used for persistence.
     pub const fn name(self) -> &'static str {
         match self {
-            Self::Acrobat => "acrobat",
+            Self::AnsNew => "ansnew",
             Self::Dark => "dark",
             Self::Light => "light",
             Self::Midnight => "midnight",

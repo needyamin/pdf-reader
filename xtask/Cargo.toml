@@ -18,5 +18,10 @@ ureq = "3"
 # MSIX asset generation: scaling the app icon to the required tile sizes.
 image = { workspace = true }
 
+# `xtask run` needs `SetConsoleCtrlHandler` so a Ctrl+C in the terminal does not
+# kill xtask before it can report the app's exit.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_System_Console"] }
+
 [lints]
 workspace = true

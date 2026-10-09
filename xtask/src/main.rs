@@ -14,6 +14,38 @@ use sha2::{Digest, Sha256};
 
 mod dist;
 
+/// Ignore Ctrl+C in `xtask run` so it outlives the app it launched.
+///
+/// The debug app shares this console, so a Ctrl+C in the terminal is delivered
+/// to both processes at once. The app keeps the default handler — Ctrl+C is a
+/// perfectly normal way to close a GUI launched from a shell — while xtask
+/// ignoring it lets xtask wait for the app to exit and report a clean stop,
+/// instead of cargo printing a scary `STATUS_CONTROL_C_EXIT` error for a
+/// routine action. Only affects xtask: the child gets its own default handler.
+#[cfg(windows)]
+fn ignore_ctrl_c() {
+    use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
+    // SAFETY: `SetConsoleCtrlHandler(NULL, TRUE)` is the documented way to make
+    // the calling process ignore Ctrl+C. It reads no pointers we supply and
+    // touches no memory we own.
+    #[allow(unsafe_code)]
+    let installed = unsafe { SetConsoleCtrlHandler(None, 1) };
+    let _ = installed;
+}
+
+/// No-op off Windows, where a GUI app does not share the terminal this way.
+#[cfg(not(windows))]
+fn ignore_ctrl_c() {}
+
+/// Whether an exit status is the Windows `STATUS_CONTROL_C_EXIT` code — how a
+/// process stopped by Ctrl+C (or a closed console) reports itself.
+// Taken by reference so the caller can still inspect the status afterwards;
+// `ExitStatus` is only `Copy` on Windows, not on Unix.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn stopped_by_ctrl_c(status: &std::process::ExitStatus) -> bool {
+    status.code() == Some(0xC000_013A_u32.cast_signed())
+}
+
 /// Pinned PDFium build. The upstream release is marked immutable, so this tag
 /// keeps resolving to the same bytes.
 const PDFIUM_TAG: &str = "chromium/8066";
@@ -97,12 +129,19 @@ fn main() -> Result<()> {
             let profile = if release { "release" } else { "debug" };
             let binary = PathBuf::from("target").join(profile).join(binary_name());
 
+            // Keep Ctrl+C from killing xtask before the app has exited (see
+            // `ignore_ctrl_c`). Done after the build so Ctrl+C still cancels a
+            // long compile.
+            ignore_ctrl_c();
+
             let status = Command::new(&binary)
                 .args(args)
                 .status()
                 .with_context(|| format!("running {}", binary.display()))?;
 
-            if !status.success() {
+            if stopped_by_ctrl_c(&status) {
+                println!("application stopped (Ctrl+C)");
+            } else if !status.success() {
                 bail!("application exited with {status}");
             }
         }
@@ -343,4 +382,21 @@ fn example_binary(name: &str) -> PathBuf {
         .join("debug")
         .join("examples")
         .join(file)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn ctrl_c_exit_is_recognised() {
+        use std::os::windows::process::ExitStatusExt;
+        // 0xC000013A is STATUS_CONTROL_C_EXIT, how a Ctrl+C'd process reports.
+        assert!(stopped_by_ctrl_c(&std::process::ExitStatus::from_raw(
+            0xC000_013A
+        )));
+        assert!(!stopped_by_ctrl_c(&std::process::ExitStatus::from_raw(0)));
+        assert!(!stopped_by_ctrl_c(&std::process::ExitStatus::from_raw(1)));
+    }
 }

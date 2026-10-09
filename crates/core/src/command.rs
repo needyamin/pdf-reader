@@ -348,6 +348,12 @@ pub enum Command {
     /// Turn reading the selection aloud automatically on or off.
     ToggleAutoSpeak,
 
+    /// Set the font family used for form field text (empty = default).
+    SetFormFont(String),
+
+    /// Set the point size used for form field text (0 = fit the field).
+    SetFormFontSize(f32),
+
     /// Turn the popup's "Google Translate" link on or off.
     ToggleTranslate,
 

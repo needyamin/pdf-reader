@@ -20,7 +20,7 @@ use pdfreader_core::{
 use crate::annot;
 use crate::error::EngineError;
 use crate::export::{self, JobProgress};
-use crate::form::read_form;
+use crate::form::{read_form, read_widget_value};
 use crate::text::{CharBox, TextPage};
 use crate::{DocumentInfo, Result};
 
@@ -388,9 +388,15 @@ impl PdfEngine for PdfiumEngine {
             pdfreader_core::FieldValue::Text(text) => Some(text.clone()),
             _ => None,
         };
+        // Kept because `value` is moved by the write below, and a boolean write
+        // is the one that needs checking afterwards.
+        let checked_target = match &value {
+            pdfreader_core::FieldValue::Checked(on) => Some(*on),
+            _ => None,
+        };
 
         // Phase 1: write through the target widget.
-        let (outcome, shared_name) = {
+        let (outcome, shared_name, is_radio) = {
             let mut page = page_of(document, id.page)?;
             // A stale or bogus widget id means "nothing to write", not a
             // failure: the form was re-read or the document changed between
@@ -410,6 +416,7 @@ impl PdfEngine for PdfiumEngine {
             }
 
             let shared_name: Option<String> = field.name().map(|n| n.to_string());
+            let is_radio = field.as_radio_button_field().is_some();
             let outcome = match value {
                 pdfreader_core::FieldValue::Text(text) => field
                     .as_text_field_mut()
@@ -450,10 +457,47 @@ impl PdfEngine for PdfiumEngine {
                     Err(EngineError::Unsupported("clearing this widget".to_string()))
                 }
             };
-            (outcome, shared_name)
+            (outcome, shared_name, is_radio)
         };
 
         outcome?;
+
+        // Phase 1b: verify a boolean write actually landed.
+        //
+        // `PdfFormRadioButtonField::set_checked` writes the value onto the
+        // *widget*, but a radio group keeps its value on the parent field
+        // dictionary — so the call reports success and changes nothing. Without
+        // this check the click is dropped silently and only the saved file
+        // reveals it. Checkboxes and text fields do land; the check is one read
+        // of a field that is already open.
+        if let Some(on) = checked_target {
+            let wanted = pdfreader_core::FieldValue::Checked(on);
+            let landed = {
+                let page = page_of(document, id.page)?;
+                let annotations = page.annotations();
+                match annotations.get(id.annot_index as PdfPageAnnotationIndex) {
+                    Ok(annotation) => match annotation.as_form_field() {
+                        Some(field) => read_widget_value(field) == wanted,
+                        None => false,
+                    },
+                    Err(_) => false,
+                }
+            };
+            if !landed {
+                // A radio group keeps its value on the parent field dictionary,
+                // which `pdfium-render` does not expose, so `set_checked` writes
+                // the *widget* and changes nothing. Remember the selection
+                // instead of losing it: `form_fields` reports it back and
+                // `save_to_bytes` draws it into the page.
+                return Err(EngineError::Unsupported(
+                    if is_radio {
+                        "selecting a radio button in this form".to_string()
+                    } else {
+                        "writing this checkbox".to_string()
+                    },
+                ));
+            }
+        }
 
         // Phase 2: a field whose name is shared by several widgets keeps its
         // value on the parent field dictionary, which pdfium-render cannot
@@ -798,3 +842,4 @@ fn convert_bookmark(bookmark: &PdfBookmark, depth: usize) -> OutlineNode {
         children,
     }
 }
+

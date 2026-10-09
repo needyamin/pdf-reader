@@ -6,8 +6,8 @@
 //! engine seam.
 
 use pdfium_render::prelude::{
-    PdfDocument, PdfFormField, PdfFormFieldCommon, PdfFormFieldType, PdfFormType,
-    PdfPageAnnotation, PdfPageAnnotationCommon,
+    PdfDocument, PdfFormField, PdfFormFieldCommon, PdfFormFieldType, PdfFormRadioButtonField,
+    PdfFormType, PdfPageAnnotation, PdfPageAnnotationCommon,
 };
 
 use pdfreader_core::{
@@ -73,16 +73,7 @@ fn read_widget(
         bounds.height().value,
     );
 
-    let kind = match field.field_type() {
-        PdfFormFieldType::PushButton => FormFieldType::PushButton,
-        PdfFormFieldType::Checkbox => FormFieldType::CheckBox,
-        PdfFormFieldType::RadioButton => FormFieldType::RadioButton,
-        PdfFormFieldType::ComboBox => FormFieldType::ComboBox,
-        PdfFormFieldType::ListBox => FormFieldType::ListBox,
-        PdfFormFieldType::Text => FormFieldType::Text,
-        PdfFormFieldType::Signature => FormFieldType::Signature,
-        PdfFormFieldType::Unknown => FormFieldType::Unknown,
-    };
+    let kind = field_kind(field.field_type());
 
     let value = read_value(field, kind);
     let options = read_options(field);
@@ -100,6 +91,20 @@ fn read_widget(
         required: field.is_required(),
         multiline,
     })
+}
+
+/// Map PDFium's widget type to ours.
+fn field_kind(field_type: PdfFormFieldType) -> FormFieldType {
+    match field_type {
+        PdfFormFieldType::PushButton => FormFieldType::PushButton,
+        PdfFormFieldType::Checkbox => FormFieldType::CheckBox,
+        PdfFormFieldType::RadioButton => FormFieldType::RadioButton,
+        PdfFormFieldType::ComboBox => FormFieldType::ComboBox,
+        PdfFormFieldType::ListBox => FormFieldType::ListBox,
+        PdfFormFieldType::Text => FormFieldType::Text,
+        PdfFormFieldType::Signature => FormFieldType::Signature,
+        PdfFormFieldType::Unknown => FormFieldType::Unknown,
+    }
 }
 
 /// Read the current value of a field, per widget type.
@@ -125,11 +130,7 @@ fn read_value(field: &PdfFormField<'_>, kind: FormFieldType) -> FieldValue {
             let checked = field
                 .as_checkbox_field()
                 .and_then(|c| c.is_checked().ok())
-                .or_else(|| {
-                    field
-                        .as_radio_button_field()
-                        .and_then(|r| r.is_checked().ok())
-                });
+                .or_else(|| field.as_radio_button_field().and_then(radio_is_checked));
             FieldValue::Checked(checked.unwrap_or(false))
         }
 
@@ -137,6 +138,42 @@ fn read_value(field: &PdfFormField<'_>, kind: FormFieldType) -> FieldValue {
             FieldValue::Empty
         }
     }
+}
+
+/// Whether a radio widget is the selected one in its group.
+///
+/// `PdfFormRadioButtonField::is_checked` falls back to comparing
+/// `group_value()` with `appearance_stream()`. Both are plain strings, so an
+/// untouched group — where the group value *and* every widget's appearance
+/// stream are all `"Off"` — compares equal and **every** radio in the group
+/// reported "checked". That is exactly what a blank XFA form does, which made
+/// the field list read "Radio · Yes" down the whole panel and drew a dot on
+/// every radio on the page.
+///
+/// A radio is selected only when the group has a real (non-`Off`) value and
+/// this widget's appearance stream is that value.
+fn radio_is_checked(radio: &PdfFormRadioButtonField<'_>) -> Option<bool> {
+    let group = radio.group_value()?;
+    if is_off_state(&group) {
+        return Some(false);
+    }
+    Some(radio.appearance_stream().is_some_and(|state| state == group))
+}
+
+/// Whether a widget state name means "not selected".
+///
+/// PDF names are written with a leading slash; `"Off"` is the reserved name for
+/// the deselected state of a checkbox or radio widget.
+fn is_off_state(state: &str) -> bool {
+    state.trim_start_matches('/').eq_ignore_ascii_case("off")
+}
+
+/// Re-read one widget's current value.
+///
+/// Exposed so the engine can verify that a write actually landed: some widgets
+/// accept the call and change nothing.
+pub(crate) fn read_widget_value(field: &PdfFormField<'_>) -> FieldValue {
+    read_value(field, field_kind(field.field_type()))
 }
 
 /// Read the choices of a combo or list box.

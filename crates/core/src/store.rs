@@ -199,6 +199,8 @@ impl Store {
             | Command::ToggleLookup
             | Command::ToggleSpeak
             | Command::ToggleAutoSpeak
+            | Command::SetFormFont(_)
+            | Command::SetFormFontSize(_)
             | Command::ToggleTranslate
             | Command::SetLensTarget(_)
             | Command::ShowSettings

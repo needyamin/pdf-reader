@@ -57,8 +57,15 @@ impl Speaker {
         self.stop();
 
         let mut command = speech_command(text, lang)?;
-        // Detached so a hung voice never blocks the application from closing.
-        command.stdin(std::process::Stdio::null());
+        // Keep the child from flashing a console window (Windows).
+        hide_console(&mut command);
+        // Detached and silent: a hung voice must never block the application
+        // from closing, and with no console attached the child must not try to
+        // write to one.
+        command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
         self.child = Some(command.spawn()?);
         Ok(())
     }
@@ -87,6 +94,25 @@ impl Drop for Speaker {
         self.stop();
     }
 }
+
+/// Stop Windows from giving the child a console window of its own.
+///
+/// The app is a GUI process (`windows_subsystem = "windows"`), so spawning a
+/// console program such as PowerShell allocates a brand-new console window that
+/// flashes on screen for every utterance — very visible with auto-speak on.
+/// `CREATE_NO_WINDOW` tells Windows not to allocate one at all; unlike
+/// `-WindowStyle Hidden`, which only hides the window after it has appeared.
+#[cfg(target_os = "windows")]
+fn hide_console(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    /// `CREATE_NO_WINDOW` from `winbase.h`.
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    command.creation_flags(CREATE_NO_WINDOW);
+}
+
+/// No-op on platforms where the speech helper is not a console program.
+#[cfg(not(target_os = "windows"))]
+fn hide_console(_command: &mut Command) {}
 
 /// Build the platform command that speaks `text`.
 // The signature matches the Linux variant, which can fail when no voice is

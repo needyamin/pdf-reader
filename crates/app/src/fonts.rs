@@ -46,6 +46,32 @@ pub fn install(ctx: &Context) {
         .families
         .insert(FontFamily::Proportional, faces.clone());
 
+    // Expose each script font as its own named family, so the user can pick one
+    // for form text (Settings → Text). Every family the UI offers is registered
+    // even when its file is missing — otherwise a saved choice would name a
+    // family egui does not know and panic. Each named family keeps the full
+    // fallback chain, so a glyph the chosen face lacks still renders.
+    let mut named: Vec<String> = faces.clone();
+    for (name, _) in pdfreader_ui::FORM_FONTS {
+        if !name.is_empty() && !named.iter().any(|n| n == name) {
+            named.push((*name).to_string());
+        }
+    }
+    for name in &named {
+        let mut family: Vec<String> = Vec::new();
+        if faces.contains(name) {
+            family.push(name.clone());
+        }
+        for fallback in &faces {
+            if !family.contains(fallback) {
+                family.push(fallback.clone());
+            }
+        }
+        definitions
+            .families
+            .insert(FontFamily::Name(name.clone().into()), family);
+    }
+
     tracing::info!("bundled fonts registered: {}", faces.join(", "));
     ctx.set_fonts(definitions);
 }

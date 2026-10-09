@@ -130,14 +130,24 @@ fn main() {
     // handler for "Open with" and file associations.
     let initial = std::env::args_os().nth(1).map(PathBuf::from);
 
-    let viewport = egui::ViewportBuilder::default()
-        .with_inner_size([1400.0, 900.0])
+    // Native OS decorations: the standard minimize / maximize / close buttons
+    // are always present and behave the way people expect. The window opens
+    // maximized — filling the screen *with* its title bar — unless the user
+    // turned that off. The first frames repeat the request, because winit does
+    // not always honour the creation-time one.
+    let maximized = wants_maximized(&load_settings());
+    let mut viewport = egui::ViewportBuilder::default()
         .with_min_inner_size([820.0, 560.0])
-        // Native OS decorations: the standard minimize / maximize / close
-        // buttons are always present and behave the way people expect.
         .with_decorations(true)
-        .with_maximized(true)
-        .with_title("PDF Reader");
+        .with_title("AnsNew PDF Reader");
+    // Asking for an inner size *and* maximized at once leaves the window with
+    // the maximized flag set but the requested size applied — it looks
+    // maximized to winit and windowed on screen. Only one of them is set.
+    viewport = if maximized {
+        viewport.with_maximized(true)
+    } else {
+        viewport.with_inner_size([1400.0, 900.0])
+    };
 
     // Title bar, taskbar and Alt-Tab. Without this Windows falls back to the
     // generic application icon even when the exe carries a resource.
@@ -155,7 +165,7 @@ fn main() {
     };
 
     if let Err(error) = eframe::run_native(
-        "PDF Reader",
+        "AnsNew PDF Reader",
         options,
         Box::new(move |cc| {
             // Ctrl+Plus / Ctrl+Minus / Ctrl+0 zoom the *document* here, so
@@ -180,7 +190,13 @@ fn init_tracing() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+                // `wgpu_hal` logs a warning when the Vulkan loader cannot find
+                // the optional SDK layer manifests in the registry. That is
+                // pure noise on any machine without the Vulkan SDK installed,
+                // it says nothing about this app, and it made every launch look
+                // like it had failed — so its warnings are dropped. Everything
+                // else keeps its level, and `RUST_LOG` still overrides this.
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn,wgpu_hal=error")),
         )
         .try_init();
 }
@@ -219,6 +235,29 @@ struct Settings {
     show_stats: Option<bool>,
     /// Whether tiles just outside the viewport are prefetched.
     prefetch: Option<bool>,
+    /// Font family used for form field text (empty = default).
+    form_font: Option<String>,
+    /// Point size used for form field text (0 = fit the field).
+    form_font_size: Option<f32>,
+    /// Whether the window opens maximized. Absent means yes, which is the
+    /// default a reader wants: the page is the point, but the title bar and its
+    /// minimize / maximize / close buttons stay available.
+    open_maximized: Option<bool>,
+}
+
+/// Whether the window should open maximized.
+///
+/// Maximized, not full screen: the window fills the screen *with* its title bar
+/// and the standard window buttons, which is what "open big" means to a desktop
+/// user. True borderless full screen stays on F11.
+///
+/// On by default (see [`Settings::open_maximized`]). A screenshot run opts out
+/// so the captured size is predictable, and `PDFREADER_MAXIMIZED` forces it on.
+fn wants_maximized(settings: &Settings) -> bool {
+    if std::env::var_os("PDFREADER_MAXIMIZED").is_some() {
+        return true;
+    }
+    settings.open_maximized.unwrap_or(true) && std::env::var_os("PDFREADER_SCREENSHOT").is_none()
 }
 
 /// State for the non-blocking encrypted-document password prompt.
@@ -532,6 +571,13 @@ struct App {
     /// without un-maximizing first can fail to cover the taskbar, and leaving
     /// without restoring leaves a small floating window.
     pre_fullscreen_maximized: Option<bool>,
+    /// A viewport change held back a frame or two so the change before it can
+    /// settle. Entering fullscreen from a maximized window must un-maximize
+    /// first: doing both in one frame leaves the window fullscreen-sized with
+    /// the taskbar still showing. Leaving restores the maximized state the same
+    /// way. The `u8` counts frames waited, so a viewport that never reports the
+    /// expected state still moves on.
+    pending_viewport: Option<(u8, ViewportCommand)>,
     /// Passphrase prompts for encrypted documents, keyed by tab. Several
     /// encrypted documents can fail at once; a single slot would silently
     /// discard the passphrase a user is halfway through typing.
@@ -572,12 +618,29 @@ struct App {
     show_stats: bool,
     /// Whether tiles just outside the viewport are prefetched.
     prefetch: bool,
+    /// Font family used for form field text (empty = default).
+    form_font: String,
+    /// Point size used for form field text (0 = fit the field).
+    form_font_size: f32,
+    /// Whether the next launch opens maximized (Settings → Reading → Window).
+    open_maximized: bool,
+    /// Frames left to keep asking winit to maximize the window. A creation-time
+    /// request is not always honoured, so it is repeated for a moment and then
+    /// dropped — after that the user's own window buttons win.
+    start_maximized: u8,
     /// State of the full Settings window (open flag and selected category).
     settings_window: settings::SettingsWindow,
     /// Set by Edit → Find… so the toolbar's find box takes focus next frame.
     focus_search: bool,
+    /// Debug: a sample word to open the lookup card on, for `PDFREADER_DEMO_POPUP`
+    /// screenshot QA. Taken once the dictionaries are ready.
+    demo_popup: Option<String>,
     /// Whether the keyboard-shortcuts reference window is open.
     shortcuts_open: bool,
+    /// Whether the "About Us" window is open.
+    about_open: bool,
+    /// The profile photo, decoded once on first use.
+    profile_texture: Option<egui::TextureHandle>,
     /// Current full-text search query from the toolbar.
     search_query: String,
     /// Pages matching the last completed search.
@@ -609,6 +672,9 @@ struct App {
     /// path and exit. Lets the GUI be inspected without a human at the screen.
     screenshot: Option<PathBuf>,
     screenshot_sent: bool,
+    /// Frame at which `PDFREADER_SCREENSHOT` fires; raise it when the shot
+    /// needs something that loads late (dictionaries).
+    screenshot_frames: u64,
     frames_total: u64,
 }
 
@@ -636,6 +702,22 @@ impl App {
             // visible without any further interaction.
             store.dispatch(Command::SetSidebarTab(SidebarTab::Search));
         }
+        // Debug: pick the initial sidebar tab (PDFREADER_SIDEBAR_TAB), so a
+        // panel can be captured without clicking its tab.
+        if let Ok(tab) = std::env::var("PDFREADER_SIDEBAR_TAB") {
+            let tab = match tab.to_ascii_lowercase().as_str() {
+                "outline" => SidebarTab::Outline,
+                "search" => SidebarTab::Search,
+                "comments" => SidebarTab::Comments,
+                "forms" => SidebarTab::Forms,
+                "bookmarks" => SidebarTab::Bookmarks,
+                _ => SidebarTab::Thumbnails,
+            };
+            store.dispatch(Command::SetSidebarTab(tab));
+        }
+
+        // Read before `settings` is partially moved into the struct below.
+        let start_maximized = wants_maximized(&settings);
 
         let mut app = Self {
             store,
@@ -654,6 +736,7 @@ impl App {
             running_job: None,
             job_notice: None,
             pre_fullscreen_maximized: None,
+            pending_viewport: None,
             scroll_to_point: None,
             password_prompts: HashMap::new(),
             lens: None,
@@ -684,9 +767,16 @@ impl App {
             default_zoom: zoom_mode_from_name(settings.default_zoom.as_deref()),
             show_stats: settings.show_stats.unwrap_or(false),
             prefetch: settings.prefetch.unwrap_or(true),
+            form_font: settings.form_font.unwrap_or_default(),
+            form_font_size: settings.form_font_size.unwrap_or(0.0).max(0.0),
+            open_maximized: settings.open_maximized.unwrap_or(true),
+            start_maximized: if start_maximized { 15 } else { 0 },
             settings_window: settings::SettingsWindow::new(),
             focus_search: false,
+            demo_popup: std::env::var("PDFREADER_DEMO_POPUP").ok(),
             shortcuts_open: false,
+            about_open: std::env::var_os("PDFREADER_ABOUT").is_some(),
+            profile_texture: None,
             search_query: seeded_query.unwrap_or_default(),
             search_results: Vec::new(),
             search_doc: None,
@@ -703,12 +793,20 @@ impl App {
             last_stats: std::time::Instant::now(),
             screenshot: std::env::var_os("PDFREADER_SCREENSHOT").map(PathBuf::from),
             screenshot_sent: false,
+            screenshot_frames: std::env::var("PDFREADER_SCREENSHOT_FRAMES")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(20),
             frames_total: 0,
         };
 
         // The canvas owns the prefetch flag (it is what draws the tiles), so
         // seed it from the persisted preference now that `app` exists.
         app.canvas.set_prefetch(app.prefetch);
+        app.canvas.set_form_font(canvas::FormFont {
+            family: app.form_font.clone(),
+            size: app.form_font_size,
+        });
 
         // Debug: open the Settings window on launch so its layout can be
         // captured without a human clicking through the menu (pair with
@@ -757,6 +855,14 @@ impl App {
         app
     }
 
+    /// Push the form-font preference to the canvas, which owns the drawing.
+    fn sync_form_font(&mut self) {
+        self.canvas.set_form_font(canvas::FormFont {
+            family: self.form_font.clone(),
+            size: self.form_font_size,
+        });
+    }
+
     /// Write preferences to disk (best effort).
     fn persist(&self) {
         let Some(path) = config_file() else { return };
@@ -789,6 +895,9 @@ impl App {
             ),
             show_stats: Some(self.show_stats),
             prefetch: Some(self.prefetch),
+            form_font: Some(self.form_font.clone()),
+            form_font_size: Some(self.form_font_size),
+            open_maximized: Some(self.open_maximized),
         };
         if let Ok(text) = serde_json::to_string_pretty(&settings) {
             let _ = std::fs::write(path, text);
@@ -1192,8 +1301,23 @@ impl App {
                     self.engine.bump_generation();
                 }
                 EngineResponse::FormFields { doc, form } => {
+                    // Debug: check the first checkbox so the tick can be
+                    // captured without a mouse (PDFREADER_CHECK_FIRST).
+                    let debug_check = std::env::var_os("PDFREADER_CHECK_FIRST").is_some().then(|| {
+                        form.fields
+                            .iter()
+                            .find(|f| f.kind == pdfreader_core::FormFieldType::CheckBox)
+                            .map(|f| f.id)
+                    });
                     let effects = self.store.dispatch(Command::FormFieldsLoaded { doc, form });
                     self.execute(effects);
+                    if let Some(Some(id)) = debug_check {
+                        let effects = self.store.dispatch(Command::SetFormFieldValue {
+                            id,
+                            value: pdfreader_core::FieldValue::Checked(true),
+                        });
+                        self.execute(effects);
+                    }
                 }
                 EngineResponse::FieldSet {
                     doc,
@@ -1932,6 +2056,18 @@ impl App {
                     self.persist();
                     continue;
                 }
+                Command::SetFormFont(family) => {
+                    self.form_font = family;
+                    self.sync_form_font();
+                    self.persist();
+                    continue;
+                }
+                Command::SetFormFontSize(size) => {
+                    self.form_font_size = size.max(0.0);
+                    self.sync_form_font();
+                    self.persist();
+                    continue;
+                }
                 Command::ToggleTranslate => {
                     self.translate_enabled = !self.translate_enabled;
                     self.persist();
@@ -1949,8 +2085,7 @@ impl App {
                     continue;
                 }
                 Command::ShowAbout => {
-                    self.settings_window.open = true;
-                    self.settings_window.select_by_name("about");
+                    self.about_open = true;
                     continue;
                 }
                 Command::ShowShortcuts => {
@@ -1974,19 +2109,28 @@ impl App {
             }
             if fullscreen {
                 let entering = self.store.state().fullscreen;
+                // A fresh toggle cancels any transition still in flight.
+                self.pending_viewport = None;
                 if entering {
                     // Un-maximize first: a maximized window going borderless
                     // fullscreen is the known "not truly fullscreen" failure.
+                    // The fullscreen command is deferred so winit can apply the
+                    // un-maximize before it, which is what actually fixes the
+                    // taskbar-still-showing case.
                     let maximized = ctx.input(|input| input.viewport().maximized);
                     self.pre_fullscreen_maximized = maximized;
                     if maximized == Some(true) {
                         ctx.send_viewport_cmd(ViewportCommand::Maximized(false));
+                        self.pending_viewport = Some((0, ViewportCommand::Fullscreen(true)));
+                    } else {
+                        ctx.send_viewport_cmd(ViewportCommand::Fullscreen(true));
                     }
-                    ctx.send_viewport_cmd(ViewportCommand::Fullscreen(true));
                 } else {
                     ctx.send_viewport_cmd(ViewportCommand::Fullscreen(false));
                     if self.pre_fullscreen_maximized == Some(true) {
-                        ctx.send_viewport_cmd(ViewportCommand::Maximized(true));
+                        // Restore the maximized window once the fullscreen exit
+                        // has settled, for the same reason as above.
+                        self.pending_viewport = Some((0, ViewportCommand::Maximized(true)));
                     }
                     self.pre_fullscreen_maximized = None;
                 }
@@ -2017,6 +2161,40 @@ impl eframe::App for App {
         }
         let dpr = ctx.pixels_per_point();
 
+        // Open maximized. Winit does not always honour a creation-time request,
+        // so it is repeated for the first few frames and then dropped — the
+        // title bar and its window buttons stay visible either way, which is
+        // the whole point of maximizing rather than going full screen.
+        if self.start_maximized > 0 {
+            self.start_maximized -= 1;
+            ctx.send_viewport_cmd(ViewportCommand::Maximized(true));
+            ctx.request_repaint();
+        }
+
+        // Send a viewport change held back so the change before it could settle
+        // (see `pending_viewport`): un-maximizing and going fullscreen in the
+        // same frame is what leaves the window fullscreen-sized with the
+        // taskbar still showing. Waits until the viewport reports the expected
+        // state, with a hard cap so it can never get stuck.
+        if let Some((waited, command)) = self.pending_viewport.take() {
+            let settled = match &command {
+                ViewportCommand::Fullscreen(true) => {
+                    ctx.input(|input| input.viewport().maximized != Some(true))
+                }
+                ViewportCommand::Maximized(true) => {
+                    ctx.input(|input| input.viewport().fullscreen != Some(true))
+                }
+                _ => true,
+            };
+            if (settled && waited >= 1) || waited >= 3 {
+                ctx.send_viewport_cmd(command);
+            } else {
+                self.pending_viewport = Some((waited + 1, command));
+            }
+            ctx.request_repaint();
+        }
+
+
         // Snapshot the helper-tool preferences up front. They are read-only
         // during this frame, but `self` is borrowed for most of the draw, so a
         // local copy lets the menu and canvas closures read them without a
@@ -2026,6 +2204,8 @@ impl eframe::App for App {
         let auto_speak = self.auto_speak;
         let translate_enabled = self.translate_enabled;
         let lens_target = self.lens_target.clone();
+        let form_font = self.form_font.clone();
+        let form_font_size = self.form_font_size;
         // Edit → Find… asks the toolbar's find box to take focus. Consume the
         // flag here so the request lasts exactly one frame.
         let focus_search = self.focus_search;
@@ -2053,12 +2233,35 @@ impl eframe::App for App {
             }
         }
 
+        // Debug: open the lookup card on a sample word so its layout can be
+        // captured without a mouse (pair with PDFREADER_SCREENSHOT). Waits for
+        // the dictionaries so the card shows a real answer.
+        if let Some(word) = self.demo_popup.take() {
+            match self
+                .lens
+                .as_ref()
+                .map(|dict| lens::Answer::from_lookup(dict.lookup(&word)))
+            {
+                Some(answer) => self.lens_popup.open(
+                    lens::LookupRequest {
+                        page: 0,
+                        text: word,
+                        anchor: egui::pos2(280.0, 240.0),
+                    },
+                    answer,
+                    false,
+                ),
+                None => self.demo_popup = Some(word),
+            }
+        }
+
         let drained = self.pump(&ctx);
 
         let theme_id = self.store.state().theme;
         let palette = pdfreader_ui::Theme::from_id(theme_id).palette;
 
         let mut commands = self.shortcuts(&ctx);
+
         let mut tiles: Vec<PendingTile> = Vec::new();
         let mut thumbs: Vec<PendingThumb> = Vec::new();
         let mut canvas_size = self.canvas_size;
@@ -2098,9 +2301,9 @@ impl eframe::App for App {
                     commands.extend(menu_bar(ui, store.state(), &palette));
                 });
 
-            // Acrobat Pro DC places the document tab strip directly under the
-            // menu bar, above the toolbar. egui consumes top panels in
-            // declaration order, so the tabbar is declared first.
+            // The document tab strip sits directly under the menu bar, above
+            // the toolbar. egui consumes top panels in declaration order, so
+            // the tabbar is declared first.
             if !store.state().tabs.is_empty() {
                 egui::Panel::top("tabbar")
                     .exact_size(TABBAR_HEIGHT)
@@ -2207,6 +2410,8 @@ impl eframe::App for App {
                                             doc.id,
                                             form,
                                             view.selected_field,
+                                            &form_font,
+                                            form_font_size,
                                         )),
                                         None => {
                                             ui.add_space(6.0);
@@ -2250,8 +2455,8 @@ impl eframe::App for App {
                     status_bar(ui, store.state(), &palette);
                 });
 
-            // Right-hand tools rail, in the spirit of Acrobat Pro DC. Side
-            // panels are consumed before the central panel.
+            // Right-hand tools rail. Side panels are consumed before the
+            // central panel.
             egui::Panel::right("tools-rail")
                 .exact_size(TOOLS_RAIL_WIDTH)
                 .resizable(false)
@@ -2665,6 +2870,7 @@ impl eframe::App for App {
         // panels.
         self.draw_settings_window(&ctx, &palette);
         self.draw_shortcuts_window(&ctx, &palette);
+        self.draw_about_window(&ctx);
         if self.show_stats {
             self.draw_stats_overlay(&ctx, &palette);
         }
@@ -2684,7 +2890,7 @@ impl eframe::App for App {
 
         self.frames_total += 1;
         if self.screenshot.is_some() {
-            if !self.screenshot_sent && self.frames_total >= 20 {
+            if !self.screenshot_sent && self.frames_total >= self.screenshot_frames {
                 ctx.send_viewport_cmd(ViewportCommand::Screenshot(egui::UserData::default()));
                 self.screenshot_sent = true;
             }
@@ -3367,6 +3573,9 @@ mod tests {
             default_zoom: Some("fit-page".to_owned()),
             show_stats: Some(true),
             prefetch: Some(false),
+            form_font: Some("NotoSansBengali-Regular".to_owned()),
+            form_font_size: Some(14.0),
+            open_maximized: Some(false),
         };
         let json = serde_json::to_string(&settings).expect("settings serialise");
         let back: Settings = serde_json::from_str(&json).expect("settings deserialise");
@@ -3380,6 +3589,9 @@ mod tests {
         assert_eq!(back.default_zoom.as_deref(), Some("fit-page"));
         assert_eq!(back.show_stats, Some(true));
         assert_eq!(back.prefetch, Some(false));
+        assert_eq!(back.form_font.as_deref(), Some("NotoSansBengali-Regular"));
+        assert_eq!(back.form_font_size, Some(14.0));
+        assert_eq!(back.open_maximized, Some(false));
     }
 
     #[test]

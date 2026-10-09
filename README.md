@@ -1,4 +1,4 @@
-# PDF Reader
+# AnsNew PDF Reader
 
 A fast, native, cross-platform PDF reader written in **Rust**, with an **egui** /
 
@@ -85,9 +85,49 @@ renderer built for large documents.
 
   on the page at the field's real rectangle, committing on Enter or blur rather
 
-  than per keystroke. Checkboxes and radio buttons toggle by clicking; combo and
+  than per keystroke. Checkboxes toggle by clicking. Radio buttons and dropdowns
 
-  list boxes open a dropdown.
+  are not offered — see the note below.
+- **Checkbox and radio state is drawn by the app**, so a checked box shows a tick
+
+  (and a radio a dot) the instant it is clicked. `PDFium` rasterizes a widget's
+
+  original appearance but does not regenerate it after a value is written, so
+
+  relying on the page render alone left a checked box looking empty.
+- **Radio buttons and dropdowns are shown as "not fillable", not offered.** There is
+
+  no write path for them in the PDF binding: a radio group keeps its value on the
+
+  parent field dictionary (verified against the raw PDFium API, where
+
+  `FPDFAnnot_GetLinkedAnnot(annot, "Parent")` returns null — the same wall Chrome
+
+  hits), and the combo and list box wrappers have no setter at all. Rather than let
+
+  a click fail, the app marks those fields and explains why at the top of the Forms
+
+  panel. Text fields and checkboxes are unaffected and round-trip through a save.
+- **XFA forms** (whose AcroForm widgets are only a compatibility shell) are called
+
+  out in that same note, so the limitation is known before filling.
+- Field names in the Forms list keep the **last two path segments**: XFA names are
+
+  long shared prefixes (`topmostSubform[0].Page1[0].…`) and truncating the end made
+
+  every row read the same.
+- Whitespace counts as blank, so a form that ships a combo box pre-filled with
+
+  spaces no longer reports as partly complete.
+- **Form text font and size** (Settings → **Text**, and the same controls at the top
+
+  of the Forms sidebar): pick the face used for typed values — Bengali, Arabic,
+
+  Devanagari, Hebrew, Tamil, Thai or the default Latin — and a size, or leave it on
+
+  **Auto** to fit each field's height. This is what makes filling a form in Bengali
+
+  legible instead of boxes.
 - Values are written into the open document via PDFium, so **Save** (or "Save and
 
   close") persists them for every other viewer.
@@ -248,10 +288,16 @@ immediately:
 | Category        | Options                                                                                       |
 | --------------- | --------------------------------------------------------------------------------------------- |
 | **Appearance**  | Theme (7 themes), interface scale (0.75×–2.00×), show the sidebar on startup                    |
-| **Reading**     | Default view mode (continuous / single page), default zoom (fit width / fit page / 100%)        |
+| **Reading**     | Default view mode (continuous / single page), default zoom (fit width / fit page / 100%), open maximized |
 | **Language**    | Word lookup, Speak (TTS), speak automatically on selection, Google Translate link, translate target language (12 languages) |
+| **Text**        | Form-text font family (Default / Noto Sans / Bengali / Devanagari / Arabic / Hebrew / Tamil / Thai) and size, with a live preview |
 | **Performance** | Preload nearby pages (tile prefetch), performance overlay (FPS, cached tiles, zoom)             |
-| **About**       | Version and the settings-file path                                                              |
+
+The window **opens maximized by default**: it fills the screen *with* its title
+bar, so the minimize / maximize / close buttons stay where you expect them. The
+preference lives under Reading → Window. **F11** (or Escape) toggles true
+borderless full screen, which hides the title bar. Help → About opens a separate
+**About Us** window rather than a settings page.
 
 Reading defaults apply to every document you open, and to the current one
 straight away.
@@ -340,10 +386,10 @@ The menu bar follows the layout desktop software uses — **File**, **Edit**,
 | **View**     | Zoom In/Out, Actual Size, Fit Width, Fit Page, Page Display ▸ (Single Page / Continuous), Rotate View ▸ (Clockwise / Counterclockwise), Show/Hide Sidebar, Full Screen, Theme ▸ |
 | **Go**       | First Page, Previous Page, Next Page, Last Page                                                       |
 | **Settings** | Opens the preferences window (a direct action, not a dropdown)                                        |
-| **Help**     | Keyboard Shortcuts, About PDF Reader                                                                  |
+| **Help**     | Keyboard Shortcuts, About AnsNew PDF Reader                                                           |
 
-Help → **Keyboard Shortcuts** opens a shortcut reference; Help → **About PDF
-Reader** opens the Settings window on its About page.
+Help → **Keyboard Shortcuts** opens a shortcut reference; Help → **About AnsNew
+PDF Reader** opens the separate **About Us** window (photo, role, profile links).
 
 ### Keyboard shortcuts
 
@@ -442,13 +488,17 @@ three word-lookup dictionaries (`E2Bdatabase.json`, `bangla_dictionary.txt`,
 
 packages it:
 
-The dictionaries and fonts sit directly beside the executable so the offline lookup,
+The dictionaries and the bundled Noto fonts (Latin, Bengali, Devanagari, Arabic,
 
-IPA, Google Translate link and non-Latin scripts all work in the packaged build just
+Hebrew, Tamil, Thai, plus Noto Sans Symbols for arrows like `→`) sit directly beside
 
-as they do in a debug run (the loaders look next to the exe first, then fall back to
+the executable, so the offline lookup, IPA, Google Translate link and non-Latin scripts
 
-`assets/lens` / `assets/fonts` for a `cargo run` from the repository root).
+all work in the packaged build just as they do in a debug run (the loaders look next to
+
+the exe first, then fall back to `assets/lens` / `assets/fonts` for a `cargo run` from
+
+the repository root).
 
 ```bash
 cargo xtask dist:portable   # target/dist/pdf-reader-<version>-portable-x64.zip
@@ -465,7 +515,7 @@ cargo xtask dist:msix -- --no-sign
 
   with a Start Menu shortcut, an Add/Remove Programs entry and an uninstaller. They
 
-  register the app as a first-class PDF handler so it appears as **"PDF Reader"** in
+  register the app as a first-class PDF handler so it appears as **"AnsNew PDF Reader"** in
 
   right-click → **Open with** (via `FriendlyAppName`), in the **Open with** submenu
 
@@ -486,7 +536,7 @@ cargo xtask dist:msix -- --no-sign
 
   current-user store and reuses. The manifest declares a `windows.fileTypeAssociation`
 
-  for `.pdf`, so after install the app appears as **"PDF Reader"** in Open with and in
+  for `.pdf`, so after install the app appears as **"AnsNew PDF Reader"** in Open with and in
 
   Default apps. Because it is self-signed, a machine must trust the certificate before
 
@@ -504,7 +554,21 @@ so they cannot drift from the manifest; to change the packaging itself, edit
 
 Release builds are windowed (`windows_subsystem`), so launching from Explorer or a
 
-shortcut shows no console window; debug builds keep the console for tracing output.
+shortcut shows no console window; debug builds keep the console for tracing output
+(`RUST_LOG` overrides the level). `wgpu_hal`'s warnings are dropped by default:
+without the Vulkan SDK installed its loader logs a "registry lookup failed to get
+layer manifest files" warning on every launch, which is harmless noise about the
+optional SDK layers and not about this app.
+
+The helper processes the app starts are windowless too: the speech engine's
+
+PowerShell is spawned with `CREATE_NO_WINDOW` (a GUI process spawning a console
+
+program otherwise flashes a terminal on every utterance), and URLs open through
+
+`rundll32` rather than `cmd`. So neither the EXE nor the MSIX build ever shows a
+
+stray terminal.
 
 ## License
 

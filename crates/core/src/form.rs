@@ -57,6 +57,16 @@ impl FormKind {
     pub const fn is_interactive(self) -> bool {
         !matches!(self, Self::None)
     }
+
+    /// Whether the form is XFA.
+    ///
+    /// XFA documents carry a parallel form definition; the widgets the engine
+    /// can see are only a compatibility shell, so some of them — radio groups
+    /// especially — cannot be written back. Worth telling the user up front
+    /// rather than letting a save drop their input.
+    pub const fn is_xfa(self) -> bool {
+        matches!(self, Self::XfaFull | Self::XfaForeground)
+    }
 }
 
 /// The kind of widget a form field presents.
@@ -82,15 +92,21 @@ pub enum FormFieldType {
 }
 
 impl FormFieldType {
-    /// Whether the field holds a value a user can type or pick.
+    /// Whether the reader can write a value into this kind of field.
     ///
-    /// Push buttons and signature fields are excluded: a push button has no
-    /// state to persist, and signing is not supported by this engine.
+    /// Push buttons and signature fields are excluded because they have no
+    /// value to persist, and signing is not supported.
+    ///
+    /// Radio buttons, combo boxes and list boxes are excluded too, and this is
+    /// not a matter of taste: the PDF binding exposes no write path for them.
+    /// A radio group keeps its value on the parent field dictionary (which
+    /// `pdfium-render` cannot reach — verified against the raw `PDFium` API,
+    /// where `FPDFAnnot_GetLinkedAnnot(annot, "Parent")` returns null), and the
+    /// combo and list box wrappers carry no `set_value` at all. Offering the
+    /// interaction and then failing on every click is worse than saying so: the
+    /// Forms panel carries a note, and these fields show as not fillable.
     pub const fn is_fillable(self) -> bool {
-        matches!(
-            self,
-            Self::Text | Self::CheckBox | Self::RadioButton | Self::ComboBox | Self::ListBox
-        )
+        matches!(self, Self::Text | Self::CheckBox)
     }
 
     /// Whether the field offers a fixed list of choices.
@@ -145,11 +161,15 @@ impl FieldValue {
     }
 
     /// Whether the field has been left blank.
+    ///
+    /// Whitespace counts as blank: forms that ship a combo box "filled" with
+    /// spaces would otherwise report as complete before the user typed
+    /// anything, and the progress summary in the Forms panel is the whole point
+    /// of asking.
     pub fn is_empty(&self) -> bool {
         match self {
             Self::Empty | Self::Choice(None) => true,
-            Self::Text(s) => s.is_empty(),
-            Self::Choice(Some(s)) => s.is_empty(),
+            Self::Text(text) | Self::Choice(Some(text)) => text.trim().is_empty(),
             // An unchecked box counts as empty for form-completeness checks.
             Self::Checked(on) => !on,
         }
@@ -291,15 +311,18 @@ mod tests {
     }
 
     #[test]
-    fn only_value_bearing_widgets_are_fillable() {
+    fn only_writable_widgets_are_fillable() {
         assert!(FormFieldType::Text.is_fillable());
         assert!(FormFieldType::CheckBox.is_fillable());
-        assert!(FormFieldType::RadioButton.is_fillable());
-        assert!(FormFieldType::ComboBox.is_fillable());
-        assert!(FormFieldType::ListBox.is_fillable());
         // A push button has no state to persist; signing is unsupported.
         assert!(!FormFieldType::PushButton.is_fillable());
         assert!(!FormFieldType::Signature.is_fillable());
+        // No write path exists for these in the PDF binding, so the reader must
+        // not offer to fill them: a radio group's value lives on the parent
+        // field dictionary, and the combo/list wrappers have no setter.
+        assert!(!FormFieldType::RadioButton.is_fillable());
+        assert!(!FormFieldType::ComboBox.is_fillable());
+        assert!(!FormFieldType::ListBox.is_fillable());
     }
 
     #[test]

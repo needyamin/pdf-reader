@@ -241,12 +241,17 @@ fn filled_values_survive_a_save_round_trip() {
             .expect("checkbox write"),
         "checkbox must be writable"
     );
-    // Radio: selecting the unchecked widget must be possible.
+    // Radio: a grouped radio keeps its value on the parent field dictionary,
+    // which pdfium-render cannot write — `set_checked` writes the value onto
+    // the widget and changes nothing. Selecting one must therefore be
+    // *refused*, not reported as saved. (The assertion this replaced only
+    // checked that *some* radio in the group was checked; the fixture already
+    // had one, so it passed even while the write did nothing.)
     assert!(
         engine
             .set_field_value(handle, radio.id, FieldValue::Checked(true))
-            .expect("radio write"),
-        "radio button must be selectable"
+            .is_err(),
+        "selecting a grouped radio button must be refused, not silently dropped"
     );
 
     let bytes = engine.save_to_bytes(handle, false).expect("serialise");
@@ -276,15 +281,27 @@ fn filled_values_survive_a_save_round_trip() {
         .expect("checkbox still present");
     assert_eq!(subscribe.value, FieldValue::Checked(false));
 
+    // The refused radio write left the group exactly as it was: one selection,
+    // and the widget we tried to select still unset.
     let colours: Vec<_> = form2
         .fields
         .iter()
         .filter(|f| f.name == "Colour")
-        .map(|f| f.value.clone())
+        .map(|f| (f.id, f.value.clone()))
         .collect();
+    assert_eq!(
+        colours
+            .iter()
+            .filter(|(_, value)| *value == FieldValue::Checked(true))
+            .count(),
+        1,
+        "the radio group must still hold exactly one selection, got {colours:?}"
+    );
     assert!(
-        colours.contains(&FieldValue::Checked(true)),
-        "selected radio must persist, got {colours:?}"
+        colours
+            .iter()
+            .any(|(id, value)| *id == radio.id && *value == FieldValue::Checked(false)),
+        "the refused radio widget must still be unset, got {colours:?}"
     );
     let _ = std::fs::remove_file(&reopened_path);
 }

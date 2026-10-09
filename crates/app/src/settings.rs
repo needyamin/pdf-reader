@@ -23,10 +23,10 @@ pub enum Category {
     Reading,
     /// The word-lookup helpers and the translate target.
     Language,
+    /// Font family and size for form text.
+    Text,
     /// Prefetching and the diagnostics overlay.
     Performance,
-    /// Version and where settings live.
-    About,
 }
 
 impl Category {
@@ -35,8 +35,8 @@ impl Category {
         Category::Appearance,
         Category::Reading,
         Category::Language,
+        Category::Text,
         Category::Performance,
-        Category::About,
     ];
 
     /// Rail label.
@@ -45,8 +45,8 @@ impl Category {
             Category::Appearance => "Appearance",
             Category::Reading => "Reading",
             Category::Language => "Language tools",
+            Category::Text => "Text",
             Category::Performance => "Performance",
-            Category::About => "About",
         }
     }
 
@@ -56,8 +56,8 @@ impl Category {
             Category::Appearance => "Theme, interface scale and layout.",
             Category::Reading => "How documents open.",
             Category::Language => "The lookup helpers and the translate target.",
+            Category::Text => "Font family and size for text typed into forms.",
             Category::Performance => "Prefetching and the diagnostics overlay.",
-            Category::About => "Version and where your settings are stored.",
         }
     }
 }
@@ -93,8 +93,8 @@ impl SettingsWindow {
         self.category = match name.to_ascii_lowercase().as_str() {
             "reading" => Category::Reading,
             "language" => Category::Language,
+            "text" => Category::Text,
             "performance" => Category::Performance,
-            "about" => Category::About,
             _ => Category::Appearance,
         };
     }
@@ -174,7 +174,7 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
 /// Display name for a theme.
 const fn theme_label(id: ThemeId) -> &'static str {
     match id {
-        ThemeId::Acrobat => "Acrobat",
+        ThemeId::AnsNew => "AnsNew",
         ThemeId::Dark => "Dark",
         ThemeId::Light => "Light",
         ThemeId::Midnight => "Midnight",
@@ -307,10 +307,12 @@ impl App {
                                     Category::Language => {
                                         self.page_language(ui, palette, &mut commands);
                                     }
+                                    Category::Text => {
+                                        self.page_text(ui, palette, &mut commands);
+                                    }
                                     Category::Performance => {
                                         self.page_performance(ui, palette, &mut changed);
                                     }
-                                    Category::About => about_page(ui, palette),
                                 }
                                 ui.add_space(8.0);
                             });
@@ -392,6 +394,78 @@ impl App {
         ));
     }
 
+    /// Text: the font used for form field text.
+    fn page_text(&mut self, ui: &mut egui::Ui, palette: &Palette, commands: &mut Vec<Command>) {
+        section(ui, palette, "Font family");
+        let family_label = pdfreader_ui::FORM_FONTS
+            .iter()
+            .find(|(name, _)| *name == self.form_font)
+            .map_or("Default", |(_, label)| *label);
+        egui::ComboBox::from_id_salt("form-font")
+            .width(240.0)
+            .selected_text(family_label)
+            .show_ui(ui, |ui| {
+                for &(name, label) in pdfreader_ui::FORM_FONTS {
+                    if ui
+                        .selectable_label(self.form_font == name, label)
+                        .clicked()
+                    {
+                        commands.push(Command::SetFormFont(name.to_owned()));
+                    }
+                }
+            });
+        ui.label(hint(
+            palette,
+            "Face used for text typed into form fields. Pick one that covers the script you fill in — Bengali, Arabic and the rest are bundled.",
+        ));
+        ui.add_space(14.0);
+
+        section(ui, palette, "Font size");
+        let mut size = self.form_font_size;
+        ui.add(
+            egui::Slider::new(&mut size, 0.0..=48.0)
+                .step_by(0.5)
+                .custom_formatter(|value, _| {
+                    if value <= 0.0 {
+                        "Auto".to_owned()
+                    } else {
+                        format!("{value:.1} pt")
+                    }
+                }),
+        );
+        if (size - self.form_font_size).abs() > f32::EPSILON {
+            commands.push(Command::SetFormFontSize(size));
+        }
+        ui.label(hint(
+            palette,
+            "Size for filled field text. Auto fits each field's own height, which is often only 10–14 pt.",
+        ));
+        ui.add_space(14.0);
+
+        section(ui, palette, "Preview");
+        let preview = if self.form_font_size > 0.0 {
+            self.form_font_size
+        } else {
+            14.0
+        };
+        let family = if self.form_font.is_empty() {
+            egui::FontFamily::Proportional
+        } else {
+            egui::FontFamily::Name(self.form_font.clone().into())
+        };
+        egui::Frame::new()
+            .fill(palette.surface)
+            .corner_radius(6.0)
+            .inner_margin(egui::Margin::symmetric(10, 8))
+            .show(ui, |ui| {
+                ui.label(
+                    RichText::new("AnsNew PDF Reader  ·  বাংলা  ·  English")
+                        .font(egui::FontId::new(preview, family))
+                        .color(palette.text),
+                );
+            });
+    }
+
     /// Reading: how documents open.
     fn page_reading(
         &mut self,
@@ -432,6 +506,21 @@ impl App {
         ui.label(hint(
             palette,
             "Fit modes re-scale as the window resizes; 100% shows the page at its true size.",
+        ));
+        ui.add_space(10.0);
+
+        section(ui, palette, "Window");
+        let mut maximized = self.open_maximized;
+        if ui
+            .checkbox(&mut maximized, "Open maximized")
+            .changed()
+        {
+            self.open_maximized = maximized;
+            *changed = true;
+        }
+        ui.label(hint(
+            palette,
+            "Open filling the screen with the title bar and its window buttons still visible — on by default. F11 toggles true full screen.",
         ));
     }
 
@@ -559,6 +648,10 @@ impl App {
         self.default_zoom = ZoomMode::FitWidth;
         self.show_stats = false;
         self.prefetch = true;
+        self.form_font.clear();
+        self.form_font_size = 0.0;
+        self.sync_form_font();
+        self.open_maximized = true;
         self.lookup_enabled = true;
         self.speak_enabled = true;
         self.auto_speak = true;
@@ -676,24 +769,212 @@ fn rail_item(ui: &mut egui::Ui, palette: &Palette, label: &str, selected: bool) 
     ui.add(button).clicked()
 }
 
-/// About: version and where settings live.
-fn about_page(ui: &mut egui::Ui, palette: &Palette) {
-    section(ui, palette, "PDF Reader");
-    ui.label(RichText::new(format!("Version {}", env!("CARGO_PKG_VERSION"))).size(12.0));
+// --- About Us window ---------------------------------------------------------
+//
+// A faithful copy of the "About Us" window from the author's Media Downloader
+// app: same light palette, layout, sizes and buttons, so the two products look
+// identical. The window pins its own light visuals instead of following the
+// reader's (possibly dark) theme.
 
-    section(ui, palette, "Settings file");
-    match crate::config_file() {
-        Some(path) => ui.label(RichText::new(path.display().to_string()).monospace().size(11.5)),
-        None => ui.label(hint(palette, "No configuration directory could be found.")),
+/// `#333333` — body text.
+const ABOUT_TEXT: egui::Color32 = egui::Color32::from_rgb(0x33, 0x33, 0x33);
+/// `#2196F3` — links and the primary button.
+const ABOUT_PRIMARY: egui::Color32 = egui::Color32::from_rgb(0x21, 0x96, 0xF3);
+/// `#1976D2` — the role line and the pressed button fill.
+const ABOUT_SECONDARY: egui::Color32 = egui::Color32::from_rgb(0x19, 0x76, 0xD2);
+/// `#757575` — muted text.
+const ABOUT_MUTED: egui::Color32 = egui::Color32::from_rgb(0x75, 0x75, 0x75);
+/// `#F5F5F5` — the ghost button's fill.
+const ABOUT_LIGHT_GRAY: egui::Color32 = egui::Color32::from_rgb(0xF5, 0xF5, 0xF5);
+
+/// The profile photo, embedded so the window works in the packaged build.
+const PROFILE_JPG: &[u8] = include_bytes!("../../../assets/profile.jpg");
+
+/// Links shown in the "Profile Links" block, matching Media Downloader.
+const PROFILE_LINKS: &[(&str, &str)] = &[
+    ("GitHub", "https://github.com/needyamin"),
+    ("Website", "https://needyamin.github.io"),
+    ("ORCID", "https://orcid.org/0009-0009-1184-6005"),
+    ("Facebook", "https://facebook.com/needyaminofficial"),
+];
+
+/// The GitHub profile the "Visit GitHub" button opens.
+const PROFILE_GITHUB: &str = "https://github.com/needyamin";
+
+/// Decode the embedded profile photo once.
+fn load_profile_texture(ctx: &egui::Context) -> Option<egui::TextureHandle> {
+    let image = image::load_from_memory(PROFILE_JPG).ok()?.to_rgba8();
+    let size = [image.width() as usize, image.height() as usize];
+    let color = egui::ColorImage::from_rgba_unmultiplied(size, image.as_raw());
+    Some(ctx.load_texture("profile-photo", color, egui::TextureOptions::LINEAR))
+}
+
+/// A flat filled button, matching Media Downloader's `color_button`.
+fn filled_button(
+    ui: &mut egui::Ui,
+    text: &str,
+    fill: egui::Color32,
+    fg: egui::Color32,
+    pressed: egui::Color32,
+    size: egui::Vec2,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    let paint = if response.is_pointer_button_down_on() {
+        pressed
+    } else {
+        fill
     };
-    ui.label(hint(
-        palette,
-        "Preferences are written here as JSON and loaded on the next launch.",
-    ));
+    ui.painter()
+        .rect_filled(rect, egui::CornerRadius::ZERO, paint);
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        text,
+        egui::FontId::new(13.0, egui::FontFamily::Proportional),
+        fg,
+    );
+    response
+}
 
-    section(ui, palette, "Dictionaries");
-    ui.label(hint(
-        palette,
-        "The offline word-lookup dictionaries live in the lens folder next to the executable (or assets/lens when run from a checkout).",
-    ));
+/// A flat light button, matching Media Downloader's `ghost_button`.
+fn ghost_button(text: &str) -> egui::Button<'static> {
+    egui::Button::new(RichText::new(text).color(ABOUT_TEXT))
+        .fill(ABOUT_LIGHT_GRAY)
+        .stroke(egui::Stroke::NONE)
+        .corner_radius(egui::CornerRadius::ZERO)
+        .min_size(egui::vec2(0.0, 28.0))
+}
+
+impl App {
+    /// Draw the "About Us" window.
+    ///
+    /// Long because it mirrors the reference design line for line; splitting it
+    /// would scatter that layout for no gain.
+    #[allow(clippy::too_many_lines)]
+    pub(crate) fn draw_about_window(&mut self, ctx: &egui::Context) {
+        if !self.about_open {
+            return;
+        }
+        if self.profile_texture.is_none() {
+            self.profile_texture = load_profile_texture(ctx);
+        }
+        let photo = self.profile_texture.clone();
+        let version = env!("CARGO_PKG_VERSION");
+
+        let mut open = self.about_open;
+        let mut close = false;
+        let mut visit: Option<&str> = None;
+
+        // The window is a fixed light design; pin the light visuals for it and
+        // restore the reader's theme afterwards.
+        ctx.set_visuals(egui::Visuals::light());
+
+        egui::Window::new("About Us")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_size([780.0, 560.0])
+            .min_width(700.0)
+            .min_height(500.0)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    if let Some(texture) = &photo {
+                        ui.add(egui::Image::new((texture.id(), egui::vec2(72.0, 72.0))));
+                    }
+                    ui.vertical(|ui| {
+                        ui.label(
+                            RichText::new("Md. Yamin Hossain")
+                                .size(21.0)
+                                .strong()
+                                .color(ABOUT_TEXT),
+                        );
+                        ui.label(
+                            RichText::new("Sr. Software Engineer")
+                                .size(14.0)
+                                .color(ABOUT_SECONDARY),
+                        );
+                        ui.label(
+                            RichText::new("Dhaka, Bangladesh")
+                                .size(13.0)
+                                .color(ABOUT_MUTED),
+                        );
+                        ui.add_space(6.0);
+                        ui.label(
+                            RichText::new(
+                                "Software Engineer focused on scalable systems, infrastructure \
+                                 automation, and intuitive user experiences.",
+                            )
+                            .size(13.0)
+                            .color(ABOUT_TEXT),
+                        );
+                        ui.label(
+                            RichText::new(format!("AnsNew PDF Reader v{version}"))
+                                .size(12.0)
+                                .color(ABOUT_MUTED),
+                        );
+                    });
+                });
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new("Profile Links")
+                        .size(16.0)
+                        .strong()
+                        .color(ABOUT_TEXT),
+                );
+                for &(label, url) in PROFILE_LINKS {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(format!("{label}:")).strong().color(ABOUT_TEXT));
+                        if ui.link(RichText::new(url).color(ABOUT_PRIMARY)).clicked() {
+                            visit = Some(url);
+                        }
+                    });
+                }
+                ui.add_space(10.0);
+                ui.label(
+                    RichText::new(
+                        "AnsNew PDF Reader is created and maintained by Md. Yamin Hossain. \
+                         This open-source desktop app focuses on fast, offline PDF reading \
+                         with a clean user experience.",
+                    )
+                    .size(13.0)
+                    .color(ABOUT_TEXT),
+                );
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    let width = (ui.available_width() - 8.0).max(120.0);
+                    if filled_button(
+                        ui,
+                        "Visit GitHub",
+                        ABOUT_PRIMARY,
+                        egui::Color32::WHITE,
+                        ABOUT_SECONDARY,
+                        egui::vec2(140.0, 34.0),
+                    )
+                    .clicked()
+                    {
+                        visit = Some(PROFILE_GITHUB);
+                    }
+                    ui.add_space((width - 280.0).max(8.0));
+                    if ui.add(ghost_button("Close")).clicked() {
+                        close = true;
+                    }
+                });
+            });
+
+        // Restore the reader's own theme (the light visuals were only for the
+        // About window).
+        pdfreader_ui::apply_theme(ctx, self.store.state().theme);
+
+        if let Some(url) = visit
+            && let Err(error) = pdfreader_platform::url::open(url)
+        {
+            tracing::warn!("could not open {url} ({error})");
+        }
+        if !open || close {
+            self.about_open = false;
+        }
+    }
 }

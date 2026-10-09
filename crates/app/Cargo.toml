@@ -5,7 +5,7 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 name = "pdfreader-app"
-description = "PDF Reader desktop application"
+description = "AnsNew PDF Reader desktop application"
 publish = false
 
 # Compiles `assets/icon.ico` into a Windows resource (build.rs: Windows only).

@@ -18,8 +18,8 @@ use crate::theme::Palette;
 
 /// Height of the compact application menu.
 pub const MENUBAR_HEIGHT: f32 = 28.0;
-/// Height of the main command toolbar. Acrobat Pro DC keeps its toolbar tight;
-/// 40px fits the icon rows without wasted chrome.
+/// Height of the main command toolbar. Kept tight: 40px fits the icon rows
+/// without wasted chrome.
 pub const TOOLBAR_HEIGHT: f32 = 40.0;
 /// Height of the document tab strip.
 pub const TABBAR_HEIGHT: f32 = 34.0;
@@ -27,6 +27,23 @@ pub const TABBAR_HEIGHT: f32 = 34.0;
 pub const STATUSBAR_HEIGHT: f32 = 28.0;
 /// Width of the right-hand tools rail.
 pub const TOOLS_RAIL_WIDTH: f32 = 44.0;
+
+/// Font families offered for form text (Settings → Text), as `(family, label)`.
+///
+/// The empty family means egui's default proportional face. The names match the
+/// bundled Noto files, which the app registers as named egui families, so
+/// choosing one gives form text a face that covers that script (Bengali, and so
+/// on) at the size the user wants.
+pub const FORM_FONTS: &[(&str, &str)] = &[
+    ("", "Default"),
+    ("NotoSans-Regular", "Noto Sans (Latin)"),
+    ("NotoSansBengali-Regular", "Bengali"),
+    ("NotoSansDevanagari-Regular", "Devanagari"),
+    ("NotoSansArabic-Regular", "Arabic"),
+    ("NotoSansHebrew-Regular", "Hebrew"),
+    ("NotoSansTamil-Regular", "Tamil"),
+    ("NotoSansThai-Regular", "Thai"),
+];
 
 const BUTTON_RADIUS: u8 = 7;
 const RAIL_RADIUS: u8 = 2;
@@ -223,7 +240,7 @@ pub fn menu_bar(ui: &mut Ui, state: &AppState, palette: &Palette) -> Vec<Command
         ui.horizontal(|ui| {
             ui.add_space(8.0);
             ui.label(
-                RichText::new("PDF Reader")
+                RichText::new("AnsNew PDF Reader")
                     .strong()
                     .color(palette.text)
                     .size(12.5),
@@ -361,7 +378,7 @@ pub fn menu_bar(ui: &mut Ui, state: &AppState, palette: &Palette) -> Vec<Command
                     ui.close();
                 }
                 ui.separator();
-                if menu_item(ui, "About PDF Reader", "").clicked() {
+                if menu_item(ui, "About AnsNew PDF Reader", "").clicked() {
                     commands.push(Command::ShowAbout);
                     ui.close();
                 }
@@ -1380,6 +1397,8 @@ pub fn forms_panel(
     doc: DocumentId,
     form: &FormInfo,
     selected: Option<FieldId>,
+    form_font: &str,
+    form_font_size: f32,
 ) -> Vec<Command> {
     let mut commands = Vec::new();
 
@@ -1397,13 +1416,81 @@ pub fn forms_panel(
     egui::Frame::new()
         .inner_margin(egui::Margin::symmetric(10, 6))
         .show(ui, |ui| {
+            // The total is every widget; "to fill" counts only the ones the
+            // reader can actually write, so the note below explains the gap.
             let remaining = form.remaining_count();
             let summary = if remaining == 0 {
-                format!("{} fields · complete", form.fillable_count())
+                format!("{} fields · complete", form.fields.len())
             } else {
-                format!("{} fields · {} to fill", form.fillable_count(), remaining)
+                format!("{} fields · {} to fill", form.fields.len(), remaining)
             };
             ui.label(RichText::new(summary).color(palette.text_dim).size(11.0));
+        });
+
+    // Some widget kinds have no write path in the PDF binding at all. Saying so
+    // up front beats a click that does nothing, or an error after one.
+    let unwritable = form.fields.iter().any(|field| {
+        !field.read_only
+            && matches!(
+                field.kind,
+                FormFieldType::RadioButton | FormFieldType::ComboBox | FormFieldType::ListBox
+            )
+    });
+    if unwritable {
+        let note = if form.kind.is_xfa() {
+            "This is an XFA form. Radio buttons and dropdowns cannot be filled here — the PDF \
+             library has no way to write their values, so those fields are not offered. Fill \
+             them in another viewer; text fields and checkboxes work."
+        } else {
+            "Radio buttons and dropdowns cannot be filled here — the PDF library has no way to \
+             write their values, so those fields are not offered. Fill them in another viewer; \
+             text fields and checkboxes work."
+        };
+        egui::Frame::new()
+            .inner_margin(egui::Margin::symmetric(10, 4))
+            .show(ui, |ui| {
+                ui.label(RichText::new(note).color(palette.text_dim).size(10.5));
+            });
+    }
+
+    // Font controls for filling: the face and size used for typed values, so a
+    // script the form's own font lacks (Bengali) and a hard-coded size that is
+    // too small are both fixable without leaving the panel.
+    egui::Frame::new()
+        .inner_margin(egui::Margin::symmetric(10, 6))
+        .show(ui, |ui| {
+            ui.label(RichText::new("Form text").color(palette.text_dim).size(11.0));
+            ui.add_space(4.0);
+            let label = FORM_FONTS
+                .iter()
+                .find(|(name, _)| *name == form_font)
+                .map_or("Default", |(_, label)| *label);
+            egui::ComboBox::from_id_salt("sidebar-form-font")
+                .selected_text(label)
+                .width(ui.available_width())
+                .show_ui(ui, |ui| {
+                    for &(name, text) in FORM_FONTS {
+                        if ui.selectable_label(form_font == name, text).clicked() {
+                            commands.push(Command::SetFormFont(name.to_owned()));
+                        }
+                    }
+                });
+            ui.add_space(4.0);
+            let mut size = form_font_size;
+            ui.add(
+                egui::Slider::new(&mut size, 0.0..=48.0)
+                    .step_by(0.5)
+                    .custom_formatter(|value, _| {
+                        if value <= 0.0 {
+                            "Auto".to_owned()
+                        } else {
+                            format!("{value:.1} pt")
+                        }
+                    }),
+            );
+            if (size - form_font_size).abs() > f32::EPSILON {
+                commands.push(Command::SetFormFontSize(size));
+            }
         });
     ui.separator();
 
@@ -1474,7 +1561,7 @@ fn show_form_row(
     painter.text(
         egui::pos2(left, rect.min.y + 4.0),
         Align2::LEFT_TOP,
-        truncate(field.display_name(), 28),
+        short_field_name(field.display_name()),
         FontId::proportional(11.5),
         palette.text,
     );
@@ -1488,13 +1575,17 @@ fn show_form_row(
         format!(
             "{} · {}",
             field.kind.label(),
-            truncate(&field.value.as_text(), 24)
+            truncate(field.value.as_text().trim(), 24)
         )
     };
-    // Read-only fields are marked, because a user who cannot type into a field
-    // needs to be told why rather than guessing the app is broken.
+    // Fields that cannot be filled are marked, because a user who cannot type
+    // into one needs to be told why rather than guessing the app is broken.
+    // Read-only is the form's own doing; "not fillable" means the reader has no
+    // write path for that kind at all (radio groups, dropdowns).
     let detail = if field.read_only {
         format!("{detail} · locked")
+    } else if !field.is_editable() {
+        format!("{detail} · not fillable")
     } else {
         detail
     };
@@ -1510,7 +1601,7 @@ fn show_form_row(
     response
 }
 
-/// The right-hand tools rail, in the spirit of Acrobat Pro DC's tool sidebar.
+/// The right-hand tools rail, in the spirit of a classic tool sidebar.
 ///
 /// Only tools that exist and work are listed — the project has a no-dead-
 /// controls policy. Each button maps to a command the app already handles.
@@ -1845,7 +1936,7 @@ const fn fullscreen_label(state: &AppState) -> &'static str {
 
 const fn theme_label(id: ThemeId) -> &'static str {
     match id {
-        ThemeId::Acrobat => "Acrobat",
+        ThemeId::AnsNew => "AnsNew",
         ThemeId::Dark => "Dark",
         ThemeId::Light => "Light",
         ThemeId::Midnight => "Midnight",
@@ -1860,6 +1951,34 @@ const fn view_mode_label(mode: ViewMode) -> &'static str {
         ViewMode::Single => "single page",
         ViewMode::Continuous => "continuous",
     }
+}
+
+/// Shorten a field's fully-qualified name for the Forms list.
+///
+/// XFA names are long paths that share a prefix — every field on page 1 of the
+/// Japanese visa form starts `topmostSubform[0].Page1[0].` — so truncating the
+/// *end* made every row read the same and the list was unusable. The last two
+/// path segments are what actually tell the fields apart.
+fn short_field_name(name: &str) -> String {
+    let parts: Vec<&str> = name.split('.').collect();
+    let start = parts.len().saturating_sub(2);
+    elide_middle(&parts[start..].join("."), 30)
+}
+
+/// Keep the start and the end of `text`, eliding the middle.
+///
+/// For a path-like name both ends carry information — the container on the left
+/// and the field on the right — so cutting one of them loses more than cutting
+/// the middle does.
+fn elide_middle(text: &str, max_chars: usize) -> String {
+    let count = text.chars().count();
+    if count <= max_chars {
+        return text.to_owned();
+    }
+    let keep = max_chars.saturating_sub(1) / 2;
+    let head: String = text.chars().take(keep).collect();
+    let tail: String = text.chars().skip(count - keep).collect();
+    format!("{head}…{tail}")
 }
 
 fn truncate(text: &str, max_chars: usize) -> String {

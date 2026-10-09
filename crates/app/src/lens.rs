@@ -230,51 +230,66 @@ impl LensPopup {
                         ui.set_max_width(POPUP_WIDTH);
 
                         // --- header: language, speak, close ---------------
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new(match &self.answer {
-                                    Answer::Ready(lookup) => match lookup.detected {
-                                        pdfreader_lens::Lang::En => "English → Bangla",
-                                        pdfreader_lens::Lang::Bn => "Bangla → English",
-                                    },
-                                    _ => "LingoLearn",
-                                })
-                                .color(palette.text_dim)
-                                .size(11.0),
-                            );
-                            ui.add_space(ui.available_width() - 58.0);
-
-                            if speak_enabled {
-                                if ui
-                                    .add(
-                                        egui::Button::new(RichText::new("Speak").size(11.0))
-                                            .fill(egui::Color32::TRANSPARENT),
-                                    )
-                                    .on_hover_text("Pronounce")
-                                    .clicked()
-                                {
-                                    let lang = match &self.answer {
-                                        Answer::Ready(lookup) => lookup.detected.code(),
-                                        _ => "en",
-                                    };
-                                    speak = Some((self.text.clone(), lang));
-                                }
-                            }
-                            if ui
-                                .add(
-                                    egui::Button::new(RichText::new("×").size(11.0))
-                                        .fill(egui::Color32::TRANSPARENT),
-                                )
-                                .clicked()
-                            {
-                                close = true;
-                            }
-                        });
+                        // Each section carries its own padding so the separators
+                        // can run edge to edge. The actions are laid out
+                        // right-to-left, so the language label keeps all the
+                        // space it needs instead of a fixed magic gap.
+                        egui::Frame::new()
+                            .inner_margin(Margin::symmetric(12, 8))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        RichText::new(match &self.answer {
+                                            Answer::Ready(lookup) => match lookup.detected {
+                                                pdfreader_lens::Lang::En => "English → Bangla",
+                                                pdfreader_lens::Lang::Bn => "Bangla → English",
+                                            },
+                                            _ => "LingoLearn",
+                                        })
+                                        .color(palette.text_dim)
+                                        .size(11.5),
+                                    );
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            if ui
+                                                .add(
+                                                    egui::Button::new(
+                                                        RichText::new("×").size(12.0),
+                                                    )
+                                                    .fill(egui::Color32::TRANSPARENT),
+                                                )
+                                                .on_hover_text("Close")
+                                                .clicked()
+                                            {
+                                                close = true;
+                                            }
+                                            if speak_enabled
+                                                && ui
+                                                    .add(
+                                                        egui::Button::new(
+                                                            RichText::new("Speak").size(11.0),
+                                                        )
+                                                        .fill(egui::Color32::TRANSPARENT),
+                                                    )
+                                                    .on_hover_text("Pronounce")
+                                                    .clicked()
+                                            {
+                                                let lang = match &self.answer {
+                                                    Answer::Ready(lookup) => lookup.detected.code(),
+                                                    _ => "en",
+                                                };
+                                                speak = Some((self.text.clone(), lang));
+                                            }
+                                        },
+                                    );
+                                });
+                            });
                         ui.separator();
 
                         // --- body -----------------------------------------
                         egui::Frame::new()
-                            .inner_margin(Margin::same(10))
+                            .inner_margin(Margin::symmetric(12, 10))
                             .show(ui, |ui| {
                                 let selected = if self.text.chars().count() > SELECTION_CLAMP {
                                     let cut: String =
@@ -338,10 +353,20 @@ impl LensPopup {
                                                             .corner_radius(6.0)
                                                             .inner_margin(Margin::symmetric(8, 2))
                                                             .show(ui, |ui| {
-                                                                ui.label(
-                                                                    RichText::new(term)
-                                                                        .color(palette.text)
-                                                                        .size(13.0),
+                                                                // Single line, so a
+                                                                // chip that does not
+                                                                // fit wraps as a whole
+                                                                // instead of breaking
+                                                                // mid-word.
+                                                                ui.add(
+                                                                    egui::Label::new(
+                                                                        RichText::new(term)
+                                                                            .color(palette.text)
+                                                                            .size(13.0),
+                                                                    )
+                                                                    .wrap_mode(
+                                                                        egui::TextWrapMode::Extend,
+                                                                    ),
                                                                 );
                                                             });
                                                     }
@@ -355,20 +380,24 @@ impl LensPopup {
                         // --- footer ---------------------------------------
                         if translate_enabled {
                             ui.separator();
-                            ui.horizontal(|ui| {
-                                if ui
-                                    .add(
-                                        egui::Button::new(
-                                            RichText::new("Google Translate").size(10.0),
-                                        )
-                                        .fill(egui::Color32::TRANSPARENT),
-                                    )
-                                    .on_hover_text("Open in the browser")
-                                    .clicked()
-                                {
-                                    translate = Some(self.text.clone());
-                                }
-                            });
+                            egui::Frame::new()
+                                .inner_margin(Margin::symmetric(12, 6))
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        if ui
+                                            .add(
+                                                egui::Button::new(
+                                                    RichText::new("Google Translate").size(10.0),
+                                                )
+                                                .fill(egui::Color32::TRANSPARENT),
+                                            )
+                                            .on_hover_text("Open in the browser")
+                                            .clicked()
+                                        {
+                                            translate = Some(self.text.clone());
+                                        }
+                                    });
+                                });
                         }
                     });
             });
