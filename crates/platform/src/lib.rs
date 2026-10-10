@@ -8,5 +8,5 @@
 pub mod speech;
 pub mod url;
 
-pub use speech::{SpeechError, Speaker};
+pub use speech::{Speaker, SpeechError};
 pub use url::{UrlError, open};

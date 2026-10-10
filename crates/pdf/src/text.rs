@@ -138,7 +138,8 @@ pub fn build(chars: Vec<CharBox>) -> TextPage {
         let at = position as u32;
 
         // --- line -------------------------------------------------------
-        let continues = line.is_some_and(|(_, line_rect)| vertical_overlap(line_rect, rect) >= LINE_OVERLAP);
+        let continues =
+            line.is_some_and(|(_, line_rect)| vertical_overlap(line_rect, rect) >= LINE_OVERLAP);
         let line_index = if continues {
             line.map_or(0, |(index, _)| index)
         } else {
@@ -173,7 +174,8 @@ pub fn build(chars: Vec<CharBox>) -> TextPage {
         }
 
         let gap = previous_right.map_or(0.0_f32, |right| rect.min_x - right);
-        let starts_word = word.is_none() || gap > WORD_GAP_FACTOR * previous_height.max(rect.height());
+        let starts_word =
+            word.is_none() || gap > WORD_GAP_FACTOR * previous_height.max(rect.height());
 
         let word_index = if starts_word {
             let index = words.len() as u32;
@@ -251,8 +253,12 @@ impl TextPage {
             if character.rect.is_degenerate() {
                 continue;
             }
-            let dx = (character.rect.min_x - x).max(x - character.rect.max_x).max(0.0);
-            let dy = (character.rect.min_y - y).max(y - character.rect.max_y).max(0.0);
+            let dx = (character.rect.min_x - x)
+                .max(x - character.rect.max_x)
+                .max(0.0);
+            let dy = (character.rect.min_y - y)
+                .max(y - character.rect.max_y)
+                .max(0.0);
             let distance = dx.hypot(dy);
             if distance > max_distance {
                 continue;
@@ -278,7 +284,11 @@ impl TextPage {
 
     /// The range covering the whole word a character belongs to.
     pub fn word_range(&self, index: u32) -> CharRange {
-        let Some(word) = self.chars.get(index as usize).map(|character| character.word) else {
+        let Some(word) = self
+            .chars
+            .get(index as usize)
+            .map(|character| character.word)
+        else {
             return CharRange::default();
         };
         match self.words.get(word as usize) {
@@ -296,7 +306,11 @@ impl TextPage {
 
     /// The range covering the whole line a character belongs to.
     pub fn line_range(&self, index: u32) -> CharRange {
-        let Some(line) = self.chars.get(index as usize).map(|character| character.line) else {
+        let Some(line) = self
+            .chars
+            .get(index as usize)
+            .map(|character| character.line)
+        else {
             return CharRange::default();
         };
         match self.lines.get(line as usize) {
@@ -407,7 +421,11 @@ mod tests {
         let mut chars = line("ab", 100.0);
         // Same baseline, but far enough right to be its own word.
         chars.push(character('c', 100.0, 100.0));
-        assert_eq!(build(chars).words.len(), 2, "the gap alone should split the words");
+        assert_eq!(
+            build(chars).words.len(),
+            2,
+            "the gap alone should split the words"
+        );
     }
 
     #[test]
@@ -420,7 +438,9 @@ mod tests {
     #[test]
     fn a_point_beside_a_glyph_hits_the_nearest_one() {
         let page = page();
-        let near = page.nearest_char(95.0, 106.0, 40.0).expect("within tolerance");
+        let near = page
+            .nearest_char(95.0, 106.0, 40.0)
+            .expect("within tolerance");
         assert_eq!(page.chars[near as usize].ch, 'd');
         assert!(page.nearest_char(500.0, 104.0, 10.0).is_none());
     }

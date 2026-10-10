@@ -218,6 +218,26 @@ pub enum EngineRequest {
         /// Set by the shell to stop the job early.
         cancel: Arc<AtomicBool>,
     },
+    /// Rasterize pages and send them to a printer.
+    PrintPages {
+        /// Document to read from.
+        handle: DocumentHandle,
+        /// Zero-based page indices to print, in order.
+        pages: Vec<u32>,
+        /// Name of the printer to send the job to.
+        printer: String,
+        /// Name shown in the printer's job list.
+        doc_name: String,
+        /// The form's fields, as the reader is showing them.
+        ///
+        /// PDFium does not render a field's value — the reader draws it — so
+        /// the print path has to paint those marks onto the raster itself.
+        fields: Vec<pdfreader_core::FormFieldInfo>,
+        /// Job this belongs to.
+        job: u64,
+        /// Set by the shell to stop the job early.
+        cancel: Arc<AtomicBool>,
+    },
     /// Concatenate documents into one, in the order given.
     MergePdfs {
         /// Documents to merge.
@@ -318,6 +338,11 @@ pub enum EngineResponse {
         /// Whether the value was written. `false` means the widget vanished,
         /// is read-only, or its type cannot be written.
         written: bool,
+        /// Whether the value went into the page instead of the form model.
+        ///
+        /// The shell re-reads the form when this is set, because the fields it
+        /// affects now report a value the model does not hold.
+        painted: bool,
         /// Why the write failed, when it did.
         error: Option<String>,
     },
@@ -640,19 +665,22 @@ fn run(
                 id,
                 value,
             } => {
-                let (written, error) = match engine.set_field_value(handle, id, value) {
-                    Ok(true) => (true, None),
-                    Ok(false) => (
+                let (written, painted, error) = match engine.set_field_value(handle, id, value) {
+                    Ok(pdfreader_pdf::FieldWrite::Recorded) => (true, false, None),
+                    Ok(pdfreader_pdf::FieldWrite::Painted) => (true, true, None),
+                    Ok(pdfreader_pdf::FieldWrite::Refused) => (
+                        false,
                         false,
                         Some("the field is read-only or no longer exists".to_string()),
                     ),
-                    Err(error) => (false, Some(error.to_string())),
+                    Err(error) => (false, false, Some(error.to_string())),
                 };
                 if responses
                     .send(EngineResponse::FieldSet {
                         doc,
                         id,
                         written,
+                        painted,
                         error,
                     })
                     .is_err()
@@ -875,12 +903,70 @@ fn run(
                     // Serialising is one indivisible step, so the only
                     // meaningful progress report is the one at the end.
                     let bytes = engine.export_pages_to_bytes(handle, range)?;
-                    std::fs::write(&path, &bytes).map_err(|error| EngineError::Io {
+                    std::fs::write(&path, &bytes).map_err(|error| EngineError::Write {
                         path: path.clone(),
                         reason: error.to_string(),
                     })?;
                     Ok(1)
                 });
+                if !done {
+                    return;
+                }
+            }
+            EngineRequest::PrintPages {
+                handle,
+                pages,
+                printer,
+                doc_name,
+                fields,
+                job,
+                cancel,
+            } => {
+                let done = run_job(
+                    job,
+                    &cancel,
+                    &responses,
+                    PathBuf::new(),
+                    ExportTarget::Print,
+                    |_progress| {
+                        crate::print::print_pages(
+                            &printer,
+                            &doc_name,
+                            &pages,
+                            |page, scale| {
+                                // The printer's full resolution, trimmed only
+                                // when this page is too large to rasterize at
+                                // it. The fallback is US Letter, and only ever
+                                // used if the size cannot be read — in which
+                                // case the render below reports the real error.
+                                let (width_pt, height_pt) =
+                                    engine.page_size(handle, page).unwrap_or((612.0, 792.0));
+                                let scale = crate::print::clamp_scale(scale, width_pt, height_pt);
+                                let mut tile = engine
+                                    .render_page(handle, page, Rotation::None, scale)
+                                    .map_err(|error| {
+                                        crate::print::PrintError::Failed(error.to_string())
+                                    })?;
+                                // Paint the form values the reader is showing:
+                                // PDFium renders the document, not the filled-in
+                                // values, so a ticked radio would print empty.
+                                crate::print::paint_form_marks(
+                                    &mut tile, page, height_pt, scale, &fields,
+                                );
+                                Ok(crate::print::PageBitmap {
+                                    width: tile.width,
+                                    height: tile.height,
+                                    data: tile.data,
+                                })
+                            },
+                            || cancel.load(Ordering::Relaxed),
+                        )
+                        .map_err(|error| match error {
+                            crate::print::PrintError::Cancelled => EngineError::Cancelled,
+                            crate::print::PrintError::Failed(reason) => EngineError::Print(reason),
+                        })
+                    },
+                );
                 if !done {
                     return;
                 }

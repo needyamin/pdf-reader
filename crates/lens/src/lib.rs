@@ -24,7 +24,9 @@ mod lookup;
 mod text;
 
 pub use dict::{Dictionaries, ParseError};
-pub use link::{DEFAULT_TARGET, TRANSLATE_BASE, TRANSLATE_TEXT_MAX, is_valid_target, translate_link};
+pub use link::{
+    DEFAULT_TARGET, TRANSLATE_BASE, TRANSLATE_TEXT_MAX, is_valid_target, translate_link,
+};
 pub use lookup::{
     Group, Lang, Lookup, LookupError, MAX_GROUPS, MAX_PHRASE_WORDS, MAX_TERMS_PER_GROUP,
 };

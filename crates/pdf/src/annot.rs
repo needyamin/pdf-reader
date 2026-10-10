@@ -87,6 +87,19 @@ fn is_hidden_type(annotation_type: PdfPageAnnotationType) -> bool {
 }
 
 /// Create an annotation described by `new` on `page`, returning its id.
+/// Mark an annotation as printable.
+///
+/// PDFium creates annotations with no flags, and an annotation without the
+/// `Print` flag is omitted when the document is printed — so a highlight or
+/// note the user added on screen would silently vanish on paper. Every
+/// annotation this app creates is one the user wants to keep, so all of them
+/// are made printable.
+fn mark_printable(
+    annot: &mut impl PdfPageAnnotationCommon,
+) -> Result<(), pdfium_render::prelude::PdfiumError> {
+    annot.set_is_printed(true)
+}
+
 pub(crate) fn create_annotation(
     document: &mut PdfDocument<'_>,
     page: u32,
@@ -104,30 +117,58 @@ pub(crate) fn create_annotation(
     match new {
         NewAnnotation::Highlight(rect) => {
             let mut annot = annotations.create_highlight_annotation()?;
+            mark_printable(&mut annot)?;
             place_markup(&mut annot, *rect, PdfColor::YELLOW)?;
         }
         NewAnnotation::Underline(rect) => {
             let mut annot = annotations.create_underline_annotation()?;
+            mark_printable(&mut annot)?;
             place_markup(&mut annot, *rect, PdfColor::BLACK)?;
         }
         NewAnnotation::StrikeOut(rect) => {
             let mut annot = annotations.create_strikeout_annotation()?;
+            mark_printable(&mut annot)?;
             place_markup(&mut annot, *rect, PdfColor::RED)?;
         }
         NewAnnotation::Squiggly(rect) => {
             let mut annot = annotations.create_squiggly_annotation()?;
+            mark_printable(&mut annot)?;
             place_markup(&mut annot, *rect, PdfColor::GREEN)?;
         }
         NewAnnotation::Square(rect) => {
             let mut annot = annotations.create_square_annotation()?;
+            mark_printable(&mut annot)?;
             annot.set_bounds(pdf_rect(*rect))?;
             annot.set_stroke_color(PdfColor::RED)?;
-            // Outline only: a zero-alpha fill keeps the page text visible.
-            annot.set_fill_color(PdfColor::new(255, 0, 0, 0))?;
+            // Deliberately no fill call.
+            //
+            // Setting a *fully transparent* fill — which is how an
+            // outline-only rectangle was first written — makes PDFium skip the
+            // border as well as the interior, so the rectangle rendered as
+            // nothing at all. It was visible while the drag was in progress,
+            // because the canvas draws its own preview, and then vanished the
+            // moment the re-rendered page arrived.
+            //
+            // Leaving `/IC` alone gives the border PDFium's default width and
+            // still lets the page text show through, which is what an outline
+            // is for.
         }
         NewAnnotation::StickyNote((x, y), contents) => {
             let mut annot = annotations.create_text_annotation(contents)?;
-            annot.set_position(PdfPoints::new(*x), PdfPoints::new(*y))?;
+            mark_printable(&mut annot)?;
+            // A sticky note's `/Rect` is its icon box, and `set_position`
+            // anchors that box's *lower-left* at the point. The canvas draws
+            // its note tag at the rect *centre*, so instead give the note a
+            // known-size box centred on the clicked point: the tag then lands
+            // exactly where the user clicked and sits over PDFium's own icon.
+            const ICON_PT: f32 = 20.0;
+            let half = ICON_PT / 2.0;
+            annot.set_bounds(pdf_rect(Rect::from_xywh(
+                *x - half,
+                *y - half,
+                ICON_PT,
+                ICON_PT,
+            )))?;
             annot.set_stroke_color(PdfColor::YELLOW)?;
             if contents.is_empty() {
                 annot.set_contents("Note")?;
@@ -135,6 +176,7 @@ pub(crate) fn create_annotation(
         }
         NewAnnotation::FreeText(rect, contents) => {
             let mut annot = annotations.create_free_text_annotation(contents)?;
+            mark_printable(&mut annot)?;
             annot.set_bounds(pdf_rect(*rect))?;
             annot.set_stroke_color(PdfColor::BLACK)?;
             annot.set_contents(contents)?;
@@ -226,15 +268,7 @@ impl_markup!(
     PdfPageSquigglyAnnotation,
 );
 
-/// Build a PDFium rect from our y-up rectangle.
-fn pdf_rect(rect: Rect) -> pdfium_render::prelude::PdfRect {
-    pdfium_render::prelude::PdfRect::new(
-        PdfPoints::new(rect.min_y),
-        PdfPoints::new(rect.min_x),
-        PdfPoints::new(rect.max_y),
-        PdfPoints::new(rect.max_x),
-    )
-}
+use crate::formmark::pdf_rect;
 
 /// Write a text value into every widget that shares `name`.
 ///
@@ -306,4 +340,62 @@ pub(crate) fn remove_annotation(
     page.annotations_mut().delete_annotation(annotation)?;
     page.regenerate_content()?;
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pdfium_render::prelude::{PdfPageAnnotationCommon, PdfPagePaperSize, Pdfium};
+    use std::path::PathBuf;
+
+    /// Locate the staged PDFium library under `target/native/*`.
+    fn find_pdfium() -> Option<PathBuf> {
+        let native = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("target")
+            .join("native");
+        for entry in std::fs::read_dir(native).ok()?.flatten() {
+            let dir = entry.path();
+            if dir.join("pdfium.dll").exists()
+                || dir.join("libpdfium.so").exists()
+                || dir.join("libpdfium.dylib").exists()
+            {
+                return Some(dir);
+            }
+        }
+        None
+    }
+
+    /// Annotations must carry the PDF `Print` flag. Without it a highlight or
+    /// note the user added on screen would be silently omitted from a printed
+    /// copy — the whole point of printing a marked-up document.
+    #[test]
+    fn created_annotations_carry_the_print_flag() {
+        let Some(dir) = find_pdfium() else {
+            eprintln!("SKIP: no PDFium library staged under target/native");
+            return;
+        };
+        let bindings = Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path(&dir))
+            .or_else(|_| Pdfium::bind_to_system_library())
+            .expect("bind PDFium");
+        let pdfium = Pdfium::new(bindings);
+
+        let mut document = pdfium.create_new_pdf().expect("new document");
+        document
+            .pages_mut()
+            .create_page_at_end(PdfPagePaperSize::a4())
+            .expect("add a page");
+
+        create_annotation(
+            &mut document,
+            0,
+            &NewAnnotation::Highlight(Rect::from_xywh(20.0, 20.0, 80.0, 12.0)),
+        )
+        .expect("create a highlight");
+
+        let page = document.pages().get(0).expect("page");
+        let printed = page.annotations().iter().any(|a| a.is_printed());
+        assert!(printed, "a created annotation must be printable");
+    }
 }

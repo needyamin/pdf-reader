@@ -338,11 +338,10 @@ impl PageRange {
 pub enum ExportTarget {
     /// The user picked a destination; the file stays there.
     SaveFile,
-    /// A temporary copy handed to the operating system's print pipeline.
+    /// The job went to a printer, so there is no file to point the user at.
     ///
-    /// The shell writes it to the temp directory, prints it, and sweeps it up
-    /// on the next launch rather than deleting it immediately: the print
-    /// hand-off returns before the viewer has read the file.
+    /// Pages are rasterized and sent to the printer directly; nothing is
+    /// written to disk.
     Print,
 }
 

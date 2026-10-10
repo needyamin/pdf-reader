@@ -10,7 +10,7 @@
 use std::path::PathBuf;
 
 use crate::document::Document;
-use crate::view::{ThemeId, ViewMode, ZoomMode};
+use crate::view::{ThemeId, ViewMode, ViewState, ZoomMode};
 
 /// Identity of an open tab.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -57,6 +57,17 @@ pub enum Command {
 
     /// Ask the shell to open a file in a new tab.
     OpenPath(PathBuf),
+
+    /// Reopen the tabs from the previous session, at the state they were left.
+    ///
+    /// One command rather than a run of `OpenPath`s so the active tab is
+    /// restored in the same step, and the shell can open every file it names.
+    RestoreTabs {
+        /// Tabs to reopen, in display order: the file and where it was left.
+        tabs: Vec<(PathBuf, ViewState)>,
+        /// Index into `tabs` of the tab that was active, if any.
+        active: Option<usize>,
+    },
 
     /// The engine finished opening a document.
     DocumentOpened {
@@ -354,6 +365,17 @@ pub enum Command {
     /// Set the point size used for form field text (0 = fit the field).
     SetFormFontSize(f32),
 
+    /// Set the RGB ink used for form field text.
+    SetFormFontColor(u8, u8, u8),
+
+    /// Draw form field text heavier, or stop doing so.
+    ///
+    /// No bold face is bundled and `egui` has no weight axis, so this is a
+    /// synthetic embolden: the glyphs are stamped twice a hair apart. It is
+    /// applied identically to the field being edited and to the committed
+    /// value, so text does not change weight when a field is finished.
+    SetFormFontBold(bool),
+
     /// Turn the popup's "Google Translate" link on or off.
     ToggleTranslate,
 
@@ -408,6 +430,21 @@ pub enum Effect {
         tab: TabId,
         /// Zero-based page index.
         page: u32,
+    },
+
+    /// Bring a form field into view, moving the view as little as possible.
+    ///
+    /// Distinct from [`Self::ScrollToPage`]: selecting a field is what the user
+    /// does immediately before typing, so a field that is already visible must
+    /// not move at all. Only the field's own rectangle is carried — the shell
+    /// turns it into a scroll delta, because that needs the page layout.
+    RevealField {
+        /// Tab the field belongs to.
+        tab: TabId,
+        /// Zero-based page the field sits on.
+        page: u32,
+        /// Field rectangle in unrotated PDF page space.
+        rect: crate::rect::Rect,
     },
 
     /// Durable state changed and should be written to disk.

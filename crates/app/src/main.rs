@@ -15,6 +15,8 @@ mod export_window;
 mod fonts;
 mod lens;
 mod print;
+mod print_window;
+mod session;
 mod settings;
 
 use std::collections::HashMap;
@@ -31,7 +33,7 @@ use pdfreader_core::{
 use pdfreader_pdf::engine::{DocumentHandle, PdfiumEngine};
 use pdfreader_search::SearchMatch;
 use pdfreader_ui::{
-    MENUBAR_HEIGHT, STATUSBAR_HEIGHT, TABBAR_HEIGHT, TOOLBAR_HEIGHT, TOOLS_RAIL_WIDTH,
+    MENUBAR_HEIGHT, STATUSBAR_HEIGHT, TABBAR_HEIGHT, TOOLBAR_HEIGHT, TOOLS_RAIL_WIDTH, TextStyle,
     annotation_bar, comments_panel, forms_panel, menu_bar, outline_tree, sidebar_tabs, status_bar,
     tab_bar, toolbar, tools_rail,
 };
@@ -97,16 +99,6 @@ fn write_pdf_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result
 
 fn main() {
     init_tracing();
-
-    // Print spool files cannot be deleted when their job finishes — the shell
-    // hands the file to a handler that reads it afterwards — so they are swept
-    // here, at the first moment every earlier print is certainly done with its
-    // file. Failures are ignored: a file still open simply survives to the next
-    // launch.
-    let swept = print::sweep_stale_spool_files();
-    if swept > 0 {
-        tracing::info!("removed {swept} stale print file(s) from the temp directory");
-    }
 
     let engine = match PdfiumEngine::bind(exe_dir().as_deref()) {
         Ok(engine) => engine,
@@ -239,6 +231,10 @@ struct Settings {
     form_font: Option<String>,
     /// Point size used for form field text (0 = fit the field).
     form_font_size: Option<f32>,
+    /// RGB ink for form field text. Absent means the default near-black.
+    form_font_color: Option<[u8; 3]>,
+    /// Whether form text is drawn heavier, when the user has chosen.
+    form_font_bold: Option<bool>,
     /// Whether the window opens maximized. Absent means yes, which is the
     /// default a reader wants: the page is the point, but the title bar and its
     /// minimize / maximize / close buttons stay available.
@@ -269,13 +265,22 @@ struct PasswordPrompt {
     submitting: bool,
 }
 
-/// Where preferences are stored, per platform convention.
-fn config_file() -> Option<PathBuf> {
+/// How often the session may be written while it keeps changing. Scrolling
+/// changes it every frame; this keeps the disk off the hot path.
+const SESSION_SAVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Where the app keeps its files, per platform convention.
+pub(crate) fn config_dir() -> Option<PathBuf> {
     let base = std::env::var_os("APPDATA")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from))
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
-    Some(base.join("pdf-reader").join("settings.json"))
+    Some(base.join("pdf-reader"))
+}
+
+/// Where preferences are stored.
+fn config_file() -> Option<PathBuf> {
+    Some(config_dir()?.join("settings.json"))
 }
 
 /// Load preferences. A missing file is normal; a corrupt one is preserved
@@ -538,6 +543,8 @@ struct App {
     /// At most one at a time: it is a modal, so a second one could only ever be
     /// behind the first.
     export_window: Option<ExportWindow>,
+    /// The print window, open while the user is choosing what to print.
+    print_window: Option<print_window::PrintWindow>,
     /// The export task the window was last opened on, so reopening it returns
     /// to what the user was doing rather than to the first task every time.
     last_export_task: ExportTask,
@@ -622,6 +629,10 @@ struct App {
     form_font: String,
     /// Point size used for form field text (0 = fit the field).
     form_font_size: f32,
+    /// RGB ink for text typed into form fields.
+    form_font_color: [u8; 3],
+    /// Whether typed form text is drawn heavier (synthetic bold).
+    form_font_bold: bool,
     /// Whether the next launch opens maximized (Settings → Reading → Window).
     open_maximized: bool,
     /// Frames left to keep asking winit to maximize the window. A creation-time
@@ -676,6 +687,14 @@ struct App {
     /// needs something that loads late (dictionaries).
     screenshot_frames: u64,
     frames_total: u64,
+    /// Whether the debug form hook has already fired. The form is re-read after
+    /// a painted write, so an unguarded hook would toggle the choice back.
+    debug_form_done: bool,
+    /// The session as last written to disk, for change detection.
+    session: session::Session,
+    /// When the session was last written, so a scroll does not hit the disk on
+    /// every frame.
+    last_session_save: std::time::Instant,
 }
 
 impl App {
@@ -728,6 +747,7 @@ impl App {
             dialog_tx,
             dialog_intent: None,
             export_window: None,
+            print_window: None,
             last_export_task: ExportTask::default(),
             pending_close: None,
             close_after_save: None,
@@ -769,6 +789,8 @@ impl App {
             prefetch: settings.prefetch.unwrap_or(true),
             form_font: settings.form_font.unwrap_or_default(),
             form_font_size: settings.form_font_size.unwrap_or(0.0).max(0.0),
+            form_font_bold: settings.form_font_bold.unwrap_or(false),
+            form_font_color: settings.form_font_color.unwrap_or(canvas::DEFAULT_FORM_INK),
             open_maximized: settings.open_maximized.unwrap_or(true),
             start_maximized: if start_maximized { 15 } else { 0 },
             settings_window: settings::SettingsWindow::new(),
@@ -793,11 +815,14 @@ impl App {
             last_stats: std::time::Instant::now(),
             screenshot: std::env::var_os("PDFREADER_SCREENSHOT").map(PathBuf::from),
             screenshot_sent: false,
+            session: session::Session::default(),
+            last_session_save: std::time::Instant::now(),
             screenshot_frames: std::env::var("PDFREADER_SCREENSHOT_FRAMES")
                 .ok()
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(20),
             frames_total: 0,
+            debug_form_done: false,
         };
 
         // The canvas owns the prefetch flag (it is what draws the tiles), so
@@ -806,7 +831,26 @@ impl App {
         app.canvas.set_form_font(canvas::FormFont {
             family: app.form_font.clone(),
             size: app.form_font_size,
+            color: app.form_font_color,
+            bold: app.form_font_bold,
         });
+
+        // Reopen the tabs from last run, each where it was left. A file that has
+        // since been deleted is dropped rather than reopened as an error tab on
+        // every launch.
+        let remembered = session::load().retaining_existing_files();
+        if !remembered.tabs.is_empty() {
+            let effects = app.store.dispatch(Command::RestoreTabs {
+                tabs: remembered
+                    .tabs
+                    .iter()
+                    .map(|tab| (tab.path.clone(), tab.view))
+                    .collect(),
+                active: remembered.active,
+            });
+            app.execute(effects);
+        }
+        app.session = remembered;
 
         // Debug: open the Settings window on launch so its layout can be
         // captured without a human clicking through the menu (pair with
@@ -820,6 +864,13 @@ impl App {
         // Debug: open the keyboard-shortcuts reference on launch (screenshot QA).
         if std::env::var_os("PDFREADER_SHOW_SHORTCUTS").is_some() {
             app.shortcuts_open = true;
+        }
+        // Debug: open the print window on launch so its layout can be captured
+        // without a human clicking through the menu (pair with
+        // `PDFREADER_SCREENSHOT`). The page count is read live, so the document
+        // passed on the command line fills the window in as it loads.
+        if std::env::var_os("PDFREADER_PRINT_WINDOW").is_some() {
+            app.print_window = Some(print_window::PrintWindow::new(0));
         }
 
         // Open whatever path was given, even if it is missing — the engine will
@@ -860,6 +911,8 @@ impl App {
         self.canvas.set_form_font(canvas::FormFont {
             family: self.form_font.clone(),
             size: self.form_font_size,
+            color: self.form_font_color,
+            bold: self.form_font_bold,
         });
     }
 
@@ -897,11 +950,56 @@ impl App {
             prefetch: Some(self.prefetch),
             form_font: Some(self.form_font.clone()),
             form_font_size: Some(self.form_font_size),
+            form_font_color: Some(self.form_font_color),
+            form_font_bold: Some(self.form_font_bold),
             open_maximized: Some(self.open_maximized),
         };
         if let Ok(text) = serde_json::to_string_pretty(&settings) {
             let _ = std::fs::write(path, text);
         }
+    }
+
+    /// The session as it stands now: the open tabs and where each is left.
+    fn current_session(&self) -> session::Session {
+        let state = self.store.state();
+        let mut tabs = Vec::new();
+        let mut active = None;
+        for tab in &state.tabs {
+            // A tab that failed to load is not worth remembering; a file that
+            // has since gone is skipped on restore anyway.
+            if tab.error.is_some() {
+                continue;
+            }
+            if Some(tab.id) == state.active_tab {
+                active = Some(tabs.len());
+            }
+            tabs.push(session::SessionTab {
+                path: tab.path.clone(),
+                view: tab.view,
+            });
+        }
+        session::Session { tabs, active }
+    }
+
+    /// Write the session when it has changed.
+    ///
+    /// Scrolling changes the session every frame, so an unforced write is
+    /// throttled to [`SESSION_SAVE_INTERVAL`]; structural changes and shutdown
+    /// pass `force` and write at once.
+    /// Returns `true` when a change is still waiting out the debounce, so the
+    /// caller can arrange a frame to finish the write.
+    fn persist_session(&mut self, force: bool) -> bool {
+        let current = self.current_session();
+        if current == self.session {
+            return false;
+        }
+        if !force && self.last_session_save.elapsed() < SESSION_SAVE_INTERVAL {
+            return true;
+        }
+        session::save(&current);
+        self.session = current;
+        self.last_session_save = std::time::Instant::now();
+        false
     }
 
     /// Run effects produced by the reducer.
@@ -933,8 +1031,20 @@ impl App {
                 Effect::ScrollToPage { page, .. } => {
                     self.scroll_to_page = Some(page);
                 }
+                Effect::RevealField { tab, page, rect } => {
+                    // The canvas lays out one document at a time, so a reveal
+                    // for a tab that is no longer active would move the wrong
+                    // view. The canvas works out whether any scrolling is
+                    // actually needed; a field already on screen does not move.
+                    if self.store.state().active_tab == Some(tab) {
+                        self.canvas.reveal_field(page, rect);
+                    }
+                }
                 Effect::PersistSession => {
                     self.persist();
+                    // A structural change — a tab opened or closed — is worth
+                    // writing at once rather than waiting out the debounce.
+                    let _ = self.persist_session(true);
                 }
                 Effect::SetField { doc, id, value } => {
                     if let Some(handle) = self.handles.get(&doc).copied() {
@@ -1070,18 +1180,22 @@ impl App {
                     }
                 }
                 Effect::Print { doc, range } => {
-                    if let Some(handle) = self.handles.get(&doc).copied() {
-                        let (job, cancel) = self.begin_job("Preparing to print".to_string());
-                        // The shell names the spool file because it owns the
-                        // file's lifetime: it cannot be deleted when the job
-                        // finishes, since the print handler reads it afterwards.
-                        self.engine.send(EngineRequest::ExportPages {
-                            handle,
-                            range,
-                            path: print::spool_path(job),
-                            target: ExportTarget::Print,
-                            job,
-                            cancel,
+                    if self.handles.contains_key(&doc) {
+                        // The window is where the pages are chosen, so only the
+                        // page count is needed here. "Print Current Page" opens
+                        // with the page in view already selected; File → Print
+                        // opens on the whole document.
+                        let count = self
+                            .store
+                            .state()
+                            .tabs
+                            .iter()
+                            .find(|t| t.document.as_ref().is_some_and(|d| d.id == doc))
+                            .map_or(0, |t| t.page_count());
+                        self.print_window = Some(if range.is_some() {
+                            print_window::PrintWindow::current_page(count)
+                        } else {
+                            print_window::PrintWindow::new(count)
                         });
                     }
                 }
@@ -1142,7 +1256,11 @@ impl App {
 
         let theme_id = self.store.state().theme;
         if self.applied_theme != Some(theme_id) {
-            pdfreader_ui::Theme::from_id(theme_id).apply(ctx);
+            let theme = pdfreader_ui::Theme::from_id(theme_id);
+            // The canvas paints the on-page note editor by hand, so it has to
+            // be told the radius the rest of the chrome is using.
+            self.canvas.set_corner_radius(theme.palette.radius);
+            theme.apply(ctx);
             self.applied_theme = Some(theme_id);
         }
 
@@ -1297,25 +1415,82 @@ impl App {
                         // leaking an open document until process exit.
                         self.engine.send(EngineRequest::Close { handle });
                     }
+                    // Debug: draw one of each annotation so the marks can be
+                    // captured without a mouse (PDFREADER_DRAW_SAMPLES). Goes
+                    // through the same command a drag commits, so what appears
+                    // is what a drag produces.
+                    if !self.debug_form_done && std::env::var_os("PDFREADER_DRAW_SAMPLES").is_some()
+                    {
+                        self.debug_form_done = true;
+                        for new in [
+                            pdfreader_core::NewAnnotation::Highlight(
+                                pdfreader_core::Rect::from_xywh(80.0, 700.0, 200.0, 18.0),
+                            ),
+                            pdfreader_core::NewAnnotation::Underline(
+                                pdfreader_core::Rect::from_xywh(80.0, 660.0, 200.0, 18.0),
+                            ),
+                            pdfreader_core::NewAnnotation::StrikeOut(
+                                pdfreader_core::Rect::from_xywh(80.0, 620.0, 200.0, 18.0),
+                            ),
+                            pdfreader_core::NewAnnotation::Squiggly(
+                                pdfreader_core::Rect::from_xywh(80.0, 580.0, 200.0, 18.0),
+                            ),
+                            pdfreader_core::NewAnnotation::Square(pdfreader_core::Rect::from_xywh(
+                                80.0, 520.0, 200.0, 40.0,
+                            )),
+                        ]
+                        .into_iter()
+                        {
+                            let effects =
+                                self.store.dispatch(Command::AddAnnotation { page: 0, new });
+                            self.execute(effects);
+                        }
+                    }
+
                     // New document: drop any in-flight requests from before.
                     self.engine.bump_generation();
                 }
                 EngineResponse::FormFields { doc, form } => {
-                    // Debug: check the first checkbox so the tick can be
-                    // captured without a mouse (PDFREADER_CHECK_FIRST).
-                    let debug_check = std::env::var_os("PDFREADER_CHECK_FIRST").is_some().then(|| {
-                        form.fields
-                            .iter()
-                            .find(|f| f.kind == pdfreader_core::FormFieldType::CheckBox)
-                            .map(|f| f.id)
+                    // Debug hooks, so a mark can be captured without a mouse:
+                    // tick the first checkbox (PDFREADER_CHECK_FIRST), select the
+                    // first unselected radio (PDFREADER_SELECT_RADIO), or open
+                    // the first text field for editing (PDFREADER_EDIT_FIELD).
+                    // Fired once: the form is re-read after a painted write, and
+                    // acting again would toggle the choice straight back.
+                    let debug = (!self.debug_form_done).then(|| {
+                        if std::env::var_os("PDFREADER_CHECK_FIRST").is_some() {
+                            form.fields
+                                .iter()
+                                .find(|f| f.kind == pdfreader_core::FormFieldType::CheckBox)
+                                .map(|f| (f.id, None))
+                        } else if std::env::var_os("PDFREADER_SELECT_RADIO").is_some() {
+                            form.fields
+                                .iter()
+                                .find(|f| {
+                                    f.kind == pdfreader_core::FormFieldType::RadioButton
+                                        && f.value == pdfreader_core::FieldValue::Checked(false)
+                                })
+                                .map(|f| (f.id, Some(pdfreader_core::FieldValue::Checked(true))))
+                        } else if std::env::var_os("PDFREADER_EDIT_FIELD").is_some() {
+                            form.fields
+                                .iter()
+                                .find(|f| f.kind == pdfreader_core::FormFieldType::Text)
+                                .map(|f| (f.id, None))
+                        } else {
+                            None
+                        }
                     });
                     let effects = self.store.dispatch(Command::FormFieldsLoaded { doc, form });
                     self.execute(effects);
-                    if let Some(Some(id)) = debug_check {
-                        let effects = self.store.dispatch(Command::SetFormFieldValue {
-                            id,
-                            value: pdfreader_core::FieldValue::Checked(true),
-                        });
+                    if let Some(Some((id, value))) = debug {
+                        self.debug_form_done = true;
+                        let command = match value {
+                            Some(value) => Command::SetFormFieldValue { id, value },
+                            // No value to write: just open the field, which is
+                            // what a click on it would do.
+                            None => Command::SelectFormField(Some(id)),
+                        };
+                        let effects = self.store.dispatch(command);
                         self.execute(effects);
                     }
                 }
@@ -1323,21 +1498,34 @@ impl App {
                     doc,
                     id,
                     written,
+                    painted,
                     error,
                 } => {
-                    if !written {
-                        // The reducer already applied the value optimistically;
-                        // a failed write means the document will not actually
-                        // hold it, so say so rather than let a save silently
-                        // drop the user's input.
+                    if painted {
+                        // The value could not be recorded in the form model, so
+                        // it was drawn into the page instead. Two things follow.
+                        //
+                        // The page content changed, so its raster is out of
+                        // date: marking it stale re-renders in place, and the
+                        // mark appears without a flash or a manual scroll.
+                        self.canvas.invalidate_page(doc, id.page);
+                        // And the fields it touched now report a value the model
+                        // does not hold, so the form is re-read — the canvas has
+                        // to know they are already on the page, or it would draw
+                        // a second copy of the mark over the top of the painted
+                        // one.
+                        if let Some(handle) = self.handles.get(&doc).copied() {
+                            self.engine.send(EngineRequest::LoadForm { doc, handle });
+                        }
+                    } else if !written {
+                        let reason = error.as_deref().unwrap_or("unknown reason");
                         tracing::warn!(
-                            "form field {id:?} in document {doc:?} was not written: {}",
-                            error.as_deref().unwrap_or("unknown reason")
+                            "form field {id:?} in document {doc:?} was not written: {reason}"
                         );
-                        self.save_error = Some(format!(
-                            "Could not write field: {}",
-                            error.as_deref().unwrap_or("unknown reason")
-                        ));
+                        // The reducer applied the value optimistically; a failed
+                        // write means the document will not hold it, so say so
+                        // rather than let a save drop the user's input.
+                        self.save_error = Some(format!("Could not write field: {reason}"));
                     }
                 }
                 EngineResponse::Saved { doc, bytes } => {
@@ -1513,22 +1701,10 @@ impl App {
                             self.job_notice = Some(describe_output(&output, pages));
                         }
                         ExportTarget::Print => {
-                            // Hand the spool file to the OS. It is deliberately
-                            // not deleted here: the handler reads it after this
-                            // returns. The next launch sweeps it up.
-                            match print::print_pdf(&output) {
-                                Ok(()) => {
-                                    tracing::info!(
-                                        "sent {} to the print handler",
-                                        output.display()
-                                    );
-                                    self.job_notice = Some("Sent to the printer".to_string());
-                                }
-                                Err(error) => {
-                                    tracing::warn!("printing failed: {error}");
-                                    self.save_error = Some(format!("Could not print: {error}"));
-                                }
-                            }
+                            // The pages went straight to the printer; all that
+                            // is left is to say so.
+                            tracing::info!("sent {pages} page(s) to the printer");
+                            self.job_notice = Some("Sent to the printer".to_string());
                         }
                     }
                 }
@@ -1929,6 +2105,92 @@ impl App {
         }
     }
 
+    /// Ask the engine for the page previews the print window shows.
+    ///
+    /// Reuses the sidebar's thumbnail cache, so a page the strip has already
+    /// drawn costs nothing, and the canvas deduplicates in-flight requests, so
+    /// asking for the whole selection every frame only ever sends the missing
+    /// ones.
+    fn ensure_print_previews(&mut self, dpr: f32) {
+        let Some(window) = self.print_window.as_ref() else {
+            return;
+        };
+        let Some(tab) = self.store.state().active() else {
+            return;
+        };
+        let Some(document) = tab.document.as_ref() else {
+            return;
+        };
+        let rotation = tab.view.rotation;
+        let doc_id = document.id;
+        let pages = window.preview_pages(document.page_count(), tab.view.current_page);
+
+        let mut requests = Vec::new();
+        for page in pages {
+            if self.canvas.thumbnail(doc_id, rotation, page).is_some() {
+                continue;
+            }
+            if let Some(thumb) = self.canvas.request_thumbnail(
+                document,
+                rotation,
+                page,
+                print_window::PREVIEW_WIDTH,
+                dpr,
+            ) {
+                requests.push(thumb);
+            }
+        }
+        if !requests.is_empty() {
+            self.request_thumbnails(requests);
+        }
+    }
+
+    /// Act on what the user did in the print window.
+    fn handle_print_action(&mut self, action: print_window::Action) {
+        match action {
+            print_window::Action::None => {}
+            print_window::Action::Cancel => self.print_window = None,
+            print_window::Action::Print(pages) => {
+                self.print_window = None;
+
+                let active = self.store.state().active();
+                let doc = active.and_then(|tab| tab.document.as_ref()).map(|d| d.id);
+                let title = active
+                    .and_then(|tab| tab.document.as_ref())
+                    .map(|d| d.title.clone())
+                    .unwrap_or_else(|| "Document".to_string());
+                // The form as the reader is showing it, so the print path can
+                // paint the values PDFium will not render.
+                let fields = active
+                    .and_then(|tab| tab.form.as_ref())
+                    .map(|form| form.fields.clone())
+                    .unwrap_or_default();
+                let Some(handle) = doc.and_then(|doc| self.handles.get(&doc).copied()) else {
+                    return;
+                };
+
+                match print::choose_printer() {
+                    // Cancelled: printing is what the user changed their mind
+                    // about, so it needs no message.
+                    Ok(None) => {}
+                    Err(reason) => self.save_error = Some(format!("Could not print: {reason}")),
+                    Ok(Some(printer)) => {
+                        let (job, cancel) = self.begin_job("Sending to the printer".to_string());
+                        self.engine.send(EngineRequest::PrintPages {
+                            handle,
+                            pages,
+                            printer,
+                            doc_name: title,
+                            fields,
+                            job,
+                            cancel,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
     /// Forward canvas tile requests to the engine thread.
     fn request_tiles(&mut self, tiles: Vec<PendingTile>) {
         let generation = self.engine.generation();
@@ -2068,6 +2330,18 @@ impl App {
                     self.persist();
                     continue;
                 }
+                Command::SetFormFontColor(red, green, blue) => {
+                    self.form_font_color = [red, green, blue];
+                    self.sync_form_font();
+                    self.persist();
+                    continue;
+                }
+                Command::SetFormFontBold(bold) => {
+                    self.form_font_bold = bold;
+                    self.sync_form_font();
+                    self.persist();
+                    continue;
+                }
                 Command::ToggleTranslate => {
                     self.translate_enabled = !self.translate_enabled;
                     self.persist();
@@ -2194,7 +2468,6 @@ impl eframe::App for App {
             ctx.request_repaint();
         }
 
-
         // Snapshot the helper-tool preferences up front. They are read-only
         // during this frame, but `self` is borrowed for most of the draw, so a
         // local copy lets the menu and canvas closures read them without a
@@ -2206,6 +2479,15 @@ impl eframe::App for App {
         let lens_target = self.lens_target.clone();
         let form_font = self.form_font.clone();
         let form_font_size = self.form_font_size;
+        let form_font_color = self.form_font_color;
+        // One bundle for both places that edit the typing font — the Forms
+        // panel and the quick bar above the page.
+        let text_style = TextStyle {
+            family: &form_font,
+            size: form_font_size,
+            bold: self.form_font_bold,
+            color: form_font_color,
+        };
         // Edit → Find… asks the toolbar's find box to take focus. Consume the
         // flag here so the request lasts exactly one frame.
         let focus_search = self.focus_search;
@@ -2216,10 +2498,7 @@ impl eframe::App for App {
         if let Some(rx) = self.lens_rx.take() {
             match rx.try_recv() {
                 Ok(Ok(dictionaries)) => {
-                    tracing::info!(
-                        entries = dictionaries.entry_count(),
-                        "dictionaries loaded"
-                    );
+                    tracing::info!(entries = dictionaries.entry_count(), "dictionaries loaded");
                     self.lens = Some(dictionaries);
                 }
                 Ok(Err(reason)) => {
@@ -2410,8 +2689,7 @@ impl eframe::App for App {
                                             doc.id,
                                             form,
                                             view.selected_field,
-                                            &form_font,
-                                            form_font_size,
+                                            text_style,
                                         )),
                                         None => {
                                             ui.add_space(6.0);
@@ -2476,7 +2754,7 @@ impl eframe::App for App {
                         .active()
                         .is_some_and(|tab| tab.document.is_some())
                     {
-                        commands.extend(annotation_bar(ui, &palette, store.state()));
+                        commands.extend(annotation_bar(ui, &palette, store.state(), text_style));
                         ui.separator();
                     }
                     canvas_size = Some(ui.available_size());
@@ -2517,6 +2795,8 @@ impl eframe::App for App {
                                     palette.accent,
                                     store.state().tool,
                                     page_text,
+                                    tab.annotations.as_deref().unwrap_or(&[]),
+                                    tab.view.selected_annotation,
                                 );
                                 tiles.extend(pending);
 
@@ -2544,8 +2824,7 @@ impl eframe::App for App {
                                 let clicked = canvas
                                     .take_click()
                                     .filter(|_| store.state().tool.annotation_kind().is_none());
-                                if let Some(point) = clicked
-                                {
+                                if let Some(point) = clicked {
                                     let hit =
                                         pdfreader_render::hit_page(canvas.page_spaces(), point)
                                             .and_then(|space| {
@@ -2601,9 +2880,10 @@ impl eframe::App for App {
                                             Some(dictionaries) => lens::Answer::from_lookup(
                                                 dictionaries.lookup(&request.text),
                                             ),
-                                            None => lens_error
-                                                .clone()
-                                                .map_or(lens::Answer::Loading, lens::Answer::Missing),
+                                            None => lens_error.clone().map_or(
+                                                lens::Answer::Loading,
+                                                lens::Answer::Missing,
+                                            ),
                                         };
                                         // Auto-speak only when the whole TTS
                                         // tool is on; the setting alone does
@@ -2770,6 +3050,51 @@ impl eframe::App for App {
             self.handle_export_action(&ctx, action);
         }
 
+        // The print window, drawn last so it sits above the panels. Its page
+        // previews come from the thumbnail cache, which is why the requests are
+        // issued here: a frame later the textures exist and the spinners are
+        // replaced by pages.
+        if self.print_window.is_some() {
+            self.ensure_print_previews(dpr);
+
+            let (title, page_count, current_page, rotation, doc_id) =
+                match self.store.state().active() {
+                    Some(tab) => (
+                        tab.document
+                            .as_ref()
+                            .map_or_else(|| "Document".to_string(), |d| d.title.clone()),
+                        tab.page_count(),
+                        tab.view.current_page,
+                        tab.view.rotation,
+                        tab.document.as_ref().map(|d| d.id),
+                    ),
+                    None => ("Document".to_string(), 0, 0, Rotation::None, None),
+                };
+
+            let preview_pages = self
+                .print_window
+                .as_ref()
+                .map(|window| window.preview_pages(page_count, current_page))
+                .unwrap_or_default();
+            let previews: Vec<(u32, Option<egui::TextureHandle>)> = preview_pages
+                .into_iter()
+                .map(|page| {
+                    let texture = doc_id
+                        .and_then(|id| self.canvas.thumbnail(id, rotation, page))
+                        .cloned();
+                    (page, texture)
+                })
+                .collect();
+
+            let action = match self.print_window.as_mut() {
+                Some(window) => {
+                    window.show(&ctx, &palette, &title, page_count, current_page, &previews)
+                }
+                None => print_window::Action::None,
+            };
+            self.handle_print_action(action);
+        }
+
         // Status feedback: a failure, a job in progress, or a finished job.
         // One slot rather than a stack — at most one of these is interesting at
         // a time, and the newest is always the most relevant. Click a finished
@@ -2801,39 +3126,32 @@ impl eframe::App for App {
                         ToastKind::Error => palette.danger,
                         ToastKind::Busy | ToastKind::Success => palette.accent,
                     };
-                    egui::Frame::new()
-                        .fill(palette.panel_bg)
-                        .stroke(egui::Stroke::new(1.0, stroke))
-                        .corner_radius(3.0)
-                        .inner_margin(egui::Margin::same(10))
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                let message = match (kind, progress) {
-                                    (ToastKind::Busy, Some((done, total))) => {
-                                        format!("{text}  ({done}/{total})")
-                                    }
-                                    _ => text.clone(),
-                                };
-                                ui.label(
-                                    egui::RichText::new(message).color(palette.text).size(12.0),
-                                );
-
-                                if kind == ToastKind::Busy {
-                                    if ui
-                                        .button(egui::RichText::new("Cancel").size(12.0))
-                                        .clicked()
-                                    {
-                                        cancel = true;
-                                    }
-                                } else {
-                                    ui.label(
-                                        egui::RichText::new("(click to dismiss)")
-                                            .color(palette.text_dim)
-                                            .size(11.0),
-                                    );
+                    pdfreader_ui::toast_frame(&palette, stroke).show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            let message = match (kind, progress) {
+                                (ToastKind::Busy, Some((done, total))) => {
+                                    format!("{text}  ({done}/{total})")
                                 }
-                            });
+                                _ => text.clone(),
+                            };
+                            ui.label(egui::RichText::new(message).color(palette.text).size(12.0));
+
+                            if kind == ToastKind::Busy {
+                                if ui
+                                    .button(egui::RichText::new("Cancel").size(12.0))
+                                    .clicked()
+                                {
+                                    cancel = true;
+                                }
+                            } else {
+                                ui.label(
+                                    egui::RichText::new("(click to dismiss)")
+                                        .color(palette.text_dim)
+                                        .size(11.0),
+                                );
+                            }
                         });
+                    });
 
                     if kind != ToastKind::Busy {
                         ui.interact(
@@ -2857,7 +3175,7 @@ impl eframe::App for App {
 
         // The lookup card. Drawn last as a top-level area so it sits above
         // every panel and is never clipped by the canvas or the scroll area.
-        self.lens_popup.show(
+        let popup_rect = self.lens_popup.show(
             &ctx,
             &palette,
             &lens_target,
@@ -2865,12 +3183,31 @@ impl eframe::App for App {
             translate_enabled,
         );
 
+        // A floating card swallows the wheel — egui only scrolls a ScrollArea
+        // when the pointer's top layer is that area, and the card sits above
+        // the canvas. While the pointer is over the card, forward the
+        // unconsumed wheel delta to the canvas so the document keeps scrolling
+        // (selection intact), the way a browser behaves.
+        if let Some(rect) = popup_rect {
+            let over = ctx
+                .input(|i| i.pointer.latest_pos())
+                .is_some_and(|pos| rect.contains(pos));
+            if over {
+                let delta = ctx.input(|i| i.smooth_scroll_delta);
+                if delta != egui::Vec2::ZERO {
+                    ctx.input_mut(|i| i.smooth_scroll_delta = egui::Vec2::ZERO);
+                    let offset = self.canvas.scroll_offset();
+                    self.canvas.request_scroll_to(offset - delta);
+                }
+            }
+        }
+
         // The full Settings window (when open), the keyboard-shortcuts
         // reference, and the optional performance overlay — all above the
         // panels.
         self.draw_settings_window(&ctx, &palette);
         self.draw_shortcuts_window(&ctx, &palette);
-        self.draw_about_window(&ctx);
+        self.draw_about_window(&ctx, &palette);
         if self.show_stats {
             self.draw_stats_overlay(&ctx, &palette);
         }
@@ -2880,6 +3217,13 @@ impl eframe::App for App {
         self.request_tiles(tiles);
         self.request_thumbnails(thumbs);
         self.apply(&ctx, commands);
+
+        // Remember the open tabs and where each is left. Scrolling changes this
+        // every frame, so the write is debounced; when one is still pending,
+        // keep a frame coming so it lands even after the user stops moving.
+        if self.persist_session(false) {
+            ctx.request_repaint_after(SESSION_SAVE_INTERVAL);
+        }
 
         // Keep the frame loop alive while tiles/thumbnails are still streaming
         // in, so pages fill in promptly instead of waiting for the next input
@@ -2926,6 +3270,12 @@ impl eframe::App for App {
             self.tiles_delivered = 0;
             self.last_stats = std::time::Instant::now();
         }
+    }
+
+    fn on_exit(&mut self) {
+        // The last change may sit inside the debounce window; make the session
+        // on disk match what was actually open.
+        let _ = self.persist_session(true);
     }
 }
 
@@ -3010,78 +3360,93 @@ fn search_result_card(
     palette: &pdfreader_ui::Palette,
     query: &str,
     result: &SearchMatch,
+    index: usize,
 ) -> egui::Response {
-    // Allocate first so the hover state is known before anything is painted.
-    let (rect, response) =
-        ui.allocate_exact_size(egui::vec2(ui.available_width(), 48.0), egui::Sense::click());
-    let hovered = response.hovered();
+    let id = ui.id().with(("search-card", result.page, index));
 
-    let painter = ui.painter();
-    painter.rect_filled(
-        rect,
-        6.0,
-        if hovered {
-            palette.surface_hover
-        } else {
-            palette.surface
-        },
-    );
-    painter.rect_stroke(
-        rect,
-        6.0,
-        egui::Stroke::new(
-            1.0,
+    // Hover is read from the previous frame's response: the card's own
+    // rectangle is not known until its content has been laid out, and the
+    // background has to be reserved before that happens.
+    let hovered = ui
+        .ctx()
+        .read_response(id)
+        .is_some_and(|response| response.hovered());
+
+    // Reserved now, painted once the content has decided how tall the card is.
+    // A fixed height used to clip the second line of a two-row snippet, which is
+    // what a card with too little padding looks like.
+    let background = ui.painter().add(egui::Shape::Noop);
+    let border = ui.painter().add(egui::Shape::Noop);
+
+    let inner = ui.scope_builder(egui::UiBuilder::new(), |ui| {
+        ui.horizontal(|ui| {
+            // Page badge: a fixed-width chip so the excerpts line up in a
+            // column no matter how many digits the page number has.
+            let (badge, _) = ui.allocate_exact_size(egui::vec2(30.0, 18.0), egui::Sense::hover());
+            ui.painter().rect_filled(badge, 4.0, palette.accent_soft);
+            ui.painter().text(
+                badge.center(),
+                egui::Align2::CENTER_CENTER,
+                format!("{}", result.page + 1),
+                egui::FontId::proportional(11.0),
+                palette.accent,
+            );
+            ui.add_space(pdfreader_ui::SIDEBAR_GAP);
+
+            ui.vertical(|ui| {
+                ui.add(egui::Label::new(highlighted_snippet(
+                    &result.snippet,
+                    query,
+                    palette,
+                )));
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Page {} · {} match{}",
+                        result.page + 1,
+                        result.count,
+                        if result.count == 1 { "" } else { "es" }
+                    ))
+                    .color(palette.text_dim)
+                    .size(10.0),
+                );
+            });
+        });
+    });
+
+    let rect = inner
+        .response
+        .rect
+        .expand2(egui::vec2(pdfreader_ui::ROW_PAD_X, pdfreader_ui::ROW_PAD_Y));
+    ui.painter().set(
+        background,
+        egui::Shape::rect_filled(
+            rect,
+            6.0,
             if hovered {
-                palette.accent_soft
+                palette.surface_hover
             } else {
-                palette.border
+                palette.surface
             },
         ),
-        egui::StrokeKind::Inside,
+    );
+    ui.painter().set(
+        border,
+        egui::Shape::rect_stroke(
+            rect,
+            6.0,
+            egui::Stroke::new(
+                1.0,
+                if hovered {
+                    palette.accent_soft
+                } else {
+                    palette.border
+                },
+            ),
+            egui::StrokeKind::Inside,
+        ),
     );
 
-    // The parent already advanced past `rect`, so the child only has to draw
-    // inside it; no extra space accounting is needed.
-    ui.scope_builder(
-        egui::UiBuilder::new().max_rect(rect.shrink2(egui::vec2(8.0, 6.0))),
-        |ui| {
-            ui.horizontal(|ui| {
-                // Page badge: a fixed-width chip so the excerpts line up in a
-                // column no matter how many digits the page number has.
-                let (badge, _) =
-                    ui.allocate_exact_size(egui::vec2(30.0, 18.0), egui::Sense::hover());
-                ui.painter().rect_filled(badge, 4.0, palette.accent_soft);
-                ui.painter().text(
-                    badge.center(),
-                    egui::Align2::CENTER_CENTER,
-                    format!("{}", result.page + 1),
-                    egui::FontId::proportional(11.0),
-                    palette.accent,
-                );
-                ui.add_space(4.0);
-
-                ui.vertical(|ui| {
-                    ui.add(egui::Label::new(highlighted_snippet(
-                        &result.snippet,
-                        query,
-                        palette,
-                    )));
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "Page {} · {} match{}",
-                            result.page + 1,
-                            result.count,
-                            if result.count == 1 { "" } else { "es" }
-                        ))
-                        .color(palette.text_dim)
-                        .size(10.0),
-                    );
-                });
-            });
-        },
-    );
-
-    response
+    ui.interact(rect, id, egui::Sense::click())
 }
 
 /// Draw the Find panel: a query field plus the match list.
@@ -3095,15 +3460,24 @@ fn draw_search_results(
     error: Option<&str>,
     commands: &mut Vec<Command>,
 ) {
-    ui.add_space(2.0);
+    // Every line in this panel sits in the same content margin, so the query
+    // box, the notices and the match count line up with each other instead of
+    // the notices hugging the sidebar edge while the box is indented.
+    let notice = |ui: &mut egui::Ui, text: egui::RichText| {
+        egui::Frame::new()
+            .inner_margin(pdfreader_ui::sidebar_note_margin())
+            .show(ui, |ui| {
+                ui.label(text);
+            });
+    };
 
     // The query field lives here as well as in the toolbar: the toolbar one is
     // easy to miss once you are reading the results, and re-running a search
     // should not mean hunting for the box again. It is the same input-group
     // control the toolbar draws, so the two are identical by construction; the
-    // frame only adds breathing room inside the sidebar.
+    // frame only adds the sidebar's own content margin around it.
     egui::Frame::new()
-        .inner_margin(egui::Margin::symmetric(10, 6))
+        .inner_margin(pdfreader_ui::sidebar_margin())
         .show(ui, |ui| {
             let width = ui.available_width().min(240.0);
             let outcome =
@@ -3115,10 +3489,11 @@ fn draw_search_results(
                 commands.push(Command::Search(String::new()));
             }
         });
-    ui.add_space(6.0);
+    ui.add_space(pdfreader_ui::SIDEBAR_GAP);
 
     if query.is_empty() {
-        ui.label(
+        notice(
+            ui,
             egui::RichText::new("Type a word or phrase and press Enter.")
                 .color(palette.text_dim)
                 .size(12.0),
@@ -3126,7 +3501,8 @@ fn draw_search_results(
         return;
     }
     if !current_document {
-        ui.label(
+        notice(
+            ui,
             egui::RichText::new("These results belong to another tab.")
                 .color(palette.text_dim)
                 .size(12.0),
@@ -3134,22 +3510,30 @@ fn draw_search_results(
         return;
     }
     if in_progress {
-        ui.horizontal(|ui| {
-            ui.spinner();
-            ui.label(
-                egui::RichText::new("Searching pages…")
-                    .color(palette.text_dim)
-                    .size(12.0),
-            );
-        });
+        egui::Frame::new()
+            .inner_margin(pdfreader_ui::sidebar_note_margin())
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(
+                        egui::RichText::new("Searching pages…")
+                            .color(palette.text_dim)
+                            .size(12.0),
+                    );
+                });
+            });
         return;
     }
     if let Some(error) = error {
-        ui.label(egui::RichText::new(error).color(palette.danger).size(12.0));
+        notice(
+            ui,
+            egui::RichText::new(error).color(palette.danger).size(12.0),
+        );
         return;
     }
     if results.is_empty() {
-        ui.label(
+        notice(
+            ui,
             egui::RichText::new(format!("No results for “{query}”."))
                 .color(palette.text_dim)
                 .size(12.0),
@@ -3158,30 +3542,38 @@ fn draw_search_results(
     }
 
     let total: usize = results.iter().map(|r| r.count).sum();
-    ui.label(
-        egui::RichText::new(format!(
-            "{total} match{} on {} page{}",
-            if total == 1 { "" } else { "es" },
-            results.len(),
-            if results.len() == 1 { "" } else { "s" }
-        ))
-        .color(palette.text_dim)
-        .size(11.0),
-    );
-    ui.add_space(4.0);
+    egui::Frame::new()
+        .inner_margin(pdfreader_ui::sidebar_note_margin())
+        .show(ui, |ui| {
+            ui.label(
+                egui::RichText::new(format!(
+                    "{total} match{} on {} page{}",
+                    if total == 1 { "" } else { "es" },
+                    results.len(),
+                    if results.len() == 1 { "" } else { "s" }
+                ))
+                .color(palette.text_dim)
+                .size(11.0),
+            );
+        });
+    ui.add_space(pdfreader_ui::SIDEBAR_GAP);
 
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            for result in results {
-                if search_result_card(ui, palette, query, result)
-                    .on_hover_cursor(egui::CursorIcon::PointingHand)
-                    .clicked()
-                {
-                    commands.push(Command::GoToPage(result.page));
-                }
-                ui.add_space(4.0);
-            }
+            egui::Frame::new()
+                .inner_margin(pdfreader_ui::sidebar_list_margin())
+                .show(ui, |ui| {
+                    for (index, result) in results.iter().enumerate() {
+                        if search_result_card(ui, palette, query, result, index)
+                            .on_hover_cursor(egui::CursorIcon::PointingHand)
+                            .clicked()
+                        {
+                            commands.push(Command::GoToPage(result.page));
+                        }
+                        ui.add_space(pdfreader_ui::SIDEBAR_GAP);
+                    }
+                });
         });
 }
 
@@ -3212,19 +3604,11 @@ fn confirm_close_dialog(
     path: &std::path::Path,
 ) -> Option<CloseChoice> {
     let mut choice = None;
-    egui::Window::new("Unsaved changes")
-        .collapsible(false)
+    pdfreader_ui::dialog_window("Unsaved changes", palette)
         .resizable(false)
-        .frame(
-            egui::Frame::new()
-                .fill(palette.panel_bg)
-                .stroke(egui::Stroke::new(1.0, palette.border))
-                .corner_radius(3.0)
-                .inner_margin(egui::Margin::same(18)),
-        )
-        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        .min_width(pdfreader_ui::DIALOG_MIN_WIDTH)
         .show(ctx, |ui| {
-            ui.set_min_width(330.0);
+            ui.set_min_width(pdfreader_ui::DIALOG_MIN_WIDTH);
             ui.label(
                 egui::RichText::new(format!(
                     "{} has changes that are not saved.",
@@ -3233,26 +3617,27 @@ fn confirm_close_dialog(
                 .color(palette.text)
                 .size(13.0),
             );
+            ui.add_space(6.0);
+            ui.label(pdfreader_ui::hint(
+                palette,
+                "Saving writes the document first, then closes the tab.",
+            ));
             ui.add_space(14.0);
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 if ui
-                    .add(egui::Button::new(
-                        egui::RichText::new("Save and close").size(12.5),
-                    ))
+                    .add(pdfreader_ui::primary_button(palette, "Save and close"))
                     .clicked()
                 {
                     choice = Some(CloseChoice::SaveAndClose);
                 }
                 if ui
-                    .add(egui::Button::new(
-                        egui::RichText::new("Discard changes").size(12.5),
-                    ))
+                    .add(pdfreader_ui::secondary_button(palette, "Discard changes"))
                     .clicked()
                 {
                     choice = Some(CloseChoice::Discard);
                 }
                 if ui
-                    .add(egui::Button::new(egui::RichText::new("Cancel").size(12.5)))
+                    .add(pdfreader_ui::secondary_button(palette, "Cancel"))
                     .clicked()
                 {
                     choice = Some(CloseChoice::Cancel);
@@ -3268,19 +3653,11 @@ fn password_dialog(
     prompt: &mut PasswordPrompt,
 ) -> Option<PasswordAction> {
     let mut action = None;
-    egui::Window::new("Password required")
-        .collapsible(false)
+    pdfreader_ui::dialog_window("Password required", palette)
         .resizable(false)
-        .frame(
-            egui::Frame::new()
-                .fill(palette.panel_bg)
-                .stroke(egui::Stroke::new(1.0, palette.border))
-                .corner_radius(3.0)
-                .inner_margin(egui::Margin::same(18)),
-        )
-        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        .min_width(pdfreader_ui::DIALOG_MIN_WIDTH)
         .show(ctx, |ui| {
-            ui.set_min_width(330.0);
+            ui.set_min_width(pdfreader_ui::DIALOG_MIN_WIDTH);
             ui.label(
                 egui::RichText::new(format!("Enter the password for {}", prompt.path.display()))
                     .color(palette.text)
@@ -3316,23 +3693,14 @@ fn password_dialog(
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
                     if ui
-                        .add(
-                            egui::Button::new("Cancel")
-                                .fill(palette.surface)
-                                .corner_radius(7.0),
-                        )
+                        .add(pdfreader_ui::secondary_button(palette, "Cancel"))
                         .clicked()
                     {
                         action = Some(PasswordAction::Cancel);
                     }
                     let enabled = !prompt.passphrase.is_empty();
                     if ui
-                        .add_enabled(
-                            enabled,
-                            egui::Button::new("Unlock")
-                                .fill(palette.accent_soft)
-                                .corner_radius(7.0),
-                        )
+                        .add_enabled(enabled, pdfreader_ui::primary_button(palette, "Unlock"))
                         .clicked()
                         || (enter && enabled)
                     {
@@ -3390,10 +3758,7 @@ fn empty_state(ui: &mut egui::Ui, palette: &pdfreader_ui::Palette, commands: &mu
             .layout(egui::Layout::top_down(egui::Align::Min)),
     );
 
-    egui::Frame::new()
-        .fill(palette.panel_bg)
-        .stroke(egui::Stroke::new(1.0, palette.border))
-        .corner_radius(3.0)
+    pdfreader_ui::card_frame(palette)
         .inner_margin(egui::Margin::symmetric(34, 30))
         .show(&mut child, |ui| {
             // Bind the Frame's content to a known height so it doesn't stretch.
@@ -3431,14 +3796,7 @@ fn empty_state(ui: &mut egui::Ui, palette: &pdfreader_ui::Palette, commands: &mu
                 ));
                 ui.add_space(18.0);
                 if ui
-                    .add(
-                        egui::Button::new(
-                            egui::RichText::new("Open PDF…").color(palette.text),
-                        )
-                        .fill(palette.accent_soft)
-                        .corner_radius(2.0)
-                        .min_size(egui::vec2(132.0, 34.0)),
-                    )
+                    .add(pdfreader_ui::primary_button(palette, "Open PDF…"))
                     .clicked()
                 {
                     commands.push(Command::ShowOpenDialog);
@@ -3461,10 +3819,7 @@ fn empty_state(ui: &mut egui::Ui, palette: &pdfreader_ui::Palette, commands: &mu
 /// Loading-state canvas.
 fn loading_state(ui: &mut egui::Ui, palette: &pdfreader_ui::Palette) {
     ui.centered_and_justified(|ui| {
-        egui::Frame::new()
-            .fill(palette.panel_bg)
-            .stroke(egui::Stroke::new(1.0, palette.border))
-            .corner_radius(3.0)
+        pdfreader_ui::card_frame(palette)
             .inner_margin(egui::Margin::symmetric(28, 22))
             .show(ui, |ui| {
                 ui.vertical_centered(|ui| {
@@ -3496,10 +3851,8 @@ fn error_state(
 ) {
     let reason = tab.error.as_deref().unwrap_or("Unknown error");
     ui.centered_and_justified(|ui| {
-        egui::Frame::new()
-            .fill(palette.panel_bg)
+        pdfreader_ui::card_frame(palette)
             .stroke(egui::Stroke::new(1.0, palette.danger.gamma_multiply(0.55)))
-            .corner_radius(12.0)
             .inner_margin(egui::Margin::symmetric(30, 24))
             .show(ui, |ui| {
                 ui.set_max_width(420.0);
@@ -3518,12 +3871,7 @@ fn error_state(
                     );
                     ui.add_space(16.0);
                     if ui
-                        .add(
-                            egui::Button::new(egui::RichText::new("Dismiss").color(palette.text))
-                                .fill(palette.surface)
-                                .corner_radius(7.0)
-                                .min_size(egui::vec2(96.0, 32.0)),
-                        )
+                        .add(pdfreader_ui::secondary_button(palette, "Dismiss"))
                         .clicked()
                     {
                         commands.push(Command::DismissError);
@@ -3575,6 +3923,8 @@ mod tests {
             prefetch: Some(false),
             form_font: Some("NotoSansBengali-Regular".to_owned()),
             form_font_size: Some(14.0),
+            form_font_color: Some([12, 34, 56]),
+            form_font_bold: Some(true),
             open_maximized: Some(false),
         };
         let json = serde_json::to_string(&settings).expect("settings serialise");
@@ -3591,6 +3941,8 @@ mod tests {
         assert_eq!(back.prefetch, Some(false));
         assert_eq!(back.form_font.as_deref(), Some("NotoSansBengali-Regular"));
         assert_eq!(back.form_font_size, Some(14.0));
+        assert_eq!(back.form_font_color, Some([12, 34, 56]));
+        assert_eq!(back.form_font_bold, Some(true));
         assert_eq!(back.open_maximized, Some(false));
     }
 
@@ -3609,7 +3961,10 @@ mod tests {
     #[test]
     fn view_and_zoom_names_map_with_a_default_fallback() {
         assert_eq!(view_mode_from_name(Some("single")), ViewMode::Single);
-        assert_eq!(view_mode_from_name(Some("continuous")), ViewMode::Continuous);
+        assert_eq!(
+            view_mode_from_name(Some("continuous")),
+            ViewMode::Continuous
+        );
         assert_eq!(view_mode_from_name(None), ViewMode::Continuous);
         assert_eq!(view_mode_from_name(Some("nonsense")), ViewMode::Continuous);
 

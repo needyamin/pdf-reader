@@ -18,11 +18,12 @@ use egui::{
     TextureOptions, Ui, Vec2, pos2, vec2,
 };
 use pdfreader_core::{
-    AnnotationKind, Command, Document, DocumentId, FieldId, FieldValue, FormFieldType, FormInfo,
-    NewAnnotation, Rect as PdfSpaceRect, Rotation, Tool, ViewMode, ViewState,
+    AnnotationId, AnnotationInfo, AnnotationKind, Command, Document, DocumentId, FieldId,
+    FieldValue, FormFieldType, FormInfo, NewAnnotation, Rect as PdfSpaceRect, Rotation, Tool,
+    ViewMode, ViewState,
 };
-use pdfreader_pdf::engine::{TilePixels, TileRequest};
 use pdfreader_pdf::CharRange;
+use pdfreader_pdf::engine::{TilePixels, TileRequest};
 use pdfreader_render::{
     PageBox, PageSpace, TILE_SIZE, TileKey, hit_page, level_scale, tile_grid, tile_pixel_rect,
     zoom_level,
@@ -80,7 +81,9 @@ type ThumbCacheKey = (DocumentId, Rotation, u32);
 struct NoteInput {
     /// Page the note sits on.
     page: u32,
-    /// Layout-space anchor of the note tag.
+    /// Anchor of the note in **unrotated PDF space** (points, y up). Kept in
+    /// page space so it survives zoom/scroll and maps back through
+    /// `PageSpace::to_screen_point` for drawing.
     point: (f32, f32),
     /// The text being typed.
     text: String,
@@ -135,19 +138,46 @@ pub struct ThumbnailResult {
     pub clicked: Option<u32>,
 }
 
-/// Font used to draw form field text and the on-page editor.
+/// The ink typed form values are drawn in until the user picks another.
+pub const DEFAULT_FORM_INK: [u8; 3] = [25, 25, 25];
+
+/// Font and ink used to draw form field text and the on-page editor.
 ///
-/// The app owns the setting (Settings → Text) and pushes it here so the canvas
-/// can render typed values in the chosen face and size — the PDF's own font is
-/// not enough for scripts like Bengali, and the size a form hard-codes is often
-/// too small to read.
-#[derive(Clone, Debug, Default)]
+/// The app owns the settings — Settings → Text, and the Forms panel's "Typing
+/// font" block — and pushes them here so the canvas can render typed values in
+/// the chosen face, size and colour. The PDF's own font is not enough for
+/// scripts like Bengali, and the size a form hard-codes is often too small to
+/// read.
+#[derive(Clone, Debug)]
 pub struct FormFont {
     /// Named egui font family, or empty for the default proportional face.
     pub family: String,
     /// Point size, or `0.0` to fit the field's height.
     pub size: f32,
+    /// Whether the text is drawn heavier.
+    pub bold: bool,
+    /// RGB ink for typed values.
+    pub color: [u8; 3],
 }
+
+impl Default for FormFont {
+    fn default() -> Self {
+        Self {
+            family: String::new(),
+            size: 0.0,
+            bold: false,
+            color: DEFAULT_FORM_INK,
+        }
+    }
+}
+
+/// How far the second stamp of synthetic bold sits from the first, in points.
+///
+/// `egui` has no weight axis and no bold face is bundled, so bold is made by
+/// drawing the glyphs twice. A quarter of a point at the sizes a form uses
+/// thickens the strokes visibly without smearing the letterforms; more than
+/// about half a point starts to look like a drop shadow.
+const SYNTHETIC_BOLD_OFFSET: f32 = 0.35;
 
 impl FormFont {
     /// The egui family to draw with, falling back to the default proportional
@@ -167,6 +197,11 @@ impl FormFont {
         } else {
             (rect_height * 0.62).clamp(6.0, 15.0)
         }
+    }
+
+    /// The ink to draw typed values in.
+    pub fn ink(&self) -> Color32 {
+        Color32::from_rgb(self.color[0], self.color[1], self.color[2])
     }
 }
 
@@ -207,6 +242,13 @@ pub struct Canvas {
     /// commands. It is consumed by the next draw, after the reducer has
     /// accepted the command.
     pending_scroll_offset: Option<Vec2>,
+    /// A field to bring into view on the next draw, as `(page, PDF-space rect)`.
+    ///
+    /// Kept apart from `pending_scroll_offset` because the offset cannot be
+    /// worked out until the page layout is known, and because a field already
+    /// on screen must not move at all — clicking into a field to type should
+    /// never shift the page under the pointer.
+    pending_reveal: Option<(u32, PdfSpaceRect)>,
     /// Page the thumbnail strip last scrolled itself to, and in which
     /// document, so it follows page navigation without fighting the user's
     /// own scrolling of the strip — and re-anchors after a tab switch even
@@ -265,12 +307,23 @@ pub struct Canvas {
     /// Tracks the edge so a selection starts on the press frame, not on every
     /// frame of the drag.
     pressing_page: bool,
+    /// Whether the current press landed on the canvas but not on a page.
+    ///
+    /// The gaps between pages, and the margin around them, have no text to
+    /// select, so a drag that starts there moves the view instead of doing
+    /// nothing at all.
+    press_on_background: bool,
     /// Whether tiles just outside the viewport are requested ahead of time.
     /// Turning this off (Settings → Performance) saves memory and bandwidth at
     /// the cost of a brief blank flash when scrolling into a new area.
     prefetch: bool,
     /// Font used to draw form field text and the on-page editor.
     form_font: FormFont,
+    /// Corner radius the theme uses for controls, so the on-page note editor
+    /// is rounded the same amount as every other control on screen. The canvas
+    /// is given the palette's colours one at a time, so this is the piece it
+    /// has to be told rather than read.
+    corner_radius: f32,
     /// The text selection: the page and the characters covered.
     ///
     /// Held here rather than in the store because it is transient widget state
@@ -306,6 +359,7 @@ impl Canvas {
             center_frac_x: 0.5,
             last_zoom: None,
             pending_scroll_offset: None,
+            pending_reveal: None,
             thumb_follow: None,
             pan_tool: false,
             panning: false,
@@ -322,9 +376,11 @@ impl Canvas {
             note_input: None,
             select_start: None,
             selecting: false,
+            press_on_background: false,
             pressing_page: false,
             prefetch: true,
             form_font: FormFont::default(),
+            corner_radius: 7.0,
             selection: None,
             lookup: None,
         }
@@ -343,6 +399,7 @@ impl Canvas {
     /// is a highlight over one page's text, so it cannot outlive the view it
     /// was made in.
     pub fn clear_selection(&mut self) {
+        self.press_on_background = false;
         self.select_start = None;
         self.selecting = false;
         self.pressing_page = false;
@@ -360,6 +417,14 @@ impl Canvas {
         self.form_font = font;
     }
 
+    /// Set the corner radius the current theme gives its controls.
+    ///
+    /// The canvas paints the on-page note editor by hand, so it needs the
+    /// palette's radius — the same number the buttons in the toolbar and every
+    /// window in the app round to.
+    pub fn set_corner_radius(&mut self, radius: f32) {
+        self.corner_radius = radius;
+    }
 
     /// Page spaces from the last draw, in document layout space.
     ///
@@ -437,6 +502,16 @@ impl Canvas {
     /// Apply an absolute scroll position on the next canvas draw.
     pub fn request_scroll_to(&mut self, offset: Vec2) {
         self.pending_scroll_offset = Some(Vec2::new(offset.x.max(0.0), offset.y.max(0.0)));
+    }
+
+    /// Bring a form field into view on the next draw.
+    ///
+    /// Deliberately not a jump: a field already on screen stays exactly where it
+    /// is, and one that is off screen is scrolled just far enough to clear the
+    /// edge. Selecting a field is what the user does immediately before typing,
+    /// so moving the page under them would be actively hostile.
+    pub fn reveal_field(&mut self, page: u32, rect: PdfSpaceRect) {
+        self.pending_reveal = Some((page, rect));
     }
 
     /// Forget every outstanding tile request.
@@ -682,6 +757,11 @@ impl Canvas {
         accent: Color32,
         tool: Tool,
         page_text: &PageTextCache,
+        // Every annotation on the document, so placed notes stay visible and
+        // clickable after the page re-renders.
+        annotations: &[AnnotationInfo],
+        // The currently selected annotation, if any, drawn highlighted.
+        selected_annotation: Option<AnnotationId>,
     ) -> Vec<PendingTile> {
         let mut candidates: Vec<(f32, PendingTile)> = Vec::new();
         let rotation = view.rotation;
@@ -762,6 +842,24 @@ impl Canvas {
         // The builder offset is applied when the ScrollArea begins, so the
         // frame's own closure already paints at the target position.
         let viewport_size = ui.available_size();
+
+        // A newly selected field is brought into view only if it is not already
+        // there. `self.scroll_offset` still holds the previous frame's offset,
+        // which is what the user is currently looking at.
+        let reveal_offset = self
+            .pending_reveal
+            .take()
+            .and_then(|(page, rect)| {
+                let space = page_spaces.iter().find(|sp| sp.index == page)?;
+                let field = space.to_screen(rect);
+                reveal_scroll(
+                    (field.x, field.y, field.w, field.h),
+                    (viewport_size.x, viewport_size.y),
+                    (self.scroll_offset.x, self.scroll_offset.y),
+                )
+            })
+            .map(|(x, y)| Vec2::new(x, y));
+
         let jump_offset = scroll_to_page.and_then(|target| {
             boxes
                 .iter()
@@ -781,6 +879,7 @@ impl Canvas {
         let initial_offset =
             document_changed.then_some(Vec2::new(view.scroll_x.max(0.0), view.scroll_y.max(0.0)));
         let scroll = match jump_offset
+            .or(reveal_offset)
             .or(pending_offset)
             .or(anchor_offset)
             .or(initial_offset)
@@ -831,21 +930,37 @@ impl Canvas {
                 // Press begins the shape exactly where the pointer is, but
                 // only when it lands on a page inside the visible canvas —
                 // toolbar or menu clicks must not start strokes.
-                if pointer.primary_pressed()
-                    && in_view
-                    && self.draw_start.is_none()
-                    && note_input.is_none()
-                {
-                    if let Some(pos) = pointer.interact_pos() {
-                        let local = (pos.x - content_origin.x, pos.y - content_origin.y);
-                        if let Some(space) = page_spaces.iter().find(|sp| {
-                            local.0 >= sp.origin.0
-                                && local.0 <= sp.origin.0 + sp.size.0
-                                && local.1 >= sp.origin.1
-                                && local.1 <= sp.origin.1 + sp.size.1
-                        }) {
-                            self.draw_start = Some(local);
-                            self.draw_page = Some(space.index);
+                if pointer.primary_pressed() && in_view && self.draw_start.is_none() {
+                    // A press on the page while a note popup is open commits
+                    // that note and starts the next one in a single click, so
+                    // placing several notes flows without a throwaway click.
+                    // A press *inside* the popup (repositioning the caret) is
+                    // left for the popup to handle.
+                    if let Some(pending) = note_input.take() {
+                        if ui.ctx().is_pointer_over_egui() {
+                            note_input = Some(pending);
+                        } else if !pending.text.trim().is_empty() {
+                            commit_pending_note(
+                                &mut self.edits,
+                                &mut self.pending,
+                                doc.id,
+                                &page_spaces,
+                                pending,
+                            );
+                        }
+                    }
+                    if note_input.is_none() {
+                        if let Some(pos) = pointer.interact_pos() {
+                            let local = (pos.x - content_origin.x, pos.y - content_origin.y);
+                            if let Some(space) = page_spaces.iter().find(|sp| {
+                                local.0 >= sp.origin.0
+                                    && local.0 <= sp.origin.0 + sp.size.0
+                                    && local.1 >= sp.origin.1
+                                    && local.1 <= sp.origin.1 + sp.size.1
+                            }) {
+                                self.draw_start = Some(local);
+                                self.draw_page = Some(space.index);
+                            }
                         }
                     }
                 }
@@ -880,8 +995,13 @@ impl Canvas {
                                 if let Some(space) =
                                     page_spaces.iter().find(|space| space.index == page)
                                 {
+                                    // `to_page` yields *unrotated* PDF-space
+                                    // points, so clamp to the unrotated page
+                                    // size — using the oriented size would swap
+                                    // the bounds on a rotated page and push the
+                                    // note off its true spot.
                                     let (px, py) = space.to_page(end);
-                                    let (w, h) = space.geom.oriented(space.rotation);
+                                    let (w, h) = (space.geom.width_pt, space.geom.height_pt);
                                     // The LOCAL copy: the field was taken at the
                                     // top of the frame and written back at the
                                     // end — writing the field here would be
@@ -923,8 +1043,10 @@ impl Canvas {
                                     // Clamp to the page: a drag that ends over
                                     // another page converts through the start
                                     // page's transform, and nothing may extend
-                                    // past the page it was drawn on.
-                                    let (w, h) = space.geom.oriented(space.rotation);
+                                    // past the page it was drawn on. `to_page`
+                                    // returns unrotated PDF points, so the
+                                    // bounds are the unrotated page size.
+                                    let (w, h) = (space.geom.width_pt, space.geom.height_pt);
                                     let page_bounds = PdfSpaceRect::from_xywh(0.0, 0.0, w, h);
                                     let rect = page_bounds.intersection(rect)?;
                                     match kind {
@@ -1007,6 +1129,10 @@ impl Canvas {
                     if !self.selecting {
                         self.selection = None;
                     }
+                    // Remember that this press landed on the canvas but not on a
+                    // page: there is no text under it, so the drag that follows
+                    // is free to move the view.
+                    self.press_on_background = down_on_page && !self.selecting;
                 }
 
                 let released = pointer.primary_released();
@@ -1022,6 +1148,7 @@ impl Canvas {
 
                 if released {
                     self.select_start = None;
+                    self.press_on_background = false;
                     // Only commit when this gesture actually began on a page.
                     // Otherwise a click on the popup (which leaves the existing
                     // selection intact) would re-emit it and re-open the card.
@@ -1223,7 +1350,7 @@ impl Canvas {
                             egui::Frame::new()
                                 .fill(background)
                                 .stroke(egui::Stroke::new(1.0, accent.gamma_multiply(0.6)))
-                                .corner_radius(3.0)
+                                .corner_radius(self.corner_radius)
                                 .inner_margin(egui::Margin::same(6))
                                 .show(ui, |ui| {
                                     let Some(note) = note_input.as_mut() else {
@@ -1241,14 +1368,25 @@ impl Canvas {
                                     }
                                     let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
                                     let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
-                                    // Enter always commits; a click-away commits
-                                    // only when there is text, otherwise it
-                                    // discards the placement. Esc discards.
+                                    // Esc discards. Enter commits — even an
+                                    // empty note, which the engine names
+                                    // "Note". A click-away commits only when
+                                    // something was typed; otherwise it just
+                                    // discards the placement, so clicking to
+                                    // place the next note never litters the
+                                    // page with blank notes.
                                     if escape {
                                         return Some(None);
                                     }
-                                    if enter || response.lost_focus() {
+                                    if enter {
                                         return Some(Some(note.text.clone()));
+                                    }
+                                    if response.lost_focus() {
+                                        return if note.text.trim().is_empty() {
+                                            Some(None)
+                                        } else {
+                                            Some(Some(note.text.clone()))
+                                        };
                                     }
                                     None
                                 })
@@ -1257,25 +1395,18 @@ impl Canvas {
                         .inner;
                     if let Some(decision) = commit_text {
                         if let Some(note) = note_input.take() {
-                            // `None` = Esc discard. `Some(text)` = create; the
-                            // engine falls back to "Note" for empty text.
-                            if let Some(text) = decision {
-                                let (px, py) = space.to_page(note.point);
-                                let (w, h) = space.geom.oriented(space.rotation);
-                                self.edits.push(Command::AddAnnotation {
-                                    page: note.page,
-                                    new: NewAnnotation::StickyNote(
-                                        (px.clamp(0.0, w), py.clamp(0.0, h)),
-                                        text,
-                                    ),
-                                });
-                                self.pending.push(PendingEcho {
-                                    doc: doc.id,
-                                    page: note.page,
-                                    kind: AnnotationKind::StickyNote,
-                                    rect: None,
-                                    point: Some(note.point),
-                                });
+                            // The outer `Some` means a decision was reached; the
+                            // inner `Some` means create (empty text becomes
+                            // "Note"), `None` means Esc / empty click-away
+                            // discard.
+                            if decision.is_some() {
+                                commit_pending_note(
+                                    &mut self.edits,
+                                    &mut self.pending,
+                                    doc.id,
+                                    &page_spaces,
+                                    note,
+                                );
                             }
                         }
                     }
@@ -1304,12 +1435,8 @@ impl Canvas {
             if let Some((page, range)) = self.selection {
                 if let Some(space) = page_spaces.iter().find(|space| space.index == page) {
                     if let Some(text) = page_text.get(doc.id, page) {
-                        let fill = Color32::from_rgba_unmultiplied(
-                            accent.r(),
-                            accent.g(),
-                            accent.b(),
-                            80,
-                        );
+                        let fill =
+                            Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 80);
                         for rect in text.range_rects(range) {
                             let screen = space.to_screen(rect);
                             painter.rect_filled(
@@ -1337,6 +1464,66 @@ impl Canvas {
                 content_origin,
             );
 
+            // Persistent note cards. Without this the note a user just placed
+            // vanishes the moment the re-rendered page tiles arrive — PDFium
+            // only draws a tiny icon for a sticky note, and the app's own card
+            // was only painted as a transient echo. Drawing every sticky note
+            // here keeps it visible in the PDF and lets the user click it to
+            // select/edit (fixes "can't find the note").
+            let click = self.clicked_at;
+            // Screen rect of every drawn card, in paint order, so a click can
+            // be resolved to the card actually on top.
+            let mut cards: Vec<(AnnotationId, Rect)> = Vec::new();
+            for ann in annotations
+                .iter()
+                .filter(|a| a.kind == AnnotationKind::StickyNote)
+            {
+                let Some(space) = page_spaces.iter().find(|sp| sp.index == ann.id.page) else {
+                    continue;
+                };
+                // A sticky note's `/Rect` is its icon box. The engine creates it
+                // centred on the clicked point (and foreign notes are centred
+                // on their icon too), so anchoring the card at the rect centre
+                // pins it exactly where the note sits.
+                let anchor = (
+                    (ann.rect.min_x + ann.rect.max_x) / 2.0,
+                    (ann.rect.min_y + ann.rect.max_y) / 2.0,
+                );
+                let (sx, sy) = space.to_screen_point(anchor);
+
+                let card =
+                    draw_note_card(&painter, (sx, sy), ann.display_contents(), content_origin);
+
+                if selected_annotation == Some(ann.id) {
+                    painter.rect_stroke(
+                        card.expand(3.0),
+                        9.0,
+                        Stroke::new(1.6, accent),
+                        StrokeKind::Outside,
+                    );
+                }
+                cards.push((ann.id, card));
+            }
+
+            // Resolve a click to the topmost card under it. Cards are pushed in
+            // paint order, so the last match is the one drawn on top — clicking
+            // an overlapping note picks the one the user actually sees. A hit
+            // consumes the click so the form-field hit-test below does not also
+            // fire; a click on empty page clears the selection but is left
+            // intact so field picking still runs.
+            if tool.annotation_kind().is_none() {
+                if let Some(pt) = click {
+                    let screen_pt = pos2(pt.0 + content_origin.x, pt.1 + content_origin.y);
+                    match topmost_card(&cards, screen_pt) {
+                        Some(id) => {
+                            self.edits.push(Command::SelectAnnotation(Some(id)));
+                            self.clicked_at = None;
+                        }
+                        None => self.edits.push(Command::SelectAnnotation(None)),
+                    }
+                }
+            }
+
             // Write the note popup state back for the next frame.
             self.note_input = note_input;
         });
@@ -1350,23 +1537,54 @@ impl Canvas {
         // "the app is stuck" on a trackpad.
         let (panning, pan_delta) = ui.input(|input| {
             let pointer = &input.pointer;
-            // A draw tool owns the primary button; the middle button always
-            // pans, which is what every other viewer binds it to.
-            let wants_pan = pointer.middle_down()
-                || (self.pan_tool && pointer.primary_down() && tool.annotation_kind().is_none());
+            let wants_pan = drag_pans(
+                pointer.middle_down(),
+                pointer.primary_down(),
+                self.pan_tool,
+                self.press_on_background,
+                tool.annotation_kind().is_some(),
+            );
             (
                 wants_pan && pointer.is_decidedly_dragging(),
                 pointer.delta(),
             )
         });
         self.panning = panning;
+
+        // One place decides where the view goes this frame, so a pan and an
+        // edge-following drag cannot overwrite each other.
+        let mut scroll_delta = Vec2::ZERO;
         if panning {
             // Dragging right slides the page right, which reveals content
             // further left — so the offset moves opposite to the pointer.
+            scroll_delta -= pan_delta;
+        }
+        // A drag that reaches the edge of the viewport keeps the view moving,
+        // whether it is selecting, drawing a shape or panning. Without this a
+        // selection stops at the fold and the pointer slides off the page —
+        // "I click anywhere in the canvas and drag to the end and it will not
+        // scroll down". A pan needs it too: the pan follows the pointer's
+        // delta, and there is no delta left once the pointer is pinned to the
+        // edge.
+        if panning || self.select_start.is_some() || self.draw_start.is_some() {
+            let viewport = ui.clip_rect();
+            let pointer = ui.input(|input| {
+                input
+                    .pointer
+                    .interact_pos()
+                    .or_else(|| input.pointer.latest_pos())
+            });
+            if let Some(pointer) = pointer {
+                scroll_delta += edge_scroll_delta(pointer, viewport);
+            }
+        }
+
+        if scroll_delta != Vec2::ZERO {
             // Applied on the next frame via the builder offset, the same path
             // keyboard scrolling uses, so egui clamps it to the content.
-            self.pending_scroll_offset = Some((self.scroll_offset - pan_delta).max(Vec2::ZERO));
+            self.pending_scroll_offset = Some((self.scroll_offset + scroll_delta).max(Vec2::ZERO));
         }
+
         if ui.rect_contains_pointer(ui.clip_rect()) {
             let cursor = if self.panning {
                 egui::CursorIcon::Grabbing
@@ -1538,6 +1756,7 @@ fn annotation_colors(kind: AnnotationKind) -> (Color32, Color32) {
             Color32::from_rgba_unmultiplied(255, 235, 59, 70),
             Color32::from_rgb(212, 180, 0),
         ),
+        AnnotationKind::Underline => (Color32::TRANSPARENT, Color32::BLACK),
         AnnotationKind::StrikeOut => (Color32::TRANSPARENT, Color32::from_rgb(211, 47, 47)),
         AnnotationKind::Squiggly => (Color32::TRANSPARENT, Color32::from_rgb(67, 160, 71)),
         AnnotationKind::Square => (Color32::TRANSPARENT, Color32::from_rgb(211, 47, 47)),
@@ -1564,6 +1783,155 @@ fn draw_note_tag(painter: &egui::Painter, point: (f32, f32), content_origin: egu
     );
 }
 
+/// A sticky note drawn as one cohesive card: a small note glyph followed by
+/// the typed text, inside a single rounded bubble.
+///
+/// `PDFium` renders only a note's icon and never its body, so the whole card is
+/// painted by us. The glyph is centred on the note's point — so the note stays
+/// exactly where it was placed — while the bubble grows to the right, flipping
+/// to the left when it would run off the canvas. Returns the card's screen rect
+/// so the caller can ring it when selected and hit-test clicks against it.
+fn draw_note_card(
+    painter: &egui::Painter,
+    point: (f32, f32),
+    text: &str,
+    content_origin: egui::Pos2,
+) -> Rect {
+    // A roomy horizontal pad and a generous icon→text gap keep the two from
+    // ever crowding each other.
+    const PAD_X: f32 = 9.0;
+    const PAD_Y: f32 = 6.0;
+    const GLYPH: f32 = 16.0;
+    const GAP: f32 = 9.0;
+
+    let font = egui::FontId::proportional(11.5);
+    let ink = Color32::from_rgb(58, 44, 6);
+    let fill = Color32::from_rgb(255, 244, 196);
+    let border = Color32::from_rgb(216, 180, 62);
+
+    // One trimmed line keeps the card a tidy, predictable size.
+    let shown = truncate_chars(text.trim(), 48);
+    let galley = (!shown.is_empty()).then(|| painter.layout_no_wrap(shown, font.clone(), ink));
+    let text_size = galley.as_ref().map_or(Vec2::ZERO, |g| g.rect.size());
+
+    let height = text_size.y.max(GLYPH) + PAD_Y * 2.0;
+    let width = PAD_X + GLYPH + GAP + text_size.x + PAD_X;
+
+    let glyph_center = pos2(point.0 + content_origin.x, point.1 + content_origin.y);
+
+    // Default: the glyph sits at the note's point and the bubble grows right.
+    let mut left = glyph_center.x - GLYPH / 2.0 - PAD_X;
+    let mut text_on_right = true;
+    // Flip to the left of the point when the bubble would run off the canvas.
+    if left + width > painter.clip_rect().right() - 4.0 {
+        left = glyph_center.x + GLYPH / 2.0 + PAD_X - width;
+        text_on_right = false;
+    }
+    let card = Rect::from_min_size(
+        pos2(left, glyph_center.y - height / 2.0),
+        vec2(width, height),
+    );
+
+    // A soft drop shadow lifts the card off the page for a tidier look.
+    painter.rect_filled(
+        card.translate(vec2(0.0, 2.0)).expand(1.0),
+        8.0,
+        Color32::from_black_alpha(26),
+    );
+    painter.rect_filled(card, 7.0, fill);
+    painter.rect_stroke(card, 7.0, Stroke::new(1.0, border), StrokeKind::Inside);
+    draw_note_glyph(painter, glyph_center, ink);
+
+    if let Some(galley) = galley {
+        let text_x = if text_on_right {
+            card.min.x + PAD_X + GLYPH + GAP
+        } else {
+            card.min.x + PAD_X
+        };
+        painter.galley(
+            pos2(text_x, card.center().y - text_size.y / 2.0),
+            galley,
+            ink,
+        );
+    }
+
+    card
+}
+
+/// The id of the topmost card under `pt`.
+///
+/// `cards` is in paint order, so the last containing rect is the one drawn on
+/// top — this is what makes clicking an overlapping note pick the note the user
+/// actually sees.
+fn topmost_card(cards: &[(AnnotationId, Rect)], pt: Pos2) -> Option<AnnotationId> {
+    cards
+        .iter()
+        .rev()
+        .find(|(_, rect)| rect.contains(pt))
+        .map(|(id, _)| *id)
+}
+
+/// Create the annotation for a placed note and echo it until its page
+/// re-renders.
+///
+/// `note.point` is already in unrotated PDF space (set from `to_page` when the
+/// note was placed); converting it again would move the note away from the
+/// click, so it is used verbatim — only clamped to the unrotated page bounds.
+/// The echo is drawn in *layout* space (like the live preview), so the PDF
+/// anchor is converted back for it.
+fn commit_pending_note(
+    edits: &mut Vec<Command>,
+    pending: &mut Vec<PendingEcho>,
+    doc: DocumentId,
+    spaces: &[PageSpace],
+    note: NoteInput,
+) {
+    let Some(space) = spaces.iter().find(|sp| sp.index == note.page) else {
+        return;
+    };
+    let (w, h) = (space.geom.width_pt, space.geom.height_pt);
+    edits.push(Command::AddAnnotation {
+        page: note.page,
+        new: NewAnnotation::StickyNote(
+            (note.point.0.clamp(0.0, w), note.point.1.clamp(0.0, h)),
+            note.text.clone(),
+        ),
+    });
+    pending.push(PendingEcho {
+        doc,
+        page: note.page,
+        kind: AnnotationKind::StickyNote,
+        rect: None,
+        point: Some(space.to_screen_point(note.point)),
+    });
+}
+
+/// A small comment glyph: a rounded speech bubble with a tail.
+fn draw_note_glyph(painter: &egui::Painter, center: Pos2, ink: Color32) {
+    let stroke = Stroke::new(1.5, ink);
+    // Bubble body, nudged up a touch so the tail sits on the baseline.
+    let body = Rect::from_center_size(center + vec2(0.0, -1.0), vec2(13.0, 10.0));
+    painter.rect_stroke(body, 3.0, stroke, StrokeKind::Inside);
+    // Tail, bottom-left, pointing down.
+    painter.line(
+        vec![
+            pos2(body.min.x + 3.0, body.max.y - 0.5),
+            pos2(body.min.x + 3.0, body.max.y + 3.0),
+            pos2(body.min.x + 7.0, body.max.y - 0.5),
+        ],
+        stroke,
+    );
+}
+
+/// Trim `text` to at most `max` characters, appending an ellipsis when cut.
+fn truncate_chars(text: &str, max: usize) -> String {
+    let mut out: String = text.chars().take(max).collect();
+    if text.chars().count() > max {
+        out.push('…');
+    }
+    out
+}
+
 /// The rectangle kinds' on-screen stand-in.
 fn draw_shape_preview(
     painter: &egui::Painter,
@@ -1572,16 +1940,97 @@ fn draw_shape_preview(
     content_origin: egui::Pos2,
 ) {
     let rect = rect.translate(content_origin.to_vec2());
-    let (fill, stroke_color) = annotation_colors(kind);
-    if fill != Color32::TRANSPARENT {
-        painter.rect_filled(rect, 1.0, fill);
+    let (fill, ink) = annotation_colors(kind);
+    let line = Stroke::new(PREVIEW_STROKE_PT, ink);
+
+    // Each tool previews the mark it will actually leave. A generic box drawn
+    // for every kind meant an underline looked like a rectangle while the mouse
+    // was down and turned into a line the moment the page re-rendered around
+    // it — the shape appeared to move as it was committed.
+    match mark_for(kind, rect) {
+        Mark::Line(from, to) => {
+            painter.line_segment([from, to], line);
+        }
+        Mark::Squiggle(rect) => draw_squiggle(painter, rect, ink),
+        Mark::Fill(rect) => {
+            painter.rect_filled(rect, 1.0, fill);
+        }
+        Mark::Outline(rect) => {
+            painter.rect_stroke(rect, 1.0, line, StrokeKind::Inside);
+        }
+        Mark::FilledOutline(rect) => {
+            painter.rect_filled(rect, 1.0, fill);
+            painter.rect_stroke(rect, 1.0, line, StrokeKind::Inside);
+        }
     }
-    painter.rect_stroke(
-        rect,
-        1.0,
-        Stroke::new(1.5, stroke_color),
-        StrokeKind::Inside,
-    );
+}
+
+/// The mark a tool leaves inside the rectangle it was dragged over.
+///
+/// Kept apart from the painting so the geometry can be asserted directly. A
+/// preview that drifts from the finished annotation is invisible to any test
+/// that only checks pixels, and is exactly what made a drawn underline look
+/// like a rectangle until the page re-rendered.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Mark {
+    /// A straight line between two points.
+    Line(Pos2, Pos2),
+    /// A zig-zag along the rectangle's bottom edge.
+    Squiggle(Rect),
+    /// The rectangle's interior, with no outline.
+    Fill(Rect),
+    /// The rectangle's outline, with no fill.
+    Outline(Rect),
+    /// An outline drawn over a fill.
+    FilledOutline(Rect),
+}
+
+/// What `kind` draws inside `rect`, in preview space.
+fn mark_for(kind: AnnotationKind, rect: Rect) -> Mark {
+    match kind {
+        // Markup runs along an edge of the dragged band, matching the
+        // appearance PDFium generates from the quad points.
+        AnnotationKind::Underline => Mark::Line(rect.left_bottom(), rect.right_bottom()),
+        AnnotationKind::StrikeOut => {
+            let middle = rect.center().y;
+            Mark::Line(pos2(rect.left(), middle), pos2(rect.right(), middle))
+        }
+        AnnotationKind::Squiggly => Mark::Squiggle(rect),
+        // A highlight is its fill alone: the finished annotation has no border.
+        AnnotationKind::Highlight => Mark::Fill(rect),
+        // A typewriter box has a background and a rule around it.
+        AnnotationKind::FreeText => Mark::FilledOutline(rect),
+        // A rectangle is an outline. So is anything else drawn as a box.
+        _ => Mark::Outline(rect),
+    }
+}
+
+/// A squiggly underline, as a zig-zag along the bottom of the dragged band.
+///
+/// PDFium's squiggly appearance is a small wave; a zig-zag is the same mark at
+/// the size a preview is judged at, and costs a handful of points rather than a
+/// sampled sine.
+fn draw_squiggle(painter: &egui::Painter, rect: Rect, ink: Color32) {
+    /// Horizontal distance between the tips of the zig-zag.
+    const STEP: f32 = 4.0;
+    /// How far the zig-zag rises above the baseline.
+    const RISE: f32 = 2.5;
+
+    let baseline = rect.bottom() - 1.0;
+    let mut points = Vec::new();
+    let mut x = rect.left();
+    let mut up = true;
+    while x <= rect.right() {
+        points.push(pos2(x, if up { baseline - RISE } else { baseline }));
+        up = !up;
+        x += STEP;
+    }
+    if points.len() >= 2 {
+        painter.add(egui::Shape::line(
+            points,
+            Stroke::new(PREVIEW_STROKE_PT, ink),
+        ));
+    }
 }
 
 /// Draw the current values of text-like form fields on top of the page.
@@ -1605,6 +2054,11 @@ fn draw_form_values(
         if selected == Some(field.id) {
             continue;
         }
+        // A field the reader has painted into the page is already in the raster
+        // — drawing it again here would stack a second mark on top of it.
+        if field.rendered {
+            continue;
+        }
         let Some(space) = page_spaces.iter().find(|sp| sp.index == field.id.page) else {
             continue;
         };
@@ -1624,7 +2078,10 @@ fn draw_form_values(
             // so a checked box kept looking empty. Drawing the tick/dot here is
             // what makes the state visible.
             FieldValue::Checked(on)
-                if matches!(field.kind, FormFieldType::CheckBox | FormFieldType::RadioButton) =>
+                if matches!(
+                    field.kind,
+                    FormFieldType::CheckBox | FormFieldType::RadioButton
+                ) =>
             {
                 draw_boolean_widget(painter, rect, field.kind, *on);
             }
@@ -1643,13 +2100,28 @@ fn draw_form_values(
 /// user's chosen form font.
 fn draw_field_text(painter: &egui::Painter, rect: Rect, text: &str, font: &FormFont) {
     let painter = painter.with_clip_rect(rect);
+    let anchor = rect.left_top() + vec2(2.0, rect.height() / 2.0);
+    let font_id = egui::FontId::new(font.size_for(rect.height()), font.family());
     painter.text(
-        rect.left_top() + vec2(2.0, rect.height() / 2.0),
+        anchor,
         egui::Align2::LEFT_CENTER,
         text,
-        egui::FontId::new(font.size_for(rect.height()), font.family()),
-        Color32::from_rgb(25, 25, 25),
+        font_id.clone(),
+        font.ink(),
     );
+    if font.bold {
+        // Synthetic bold: no bold face is bundled and `egui` has no weight
+        // axis, so a second stamp a hair to the right thickens every stroke.
+        // The editor stamps its galley the same way, so a value does not change
+        // weight when the field is committed.
+        painter.text(
+            anchor + vec2(SYNTHETIC_BOLD_OFFSET, 0.0),
+            egui::Align2::LEFT_CENTER,
+            text,
+            font_id,
+            font.ink(),
+        );
+    }
 }
 
 /// Draw a checkbox or radio button reflecting its current value.
@@ -1729,6 +2201,13 @@ fn draw_pending_echoes(
 /// Text commits on Enter or blur and is buffered in egui memory meanwhile;
 /// every keystroke would otherwise round-trip through the engine thread and
 /// re-rasterize the page. Dropdowns commit on selection, which is discrete.
+/// Stroke width of a drawn annotation's mark, in points.
+///
+/// PDFium draws a created annotation's border at roughly a point when its
+/// border style is left alone, so this is the width the preview uses too — the
+/// shape does not change weight when the page re-renders around it.
+const PREVIEW_STROKE_PT: f32 = 1.4;
+
 /// How far a press may land from a glyph and still count as hitting it, in
 /// points. Wide enough for the gap beside a word, narrow enough that a click in
 /// the margin selects nothing.
@@ -1854,12 +2333,22 @@ fn draw_field_editor(
         .memory(|mem| mem.data.get_temp::<FieldId>(editor_owner_key(doc)))
         != Some(field_id);
 
-    let mut editor = ui.new_child(egui::UiBuilder::new().max_rect(rect).id_salt((
-        "form-editor",
-        doc.raw(),
-        field_id.page,
-        field_id.annot_index,
-    )));
+    // Centred vertically inside the field, matching how the committed value is
+    // drawn (`draw_field_text`). A default top-down layout would put the text
+    // at the top of the box while editing and then snap it to the middle when
+    // the field is committed — the text visibly jumping the moment you finish
+    // typing.
+    let mut editor = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(rect)
+            .layout(egui::Layout::left_to_right(egui::Align::Center))
+            .id_salt((
+                "form-editor",
+                doc.raw(),
+                field_id.page,
+                field_id.annot_index,
+            )),
+    );
 
     let response = match field.kind {
         FormFieldType::Text => {
@@ -1874,19 +2363,31 @@ fn draw_field_editor(
             // other scripts are legible. The text stays dark in every theme —
             // the page underneath is always white.
             let font_size = font.size_for(rect.height()).max(7.0);
-            editor
-                .style_mut()
-                .text_styles
-                .insert(egui::TextStyle::Body, egui::FontId::new(font_size, font.family()));
+            editor.style_mut().text_styles.insert(
+                egui::TextStyle::Body,
+                egui::FontId::new(font_size, font.family()),
+            );
             editor.visuals_mut().override_text_color = Some(Color32::from_rgb(25, 25, 25));
 
-            let inner = editor.add(
-                egui::TextEdit::singleline(&mut draft)
-                    .desired_width(rect.width())
-                    .frame(egui::Frame::NONE)
-                    .font(egui::TextStyle::Body),
-            );
+            let output = egui::TextEdit::singleline(&mut draft)
+                .desired_width(rect.width())
+                .frame(egui::Frame::NONE)
+                .font(egui::TextStyle::Body)
+                .show(&mut editor);
 
+            // Bold is synthetic (see `draw_field_text`), and `TextEdit` paints
+            // its galley only once — so stamp it a second time here. Without
+            // this the text would be heavy the moment it was committed and
+            // light again while being edited, which reads as a glitch.
+            if font.bold {
+                editor.painter().galley(
+                    output.galley_pos + vec2(SYNTHETIC_BOLD_OFFSET, 0.0),
+                    output.galley.clone(),
+                    font.ink(),
+                );
+            }
+
+            let inner = output.response.response;
             let changed = draft != field.value.as_text();
             let submit = inner.lost_focus()
                 || (inner.has_focus() && editor.input(|i| i.key_pressed(egui::Key::Enter)));
@@ -1961,6 +2462,109 @@ fn editor_owner_key(doc: DocumentId) -> egui::Id {
 /// than the viewport, and without this clamp the whole content block sits
 /// flush left with the page hugging the left edge instead of the middle.
 /// Pass `0.0` for pure document-space layout with no viewport padding.
+/// Whether a drag should move the view instead of selecting or drawing.
+///
+/// * The middle button always pans, which is what every other viewer binds it to.
+/// * The hand tool makes the primary button pan.
+/// * A press that landed on the canvas background — the margin around the pages,
+///   or the gap between them — has no text under it to select, so its drag moves
+///   the view rather than doing nothing at all.
+///
+/// A draw tool owns the primary button, so it suppresses the last two.
+fn drag_pans(
+    middle_down: bool,
+    primary_down: bool,
+    pan_tool: bool,
+    press_on_background: bool,
+    drawing: bool,
+) -> bool {
+    middle_down || (primary_down && !drawing && (pan_tool || press_on_background))
+}
+
+/// Distance the view should move this frame because a drag has reached an edge.
+///
+/// A drag that runs to the edge of the viewport has to keep the view moving, or
+/// a selection stops at the fold and the pointer slides off the page — which is
+/// what "I click and drag to the end and it will not scroll down" is.
+///
+/// The pointer's own *position* drives it, not its delta: once it stops at the
+/// edge there is no delta left to use. Speed ramps from nothing at the margin to
+/// full at the edge, so a drag that ends near the bottom creeps while one held
+/// against the edge moves steadily.
+fn edge_scroll_delta(pointer: Pos2, viewport: Rect) -> Vec2 {
+    /// Distance from an edge at which the view starts following the drag.
+    const MARGIN: f32 = 32.0;
+    /// Fastest the view moves from a drag, in pixels per frame.
+    const MAX: f32 = 14.0;
+
+    let ramp = |past: f32| (past / MARGIN).clamp(0.0, 1.0) * MAX;
+
+    let x = if pointer.x < viewport.left() + MARGIN {
+        -ramp(viewport.left() + MARGIN - pointer.x)
+    } else if pointer.x > viewport.right() - MARGIN {
+        ramp(pointer.x - (viewport.right() - MARGIN))
+    } else {
+        0.0
+    };
+    let y = if pointer.y < viewport.top() + MARGIN {
+        -ramp(viewport.top() + MARGIN - pointer.y)
+    } else if pointer.y > viewport.bottom() - MARGIN {
+        ramp(pointer.y - (viewport.bottom() - MARGIN))
+    } else {
+        0.0
+    };
+    vec2(x, y)
+}
+
+/// The smallest scroll change that brings `field` fully inside the viewport.
+///
+/// `field` is `(x, y, w, h)` and `current` is `(x, y)`, both in document
+/// coordinates — the same space, so the field's position on screen is simply
+/// the difference. `viewport` is the visible size in the same pixels.
+///
+/// Returns `None` when the field is already inside with room to spare. That is
+/// the common case: the user clicks a field they can see, and the view must not
+/// move at all — a scroll here would drag the page out from under the pointer
+/// at the exact moment they start typing.
+fn reveal_scroll(
+    field: (f32, f32, f32, f32),
+    viewport: (f32, f32),
+    current: (f32, f32),
+) -> Option<(f32, f32)> {
+    // Breathing room so a field brought in from off screen does not end up
+    // flush against the toolbar or the edge, with its caret half off.
+    const MARGIN: f32 = 24.0;
+
+    let (field_x, field_y, field_w, field_h) = field;
+    let (viewport_w, viewport_h) = viewport;
+    let (current_x, current_y) = current;
+
+    let top = field_y - current_y;
+    let bottom = top + field_h;
+    let left = field_x - current_x;
+    let right = left + field_w;
+
+    // Vertical first: a form runs down the page, so that is the axis a field is
+    // normally off screen on. A field taller than the viewport aligns to its
+    // top, which keeps the first line of it — and its caret — visible.
+    let mut next_y = current_y;
+    if top < MARGIN {
+        next_y = field_y - MARGIN;
+    } else if bottom > viewport_h - MARGIN {
+        next_y = field_y + field_h - viewport_h + MARGIN;
+    }
+
+    let mut next_x = current_x;
+    if left < MARGIN {
+        next_x = field_x - MARGIN;
+    } else if right > viewport_w - MARGIN {
+        next_x = field_x + field_w - viewport_w + MARGIN;
+    }
+
+    let next = (next_x.max(0.0), next_y.max(0.0));
+    (next != current).then_some(next)
+}
+
 fn layout_pages(
     doc: &Document,
     view: &ViewState,
@@ -2223,6 +2827,8 @@ mod tests {
                     Color32::TRANSPARENT,
                     Tool::Select,
                     &PageTextCache::new(),
+                    &[],
+                    None,
                 );
             });
             out.textures_delta.clear();
@@ -2284,6 +2890,8 @@ mod tests {
                     Color32::TRANSPARENT,
                     Tool::Select,
                     &PageTextCache::new(),
+                    &[],
+                    None,
                 );
             });
             out.textures_delta.clear();
@@ -2332,6 +2940,8 @@ mod tests {
                 Color32::TRANSPARENT,
                 Tool::Select,
                 &PageTextCache::new(),
+                &[],
+                None,
             );
         });
         // The GPU backend would normally apply these; clear them so dropping the
@@ -2389,6 +2999,8 @@ mod tests {
                 Color32::TRANSPARENT,
                 Tool::Select,
                 &PageTextCache::new(),
+                &[],
+                None,
             );
         });
         out.textures_delta.clear();
@@ -2421,6 +3033,8 @@ mod tests {
                 Color32::TRANSPARENT,
                 Tool::Select,
                 &PageTextCache::new(),
+                &[],
+                None,
             );
         });
         out2.textures_delta.clear();
@@ -2463,6 +3077,8 @@ mod tests {
                     Color32::TRANSPARENT,
                     Tool::Select,
                     &PageTextCache::new(),
+                    &[],
+                    None,
                 );
             });
             out.textures_delta.clear();
@@ -2521,6 +3137,8 @@ mod tests {
                         Color32::TRANSPARENT,
                         Tool::Select,
                         &PageTextCache::new(),
+                        &[],
+                        None,
                     );
                 });
                 output.textures_delta.clear();
@@ -2629,6 +3247,8 @@ mod tests {
                     Color32::TRANSPARENT,
                     Tool::Select,
                     &PageTextCache::new(),
+                    &[],
+                    None,
                 );
                 if !jumping_now {
                     center = canvas.center_page();
@@ -2785,6 +3405,8 @@ mod tests {
                     Color32::TRANSPARENT,
                     Tool::Select,
                     &PageTextCache::new(),
+                    &[],
+                    None,
                 );
             });
             out.textures_delta.clear();
@@ -2819,6 +3441,8 @@ mod tests {
                     Color32::TRANSPARENT,
                     Tool::Select,
                     &PageTextCache::new(),
+                    &[],
+                    None,
                 );
             });
             out2.textures_delta.clear();
@@ -3121,6 +3745,178 @@ mod tests {
         assert!((at_two[0].w - at_one[0].w * 2.0).abs() < 1e-2);
     }
 
+    /// A field already on screen must not move the view at all.
+    ///
+    /// Selecting a field is what the user does immediately before typing, so
+    /// any scroll here drags the page out from under the pointer — which is
+    /// exactly what "the text jumps to the top when I click it" was.
+    #[test]
+    fn a_visible_field_is_never_scrolled() {
+        let viewport = (800.0, 600.0);
+        // Sitting in the middle of the viewport.
+        assert_eq!(
+            reveal_scroll((60.0, 100.0, 200.0, 20.0), viewport, (0.0, 0.0)),
+            None
+        );
+        // Still visible after the view has been scrolled past it.
+        assert_eq!(
+            reveal_scroll((60.0, 400.0, 200.0, 20.0), viewport, (0.0, 300.0)),
+            None
+        );
+        // Visible on the horizontal axis too.
+        assert_eq!(
+            reveal_scroll((600.0, 100.0, 80.0, 20.0), viewport, (0.0, 0.0)),
+            None
+        );
+    }
+
+    /// A field below the viewport is brought up just far enough to clear the
+    /// bottom edge — not to the top of the page.
+    #[test]
+    fn an_offscreen_field_scrolls_the_minimum_distance() {
+        let moved = reveal_scroll((60.0, 880.0, 200.0, 20.0), (800.0, 600.0), (0.0, 0.0))
+            .expect("a field below the fold must be revealed");
+
+        // Its bottom edge lands on the margin, so the field ends up near the
+        // bottom of the viewport rather than being flung to the top.
+        assert_eq!(moved.1, 880.0 + 20.0 - 600.0 + 24.0);
+        assert!(moved.1 < 880.0, "the field must not be scrolled to the top");
+        assert_eq!(moved.0, 0.0, "the horizontal axis must not move");
+    }
+
+    /// A field above the viewport is scrolled up to, with its top edge clear of
+    /// the toolbar so the first line and the caret are visible.
+    #[test]
+    fn a_field_above_the_viewport_scrolls_up_to_it() {
+        let moved = reveal_scroll((60.0, 100.0, 200.0, 20.0), (800.0, 600.0), (0.0, 400.0))
+            .expect("a field above the fold must be revealed");
+        assert_eq!(moved.1, 100.0 - 24.0);
+    }
+
+    /// A field taller than the viewport aligns to its top: showing the bottom of
+    /// a tall field would hide the line being typed into.
+    #[test]
+    fn a_field_taller_than_the_viewport_aligns_to_its_top() {
+        let moved = reveal_scroll((0.0, 500.0, 100.0, 900.0), (800.0, 600.0), (0.0, 600.0))
+            .expect("a tall field must be revealed");
+        assert_eq!(moved.1, 500.0 - 24.0);
+    }
+
+    /// A field off the right edge moves only the horizontal axis.
+    #[test]
+    fn a_field_off_the_right_edge_moves_only_horizontally() {
+        let moved = reveal_scroll((900.0, 100.0, 80.0, 20.0), (800.0, 600.0), (0.0, 0.0))
+            .expect("a field off the right edge must be revealed");
+        assert_eq!(moved.1, 0.0, "the vertical axis must not move");
+        assert_eq!(moved.0, 900.0 + 80.0 - 800.0 + 24.0);
+    }
+
+    /// A drag that reaches an edge must keep the view moving.
+    ///
+    /// "I click anywhere in the canvas and drag to the end and it will not
+    /// scroll down" is this: the selection stops at the fold because nothing
+    /// moves the viewport once the pointer is at the edge.
+    #[test]
+    fn a_drag_at_the_edge_scrolls_the_view() {
+        let viewport = Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0));
+
+        // Well inside: nothing moves, so an ordinary drag never jitters the page.
+        assert_eq!(edge_scroll_delta(pos2(400.0, 300.0), viewport), Vec2::ZERO);
+        // Just inside the margin: still nothing.
+        assert_eq!(
+            edge_scroll_delta(pos2(400.0, 600.0 - 33.0), viewport),
+            Vec2::ZERO
+        );
+
+        // At the bottom edge: scrolls down.
+        let down = edge_scroll_delta(pos2(400.0, 600.0), viewport);
+        assert!(down.y > 0.0, "dragging at the bottom must scroll down");
+        assert_eq!(down.x, 0.0, "the horizontal axis must not move");
+
+        // Past the edge: faster, and capped rather than unbounded.
+        let past = edge_scroll_delta(pos2(400.0, 600.0 + 40.0), viewport);
+        assert!(past.y >= down.y, "further past the edge must not be slower");
+        assert!(
+            edge_scroll_delta(pos2(400.0, 5000.0), viewport).y <= 20.0,
+            "the speed must be capped"
+        );
+
+        // The other three edges mirror it.
+        assert!(edge_scroll_delta(pos2(400.0, 0.0), viewport).y < 0.0);
+        assert!(edge_scroll_delta(pos2(0.0, 300.0), viewport).x < 0.0);
+        assert!(edge_scroll_delta(pos2(800.0, 300.0), viewport).x > 0.0);
+    }
+
+    /// Which drags move the view, and which do not.
+    #[test]
+    fn only_the_right_drags_pan_the_view() {
+        // The middle button always pans.
+        assert!(drag_pans(true, false, false, false, false));
+        // The hand tool pans with the primary button.
+        assert!(drag_pans(false, true, true, false, false));
+        // A drag from the canvas background pans: there is nothing to select.
+        assert!(drag_pans(false, true, false, true, false));
+
+        // An ordinary primary drag over a page selects text instead.
+        assert!(!drag_pans(false, true, false, false, false));
+        // A draw tool owns the primary button, even on the background.
+        assert!(!drag_pans(false, true, false, true, true));
+        assert!(!drag_pans(false, true, true, false, true));
+        // Nothing is dragged without a button down.
+        assert!(!drag_pans(false, false, true, true, false));
+    }
+
+    /// Each tool must preview the mark it actually leaves.
+    ///
+    /// The preview used to be a rectangle outline for every tool, so an
+    /// underline looked like a box while the mouse was down and became a line
+    /// the moment the page re-rendered — the shape appeared to move as it was
+    /// committed.
+    #[test]
+    fn each_tool_previews_the_mark_it_leaves() {
+        let rect = Rect::from_min_size(pos2(10.0, 20.0), vec2(100.0, 12.0));
+
+        // Markup runs along an edge, not around the whole band.
+        match mark_for(AnnotationKind::Underline, rect) {
+            Mark::Line(from, to) => {
+                assert_eq!(
+                    from.y,
+                    rect.bottom(),
+                    "an underline sits on the bottom edge"
+                );
+                assert_eq!(to.y, rect.bottom());
+                assert_eq!(from.x, rect.left());
+                assert_eq!(to.x, rect.right());
+            }
+            other => panic!("an underline must preview as a line, got {other:?}"),
+        }
+        match mark_for(AnnotationKind::StrikeOut, rect) {
+            Mark::Line(from, to) => {
+                assert_eq!(
+                    from.y,
+                    rect.center().y,
+                    "a strikeout runs through the middle"
+                );
+                assert_eq!(to.y, rect.center().y);
+            }
+            other => panic!("a strikeout must preview as a line, got {other:?}"),
+        }
+        assert_eq!(
+            mark_for(AnnotationKind::Squiggly, rect),
+            Mark::Squiggle(rect),
+            "a squiggly must preview as a squiggle"
+        );
+
+        // A highlight is a fill with no border; a rectangle is a border with no
+        // fill. Those are the two the drag is most easily mistaken for.
+        assert_eq!(mark_for(AnnotationKind::Highlight, rect), Mark::Fill(rect));
+        assert_eq!(mark_for(AnnotationKind::Square, rect), Mark::Outline(rect));
+        assert_eq!(
+            mark_for(AnnotationKind::FreeText, rect),
+            Mark::FilledOutline(rect)
+        );
+    }
+
     /// An edited page's bitmaps must be marked stale (so they re-render) while
     /// the old pixels keep showing — other pages and documents untouched. A
     /// fresh render clears the stale flag; that is the no-flash contract.
@@ -3245,7 +4041,11 @@ mod tests {
         let (selected_page, range) =
             selection_range(&[space], 0, &cache, doc, ON_HELLO, ON_HELLO).expect("a word is hit");
         assert_eq!(selected_page, 0);
-        assert_eq!(page.range_text(range), "hello", "a click widens to the word");
+        assert_eq!(
+            page.range_text(range),
+            "hello",
+            "a click widens to the word"
+        );
     }
 
     #[test]
@@ -3267,7 +4067,257 @@ mod tests {
 
         let forward = selection_range(&[space], 0, &cache, doc, ON_HELLO, ON_WORLD);
         let backward = selection_range(&[space], 0, &cache, doc, ON_WORLD, ON_HELLO);
-        assert_eq!(forward, backward, "the direction of the drag must not matter");
+        assert_eq!(
+            forward, backward,
+            "the direction of the drag must not matter"
+        );
+    }
+
+    /// A sticky note stores its anchor as `to_page(click)` (unrotated PDF
+    /// space); mapping that anchor back must land on the exact click. This is
+    /// what keeps the note tag pinned where the user placed it — the bug was a
+    /// *second* `to_page` on an already-converted point, which moved the note.
+    #[test]
+    fn a_note_anchor_round_trips_through_every_rotation() {
+        let geom = PageGeometry {
+            width_pt: 200.0,
+            height_pt: 100.0,
+        };
+        for rotation in [
+            Rotation::None,
+            Rotation::Cw90,
+            Rotation::Cw180,
+            Rotation::Cw270,
+        ] {
+            let (w, h) = geom.oriented(rotation);
+            let space = PageSpace::new(PageBox::new(0, 30.0, 12.0, w, h), geom, rotation, 1.5);
+
+            // A click at a non-trivial point inside the page.
+            let click = (
+                space.origin.0 + space.size.0 * 0.3,
+                space.origin.1 + space.size.1 * 0.7,
+            );
+
+            // The anchor the note path stores.
+            let anchor = space.to_page(click);
+
+            // Drawing it back must reproduce the click.
+            let back = space.to_screen_point(anchor);
+            assert!(
+                (back.0 - click.0).abs() < 1e-2 && (back.1 - click.1).abs() < 1e-2,
+                "rotation {rotation:?}: {click:?} -> {anchor:?} -> {back:?}"
+            );
+
+            // A *double* conversion is not an identity — the exact mistake the
+            // old commit code made (it called `to_page` on an already-PDF-space
+            // anchor). Guard against a regression that reintroduces it.
+            let double = space.to_page(anchor);
+            assert!(
+                (double.0 - anchor.0).abs() > 1e-2 || (double.1 - anchor.1).abs() > 1e-2,
+                "rotation {rotation:?}: a double `to_page` must not be a no-op"
+            );
+        }
+    }
+
+    #[test]
+    fn note_text_is_trimmed_to_a_single_short_line() {
+        assert_eq!(truncate_chars("short", 48), "short");
+        let trimmed = truncate_chars(&"x".repeat(60), 48);
+        assert_eq!(trimmed.chars().count(), 49, "48 chars plus an ellipsis");
+        assert!(trimmed.ends_with('…'));
+        // Counts characters, not bytes, so multi-byte text is safe.
+        assert!(
+            truncate_chars(&"näïve résumé ".repeat(10), 5)
+                .chars()
+                .count()
+                <= 6
+        );
+    }
+
+    /// A placed note must render its tag *and* its body without panicking —
+    /// PDFium draws only the icon, so the canvas paints the typed text itself.
+    #[test]
+    fn drawing_a_sticky_note_with_text_does_not_panic() {
+        let doc = doc(1);
+        let mut canvas = Canvas::new();
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+        let view = ViewState::default();
+
+        let notes = [AnnotationInfo {
+            id: AnnotationId::new(0, 0),
+            kind: AnnotationKind::StickyNote,
+            rect: PdfSpaceRect::from_xywh(100.0, 100.0, 20.0, 20.0),
+            contents: Some("Reviewed later".into()),
+        }];
+
+        let raw = egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw, |ui| {
+            canvas.draw(
+                ui,
+                &doc,
+                &view,
+                1.0,
+                1.0,
+                Color32::BLACK,
+                Color32::BLACK,
+                None,
+                None,
+                None,
+                Color32::TRANSPARENT,
+                Tool::Select,
+                &PageTextCache::new(),
+                &notes,
+                None,
+            );
+        });
+        out.textures_delta.clear();
+    }
+
+    /// The note card must always enclose its anchor point (the glyph sits on
+    /// it) and grow sideways with the text while staying a single line tall —
+    /// the "icon and text fit nicely" contract.
+    #[test]
+    fn the_note_card_fits_its_glyph_and_grows_with_text() {
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+        let raw = egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        };
+
+        let mut empty = Rect::ZERO;
+        let mut short = Rect::ZERO;
+        let mut long = Rect::ZERO;
+        let mut out = ctx.run_ui(raw, |ui| {
+            let painter = ui.painter().clone();
+            empty = draw_note_card(&painter, (400.0, 300.0), "", egui::Pos2::ZERO);
+            short = draw_note_card(&painter, (400.0, 300.0), "hi", egui::Pos2::ZERO);
+            long = draw_note_card(
+                &painter,
+                (400.0, 300.0),
+                "a considerably longer note body than the short one",
+                egui::Pos2::ZERO,
+            );
+        });
+        out.textures_delta.clear();
+
+        let anchor = egui::pos2(400.0, 300.0);
+        for card in [empty, short, long] {
+            assert!(
+                card.contains(anchor),
+                "card must enclose its anchor: {card:?}"
+            );
+            assert!(card.width() > 0.0 && card.height() > 0.0, "card has size");
+        }
+        assert!(short.width() > empty.width(), "text widens the card");
+        assert!(long.width() > short.width(), "longer text widens further");
+        assert!(
+            (short.height() - empty.height()).abs() < 0.5,
+            "one line keeps a constant height"
+        );
+    }
+
+    /// With several notes stacked, a click must resolve to the one drawn on
+    /// top, and to the only one that contains the point otherwise.
+    #[test]
+    fn a_click_picks_the_topmost_overlapping_note() {
+        let a = AnnotationId::new(0, 0);
+        let b = AnnotationId::new(0, 1);
+        let lower = Rect::from_min_size(pos2(0.0, 0.0), vec2(100.0, 30.0));
+        let upper = Rect::from_min_size(pos2(20.0, 0.0), vec2(100.0, 30.0));
+        let cards = [(a, lower), (b, upper)];
+
+        // Both contain this point; the later (top) card wins.
+        assert_eq!(topmost_card(&cards, pos2(50.0, 15.0)), Some(b));
+        // Only the first contains this one.
+        assert_eq!(topmost_card(&cards, pos2(5.0, 15.0)), Some(a));
+        // Outside everything.
+        assert_eq!(topmost_card(&cards, pos2(500.0, 500.0)), None);
+    }
+
+    /// Committing a placed note must create it at the exact PDF point it was
+    /// dropped at (no re-conversion) and queue a layout-space echo.
+    #[test]
+    fn committing_a_note_keeps_the_placed_point() {
+        let space = PageSpace::new(
+            PageBox::new(0, 30.0, 12.0, 200.0, 100.0),
+            PageGeometry {
+                width_pt: 200.0,
+                height_pt: 100.0,
+            },
+            Rotation::None,
+            1.0,
+        );
+        let note = NoteInput {
+            page: 0,
+            point: (40.0, 60.0),
+            text: "hi".into(),
+            opened: false,
+        };
+        let mut edits = Vec::new();
+        let mut pending = Vec::new();
+        commit_pending_note(
+            &mut edits,
+            &mut pending,
+            DocumentId::from_raw(1),
+            &[space],
+            note,
+        );
+
+        assert_eq!(edits.len(), 1, "one create command");
+        match &edits[0] {
+            Command::AddAnnotation { page, new } => {
+                assert_eq!(*page, 0);
+                match new {
+                    NewAnnotation::StickyNote((x, y), text) => {
+                        assert!((*x - 40.0).abs() < 1e-3 && (*y - 60.0).abs() < 1e-3);
+                        assert_eq!(text.as_str(), "hi");
+                    }
+                    other => panic!("expected a sticky note, got {other:?}"),
+                }
+            }
+            other => panic!("expected AddAnnotation, got {other:?}"),
+        }
+
+        assert_eq!(pending.len(), 1, "an echo is queued");
+        let expected = space.to_screen_point((40.0, 60.0));
+        let p = pending[0].point.expect("echo carries a point");
+        assert!((p.0 - expected.0).abs() < 1e-3 && (p.1 - expected.1).abs() < 1e-3);
+    }
+
+    /// The card reserves a clear gap between the comment glyph and the text —
+    /// they must never overlap, and the text must start to the right of the
+    /// glyph.
+    #[test]
+    fn the_note_card_keeps_a_gap_between_glyph_and_text() {
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+        let raw = egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        };
+
+        let mut card = Rect::ZERO;
+        ctx.run_ui(raw, |ui| {
+            let painter = ui.painter().clone();
+            card = draw_note_card(&painter, (400.0, 300.0), "hello", egui::Pos2::ZERO);
+        })
+        .textures_delta
+        .clear();
+
+        // The glyph is centred on the anchor; the text begins past the glyph
+        // box, leaving a visible gap before the card's right pad.
+        let glyph_center = egui::pos2(400.0, 300.0);
+        assert!(card.contains(glyph_center));
+        // Right edge is beyond the glyph plus its box, i.e. text fits.
+        assert!(
+            card.max.x > glyph_center.x + 16.0,
+            "text must extend past the glyph box: {card:?}"
+        );
     }
 
     #[test]
@@ -3282,8 +4332,17 @@ mod tests {
     fn a_page_never_extracted_selects_nothing() {
         let (_, space) = text_fixture();
         let empty = PageTextCache::new();
-        assert!(selection_range(&[space], 0, &empty, DocumentId::from_raw(1), ON_HELLO, ON_WORLD)
-            .is_none());
+        assert!(
+            selection_range(
+                &[space],
+                0,
+                &empty,
+                DocumentId::from_raw(1),
+                ON_HELLO,
+                ON_WORLD
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -3307,15 +4366,17 @@ mod tests {
     fn an_empty_selection_produces_no_request() {
         let (page, space) = text_fixture();
         let cache = text_cache(page);
-        assert!(emit_lookup(
-            &[space],
-            0,
-            CharRange::default(),
-            &cache,
-            DocumentId::from_raw(1),
-            Pos2::ZERO
-        )
-        .is_none());
+        assert!(
+            emit_lookup(
+                &[space],
+                0,
+                CharRange::default(),
+                &cache,
+                DocumentId::from_raw(1),
+                Pos2::ZERO
+            )
+            .is_none()
+        );
     }
 
     #[test]

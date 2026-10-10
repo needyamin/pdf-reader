@@ -5,7 +5,7 @@ A fast native PDF reader for people who actually work in a document: read, mark 
 ![License](https://img.shields.io/github/license/needyamin/pdf-reader)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-blue)
 ![Rust](https://img.shields.io/badge/rust-1.98.1-orange)
-![Version](https://img.shields.io/badge/version-3.0.0-green)
+![Version](https://img.shields.io/badge/version-5.0.0-green)
 
 Built in **Rust**. Drawn with **egui** and **wgpu**. Pages come from **PDFium**, the same engine Chrome uses, on a tile renderer made for large files.
 
@@ -151,7 +151,7 @@ Outputs land in `target/dist/`, named with the version from the root `Cargo.toml
 | --- | --- |
 | **Portable** | One folder in a zip. Settings still go to `%APPDATA%\pdf-reader`. |
 | **NSIS / Inno** | Installs under Program Files, Start Menu shortcut, uninstall entry. Shows up as **AnsNew PDF Reader** in Open with and in Default apps. |
-| **MSIX** | Full-trust desktop package with a `.pdf` file association. Signed with a self-signed certificate (`CN=YAMiN HOSSAIN`). Trust that cert once, then `Add-AppxPackage`. |
+| **MSIX** | Full-trust desktop package with a `.pdf` file association. Signed with a self-signed certificate carrying the Store publisher identity. Trust that cert once — `certutil -user -addstore Root target\dist\pdf-reader-sign.cer` — then `Add-AppxPackage`. |
 
 Installer tools, if you do not have them:
 
@@ -163,6 +163,16 @@ winget install -e --id JRSoftware.InnoSetup
 Release builds are windowed: no console on launch, and speech does not flash a terminal. The app runs on macOS and Linux too; the `dist:*` tasks are the Windows ship path. On other systems, `cargo xtask run` is the way to build and start it.
 
 Windows will not silently replace a PDF app the user already chose. After install, pick AnsNew once under Open with → Always, or in Settings → Default apps.
+
+## Privacy
+
+The app collects nothing: no account, no analytics, no telemetry, and no network
+code at all. Documents are opened, edited and saved on your own machine. The one
+exception is the **Translate** button in the word-lookup popup, which opens a
+Google Translate link containing the word you selected in your own browser.
+
+The full policy is in [privacy_policy.html](privacy_policy.html) — it is the
+document submitted to the Microsoft Store listing.
 
 ## License
 

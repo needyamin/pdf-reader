@@ -7,7 +7,7 @@
 
 use pdfium_render::prelude::{
     PdfDocument, PdfFormField, PdfFormFieldCommon, PdfFormFieldType, PdfFormRadioButtonField,
-    PdfFormType, PdfPageAnnotation, PdfPageAnnotationCommon,
+    PdfFormType, PdfPage, PdfPageAnnotation, PdfPageAnnotationCommon,
 };
 
 use pdfreader_core::{
@@ -48,7 +48,9 @@ pub(crate) fn read_form(document: &PdfDocument<'_>) -> FormInfo {
             let Some(field) = annotation.as_form_field() else {
                 continue;
             };
-            if let Some(info) = read_widget(&annotation, field, page_index as u32, annot_index) {
+            if let Some(info) =
+                read_widget(&page, &annotation, field, page_index as u32, annot_index)
+            {
                 fields.push(info);
             }
         }
@@ -59,6 +61,7 @@ pub(crate) fn read_form(document: &PdfDocument<'_>) -> FormInfo {
 
 /// Build one [`FormFieldInfo`] from a widget annotation and its field.
 fn read_widget(
+    page_view: &PdfPage<'_>,
     annotation: &PdfPageAnnotation<'_>,
     field: &PdfFormField<'_>,
     page: u32,
@@ -75,7 +78,18 @@ fn read_widget(
 
     let kind = field_kind(field.field_type());
 
-    let value = read_value(field, kind);
+    // A widget the reader has taken over — hidden and re-drawn into the page —
+    // carries no usable value in the form model. Its state lives in the page
+    // instead, which is what makes the choice survive a save and a re-open.
+    let painted = annotation
+        .is_hidden()
+        .then(|| crate::formmark::painted_state(page_view, rect))
+        .flatten();
+
+    let value = match painted {
+        Some(selected) => FieldValue::Checked(selected),
+        None => read_value(field, kind),
+    };
     let options = read_options(field);
     let multiline = field.as_text_field().is_some_and(|t| t.is_multiline());
 
@@ -90,6 +104,7 @@ fn read_widget(
         read_only: field.is_read_only(),
         required: field.is_required(),
         multiline,
+        rendered: painted.is_some(),
     })
 }
 
@@ -157,7 +172,11 @@ fn radio_is_checked(radio: &PdfFormRadioButtonField<'_>) -> Option<bool> {
     if is_off_state(&group) {
         return Some(false);
     }
-    Some(radio.appearance_stream().is_some_and(|state| state == group))
+    Some(
+        radio
+            .appearance_stream()
+            .is_some_and(|state| state == group),
+    )
 }
 
 /// Whether a widget state name means "not selected".

@@ -123,13 +123,11 @@ pub enum Tool {
     Square,
     /// Sticky note placed by a click.
     StickyNote,
-    /// Typewriter text box placed by a drag.
-    FreeText,
 }
 
 impl Tool {
     /// Every tool, in toolbar order.
-    pub const ALL: [Tool; 8] = [
+    pub const ALL: [Tool; 7] = [
         Tool::Select,
         Tool::Highlight,
         Tool::Underline,
@@ -137,7 +135,6 @@ impl Tool {
         Tool::Squiggly,
         Tool::Square,
         Tool::StickyNote,
-        Tool::FreeText,
     ];
 
     /// The annotation kind this tool creates, if any.
@@ -150,7 +147,6 @@ impl Tool {
             Self::Squiggly => Some(AnnotationKind::Squiggly),
             Self::Square => Some(AnnotationKind::Square),
             Self::StickyNote => Some(AnnotationKind::StickyNote),
-            Self::FreeText => Some(AnnotationKind::FreeText),
         }
     }
 
@@ -164,7 +160,6 @@ impl Tool {
             Self::Squiggly => "Squiggly",
             Self::Square => "Rectangle",
             Self::StickyNote => "Note",
-            Self::FreeText => "Type",
         }
     }
 }

@@ -19,6 +19,18 @@ pub enum EngineError {
         reason: String,
     },
 
+    /// The file could not be written.
+    ///
+    /// Kept separate from [`EngineError::Io`] so a failed export or print spool
+    /// does not claim it could not *read* the very file it was creating.
+    #[error("cannot write {path}: {reason}")]
+    Write {
+        /// Path that failed.
+        path: PathBuf,
+        /// Underlying reason.
+        reason: String,
+    },
+
     /// The document is encrypted and no password was supplied.
     #[error("password required")]
     PasswordRequired,
@@ -85,4 +97,32 @@ pub enum EngineError {
     /// accessors in `pdfium-render`.
     #[error("{0} is not supported by the PDF engine")]
     Unsupported(String),
+
+    /// Sending the document to a printer failed.
+    #[error("print failed: {0}")]
+    Print(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A failed write must not claim it could not *read* the file — the message
+    /// is user-facing and the two are different problems. A failed print spool
+    /// used to surface as "cannot read <spool>", sending the reader looking for
+    /// a read bug that was not there.
+    #[test]
+    fn read_and_write_failures_read_differently() {
+        let read = EngineError::Io {
+            path: PathBuf::from("a.pdf"),
+            reason: "not found".into(),
+        };
+        assert!(read.to_string().contains("cannot read"), "{read}");
+
+        let write = EngineError::Write {
+            path: PathBuf::from("a.pdf"),
+            reason: "disk full".into(),
+        };
+        assert!(write.to_string().contains("cannot write"), "{write}");
+    }
 }

@@ -18,11 +18,13 @@
 
 use std::path::{Path, PathBuf};
 
-use egui::{Color32, Context, RichText, Stroke, Vec2};
+use egui::{Color32, Context, RichText, Vec2};
 use pdfreader_core::{
     Command, ExportDpi, ExportTask, ImageFormat, ImagePageSize, PageRange, Tab, pixel_size,
 };
-use pdfreader_ui::Palette;
+use pdfreader_ui::{
+    Palette, card_frame, disabled_button, field_frame, primary_button, secondary_button, section,
+};
 
 /// Image extensions the reader can decode.
 ///
@@ -488,11 +490,9 @@ impl ExportWindow {
     ) -> Action {
         let mut action = Action::None;
 
-        let frame = egui::Frame::new()
-            .fill(palette.panel_bg)
-            .stroke(Stroke::new(1.0, palette.border))
-            .corner_radius(8.0)
-            .inner_margin(egui::Margin::symmetric(20, 18));
+        // The shared window frame: the export pane is a window like Settings
+        // and About Us, and it is the same surface for the same reason.
+        let frame = pdfreader_ui::window_frame(palette);
 
         let modal = egui::Modal::new(egui::Id::new("export-window"))
             .frame(frame)
@@ -780,25 +780,11 @@ impl ExportWindow {
         let mut browse = false;
 
         ui.horizontal(|ui| {
-            if ui
-                .add(
-                    egui::Button::new(RichText::new(add_label).size(12.0))
-                        .fill(palette.accent_soft)
-                        .corner_radius(7.0),
-                )
-                .clicked()
-            {
+            if ui.add(primary_button(palette, add_label)).clicked() {
                 browse = true;
             }
             ui.add_enabled_ui(!self.sources.is_empty(), |ui| {
-                if ui
-                    .add(
-                        egui::Button::new(RichText::new("Clear").size(12.0))
-                            .fill(palette.surface)
-                            .corner_radius(7.0),
-                    )
-                    .clicked()
-                {
+                if ui.add(secondary_button(palette, "Clear")).clicked() {
                     self.clear_sources();
                 }
             });
@@ -817,11 +803,7 @@ impl ExportWindow {
         // around it.
         let mut actions = ListActions::default();
 
-        let frame = egui::Frame::new()
-            .fill(palette.surface)
-            .stroke(Stroke::new(1.0, palette.border))
-            .corner_radius(6.0)
-            .inner_margin(egui::Margin::same(6));
+        let frame = card_frame(palette).inner_margin(egui::Margin::same(6));
 
         frame.show(ui, |ui| {
             egui::ScrollArea::vertical()
@@ -869,14 +851,7 @@ impl ExportWindow {
         ui.horizontal(|ui| {
             let width = ui.available_width() - 96.0;
             path_field(ui, palette, &self.output, folder, width);
-            if ui
-                .add(
-                    egui::Button::new(RichText::new("Browse…").size(12.0))
-                        .fill(palette.surface)
-                        .corner_radius(7.0),
-                )
-                .clicked()
-            {
+            if ui.add(secondary_button(palette, "Browse…")).clicked() {
                 browse = true;
             }
         });
@@ -912,14 +887,7 @@ impl ExportWindow {
 
         ui.horizontal(|ui| {
             let mut cancel = false;
-            if ui
-                .add(
-                    egui::Button::new(RichText::new("Cancel").size(12.5))
-                        .fill(palette.surface)
-                        .corner_radius(7.0),
-                )
-                .clicked()
-            {
+            if ui.add(secondary_button(palette, "Cancel")).clicked() {
                 cancel = true;
             }
 
@@ -929,25 +897,16 @@ impl ExportWindow {
                 Err(problem) => (problem.clone(), palette.danger),
                 Ok(request) => (describe_request(request), palette.text_dim),
             };
-            ui.add_space(10.0);
+            ui.add_space(pdfreader_ui::FOOTER_GAP);
             ui.label(RichText::new(message).color(colour).size(11.5));
 
+            let enabled = readiness.is_ok();
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let enabled = readiness.is_ok();
-                let button =
-                    egui::Button::new(RichText::new(self.task.action_label()).size(12.5).color(
-                        if enabled {
-                            palette.text
-                        } else {
-                            palette.text_dim
-                        },
-                    ))
-                    .fill(if enabled {
-                        palette.accent_soft
-                    } else {
-                        palette.surface
-                    })
-                    .corner_radius(7.0);
+                let button = if enabled {
+                    primary_button(palette, self.task.action_label())
+                } else {
+                    disabled_button(palette, self.task.action_label())
+                };
 
                 if ui.add_enabled(enabled, button).clicked()
                     && let Ok(request) = readiness
@@ -1061,16 +1020,6 @@ fn count_label(count: usize, noun: &str) -> String {
     }
 }
 
-/// A small dim heading above a group of controls.
-fn section(ui: &mut egui::Ui, palette: &Palette, text: &str) {
-    ui.label(
-        RichText::new(text)
-            .color(palette.text_dim)
-            .size(10.0)
-            .strong(),
-    );
-}
-
 /// A row of mutually exclusive choices.
 ///
 /// Returns the index the user picked, if any. Built by hand rather than with
@@ -1098,7 +1047,7 @@ fn segmented(
                 } else {
                     palette.surface
                 })
-                .corner_radius(6.0);
+                .corner_radius(palette.radius);
             if ui.add(button).clicked() {
                 picked = Some(index);
             }
@@ -1126,7 +1075,8 @@ fn task_row(
     } else {
         palette.surface
     };
-    ui.painter().rect_filled(rect, 5.0, fill);
+    ui.painter()
+        .rect_filled(rect, pdfreader_ui::card_radius(palette), fill);
 
     if selected {
         let bar = egui::Rect::from_min_size(
@@ -1283,12 +1233,7 @@ fn source_row(
 
 /// The destination field: a read-only path that elides from the middle.
 fn path_field(ui: &mut egui::Ui, palette: &Palette, path: &Path, folder: bool, width: f32) {
-    let frame = egui::Frame::new()
-        .fill(palette.window_bg)
-        .stroke(Stroke::new(1.0, palette.border))
-        .corner_radius(6.0)
-        .inner_margin(egui::Margin::symmetric(9, 6));
-
+    let frame = field_frame(palette);
     let text = elide_path(path, folder);
 
     frame.show(ui, |ui| {
@@ -1340,11 +1285,7 @@ fn preview_pane(
     preview: Option<&egui::TextureHandle>,
     single: bool,
 ) {
-    let frame = egui::Frame::new()
-        .fill(palette.window_bg)
-        .stroke(Stroke::new(1.0, palette.border))
-        .corner_radius(6.0)
-        .inner_margin(egui::Margin::same(8));
+    let frame = card_frame(palette).inner_margin(egui::Margin::same(8));
 
     frame.show(ui, |ui| {
         ui.set_width(PREVIEW_WIDTH);

@@ -375,7 +375,7 @@ fn open_source<'a>(pdfium: &'a Pdfium, path: &Path) -> Result<PdfDocument<'a>> {
 /// a merged document of several hundred pages is large, and `save_to_bytes`
 /// would hold a second copy of all of it.
 fn save_to_file(document: &PdfDocument<'_>, output: &Path) -> Result<()> {
-    let file = File::create(output).map_err(|error| EngineError::Io {
+    let file = File::create(output).map_err(|error| EngineError::Write {
         path: output.to_path_buf(),
         reason: error.to_string(),
     })?;
@@ -383,7 +383,7 @@ fn save_to_file(document: &PdfDocument<'_>, output: &Path) -> Result<()> {
 
     document.save_to_writer(&mut writer).map_err(pdfium_error)?;
 
-    writer.flush().map_err(|error| EngineError::Io {
+    writer.flush().map_err(|error| EngineError::Write {
         path: output.to_path_buf(),
         reason: error.to_string(),
     })
@@ -391,7 +391,7 @@ fn save_to_file(document: &PdfDocument<'_>, output: &Path) -> Result<()> {
 
 /// Write bytes to `path`, reporting an IO failure against the path that failed.
 fn write_file(path: &Path, bytes: &[u8]) -> Result<()> {
-    std::fs::write(path, bytes).map_err(|error| EngineError::Io {
+    std::fs::write(path, bytes).map_err(|error| EngineError::Write {
         path: path.to_path_buf(),
         reason: error.to_string(),
     })
@@ -402,7 +402,7 @@ fn write_file(path: &Path, bytes: &[u8]) -> Result<()> {
 /// Takes the error by value so it can be handed straight to `map_err`, which
 /// is the only way this is ever used.
 #[allow(clippy::needless_pass_by_value)]
-fn pdfium_error(error: PdfiumError) -> EngineError {
+pub(crate) fn pdfium_error(error: PdfiumError) -> EngineError {
     EngineError::Pdfium(error.to_string())
 }
 

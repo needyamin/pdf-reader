@@ -7,6 +7,20 @@
 use egui::{Color32, Context, FontFamily, FontId, Margin, Stroke, TextStyle, Visuals};
 use pdfreader_core::ThemeId;
 
+/// Corner radius, in points, for buttons and every other control.
+///
+/// The one number the whole interface rounds to. egui's widgets get it
+/// directly; [`Palette::radius`] carries it to the chrome that paints itself.
+const CONTROL_RADIUS: u8 = 7;
+/// Corner radius for the flat `AnsNew` theme: near-square, for squared chrome.
+const FLAT_RADIUS: u8 = 2;
+/// How much rounder a floating window is than the controls inside it.
+///
+/// A window a few points rounder than its buttons reads as a container rather
+/// than as one more control, and it is what makes the Settings window, the
+/// export pane and the password prompt look like one family.
+const WINDOW_RADIUS_STEP: u8 = 3;
+
 /// Colours the chrome paints directly, beyond what `Visuals` covers.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Palette {
@@ -32,6 +46,15 @@ pub struct Palette {
     pub accent_soft: Color32,
     /// Error state color.
     pub danger: Color32,
+    /// Corner radius, in points, for controls: buttons, chips, fields, rows.
+    ///
+    /// Every floating surface in the app — windows, dialogs, cards, popups —
+    /// derives its own radius from this one number, so a squared theme stays
+    /// squared everywhere and a rounded one stays rounded everywhere. It is
+    /// set by [`Theme::from_id`] from the same constant that styles egui's own
+    /// widgets, which is what keeps hand-painted chrome and stock widgets
+    /// identical.
+    pub radius: f32,
 }
 
 /// A named theme: egui visuals plus the extra palette.
@@ -59,21 +82,26 @@ impl Theme {
 
     /// Build visuals from a light flag and a palette.
     fn build(light: bool, palette: Palette) -> Self {
-        Self::build_with_radius(light, palette, 7)
+        Self::build_with_radius(light, palette, CONTROL_RADIUS)
     }
 
     /// Build a flat theme: near-zero corner radii, for squared chrome.
     fn build_flat(light: bool, palette: Palette) -> Self {
-        Self::build_with_radius(light, palette, 2)
+        Self::build_with_radius(light, palette, FLAT_RADIUS)
     }
 
     /// Build visuals from a light flag, a palette and a widget corner radius.
-    fn build_with_radius(light: bool, palette: Palette, radius: u8) -> Self {
+    fn build_with_radius(light: bool, mut palette: Palette, radius: u8) -> Self {
         let mut visuals = if light {
             Visuals::light()
         } else {
             Visuals::dark()
         };
+
+        // The palette carries the radius so that chrome painted by hand —
+        // every window, dialog and card — can match the radius egui applies to
+        // its own widgets. One number, one look.
+        palette.radius = f32::from(radius);
 
         visuals.window_fill = palette.window_bg;
         visuals.panel_fill = palette.panel_bg;
@@ -94,6 +122,11 @@ impl Theme {
         visuals.widgets.hovered.corner_radius = egui::CornerRadius::same(radius);
         visuals.widgets.active.corner_radius = egui::CornerRadius::same(radius);
         visuals.widgets.open.corner_radius = egui::CornerRadius::same(radius);
+        // Windows, menus and tooltips are the surfaces a user sees next to the
+        // hand-painted chrome, so they take the same radius family rather than
+        // egui's defaults — otherwise a dialog and the panel behind it disagree.
+        visuals.window_corner_radius = egui::CornerRadius::same(radius + WINDOW_RADIUS_STEP);
+        visuals.menu_corner_radius = egui::CornerRadius::same(radius);
 
         Self { visuals, palette }
     }
@@ -151,6 +184,7 @@ const fn ansnew_palette() -> Palette {
         surface_hover: Color32::from_rgb(0x46, 0x46, 0x4a),
         accent_soft: Color32::from_rgb(0x59, 0x15, 0x18),
         danger: Color32::from_rgb(0xff, 0x6b, 0x6f),
+        radius: 2.0,
     }
 }
 
@@ -167,6 +201,7 @@ const fn dark_palette() -> Palette {
         surface_hover: Color32::from_rgb(0x2a, 0x2d, 0x38),
         accent_soft: Color32::from_rgb(0x2d, 0x3f, 0x66),
         danger: Color32::from_rgb(0xff, 0x7d, 0x86),
+        radius: 7.0,
     }
 }
 
@@ -183,6 +218,7 @@ const fn light_palette() -> Palette {
         surface_hover: Color32::from_rgb(0xe8, 0xed, 0xf5),
         accent_soft: Color32::from_rgb(0xd9, 0xe5, 0xff),
         danger: Color32::from_rgb(0xc9, 0x4b, 0x5d),
+        radius: 7.0,
     }
 }
 
@@ -199,6 +235,7 @@ const fn midnight_palette() -> Palette {
         surface_hover: Color32::from_rgb(0x23, 0x2f, 0x5d),
         accent_soft: Color32::from_rgb(0x36, 0x3b, 0x70),
         danger: Color32::from_rgb(0xff, 0x8e, 0x9b),
+        radius: 7.0,
     }
 }
 
@@ -215,6 +252,7 @@ const fn rose_palette() -> Palette {
         surface_hover: Color32::from_rgb(0x45, 0x26, 0x36),
         accent_soft: Color32::from_rgb(0x66, 0x2e, 0x4a),
         danger: Color32::from_rgb(0xff, 0x9a, 0xa8),
+        radius: 7.0,
     }
 }
 
@@ -231,6 +269,7 @@ const fn forest_palette() -> Palette {
         surface_hover: Color32::from_rgb(0x24, 0x40, 0x32),
         accent_soft: Color32::from_rgb(0x2c, 0x5a, 0x45),
         danger: Color32::from_rgb(0xff, 0x93, 0x91),
+        radius: 7.0,
     }
 }
 
@@ -247,6 +286,7 @@ const fn sunset_palette() -> Palette {
         surface_hover: Color32::from_rgb(0x4d, 0x2f, 0x20),
         accent_soft: Color32::from_rgb(0x6a, 0x3c, 0x20),
         danger: Color32::from_rgb(0xff, 0x9a, 0x87),
+        radius: 7.0,
     }
 }
 

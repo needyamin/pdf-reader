@@ -92,21 +92,21 @@ pub enum FormFieldType {
 }
 
 impl FormFieldType {
-    /// Whether the reader can write a value into this kind of field.
+    /// Whether the reader offers to write a value into this kind of field.
     ///
     /// Push buttons and signature fields are excluded because they have no
-    /// value to persist, and signing is not supported.
+    /// value to persist, and signing is not supported. Combo and list boxes are
+    /// excluded because the binding carries no `set_value` for them at all.
     ///
-    /// Radio buttons, combo boxes and list boxes are excluded too, and this is
-    /// not a matter of taste: the PDF binding exposes no write path for them.
-    /// A radio group keeps its value on the parent field dictionary (which
-    /// `pdfium-render` cannot reach — verified against the raw `PDFium` API,
-    /// where `FPDFAnnot_GetLinkedAnnot(annot, "Parent")` returns null), and the
-    /// combo and list box wrappers carry no `set_value` at all. Offering the
-    /// interaction and then failing on every click is worse than saying so: the
-    /// Forms panel carries a note, and these fields show as not fillable.
+    /// Radio buttons **are** offered. `pdfium-render` exposes `set_checked` on
+    /// the widget: where a form's widget dictionary doubles as its field
+    /// dictionary the group's value is written properly, and where the group
+    /// keeps its value on a parent dictionary the binding cannot reach, the
+    /// choice is still kept by the reader and shown on the page. Refusing the
+    /// interaction outright — which is what the reader used to do — meant a
+    /// click on a radio did nothing at all, which is worse than either.
     pub const fn is_fillable(self) -> bool {
-        matches!(self, Self::Text | Self::CheckBox)
+        matches!(self, Self::Text | Self::CheckBox | Self::RadioButton)
     }
 
     /// Whether the field offers a fixed list of choices.
@@ -208,6 +208,16 @@ pub struct FormFieldInfo {
     pub required: bool,
     /// Whether a text field accepts more than one line.
     pub multiline: bool,
+    /// Whether the value shown is painted into the page content by the reader
+    /// rather than recorded in the PDF form model.
+    ///
+    /// A radio group keeps its value on a *parent* field dictionary, and the
+    /// PDF binding exposes no way to reach it — so a click on such a radio
+    /// cannot be stored the normal way. The reader paints the widget into the
+    /// page instead (see `pdfreader_pdf::formmark`), which puts it on screen,
+    /// on paper, and in the saved file. The page raster then already shows the
+    /// value, so the overlay must not draw a second copy on top of it.
+    pub rendered: bool,
 }
 
 impl FormFieldInfo {
@@ -307,20 +317,49 @@ mod tests {
             read_only,
             required: false,
             multiline: false,
+            rendered: false,
         }
+    }
+
+    /// A field the reader painted into the page must stay flagged as painted
+    /// when its value is updated optimistically. Clearing the flag would make
+    /// the canvas draw a second mark over the one already in the page.
+    #[test]
+    fn an_optimistic_update_keeps_a_field_marked_as_page_rendered() {
+        let mut form = FormInfo {
+            kind: FormKind::Acrobat,
+            fields: vec![FormFieldInfo {
+                rendered: true,
+                value: FieldValue::Checked(false),
+                ..field(
+                    FormFieldType::RadioButton,
+                    false,
+                    FieldValue::Checked(false),
+                )
+            }],
+        };
+        let id = form.fields[0].id;
+
+        assert!(form.set_value(id, FieldValue::Checked(true)));
+        assert_eq!(form.field(id).unwrap().value, FieldValue::Checked(true));
+        assert!(
+            form.field(id).unwrap().rendered,
+            "the value is still drawn by the page, not the overlay"
+        );
     }
 
     #[test]
     fn only_writable_widgets_are_fillable() {
         assert!(FormFieldType::Text.is_fillable());
         assert!(FormFieldType::CheckBox.is_fillable());
+        // A radio button is offered: the widget write is attempted, and where
+        // the group's value cannot be written the choice is still kept and
+        // shown. Refusing it meant a click did nothing at all.
+        assert!(FormFieldType::RadioButton.is_fillable());
         // A push button has no state to persist; signing is unsupported.
         assert!(!FormFieldType::PushButton.is_fillable());
         assert!(!FormFieldType::Signature.is_fillable());
-        // No write path exists for these in the PDF binding, so the reader must
-        // not offer to fill them: a radio group's value lives on the parent
-        // field dictionary, and the combo/list wrappers have no setter.
-        assert!(!FormFieldType::RadioButton.is_fillable());
+        // The combo and list wrappers carry no setter at all.
         assert!(!FormFieldType::ComboBox.is_fillable());
         assert!(!FormFieldType::ListBox.is_fillable());
     }

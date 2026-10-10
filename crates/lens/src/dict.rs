@@ -253,9 +253,15 @@ mod tests {
         assert!(matches!(parse_e2b("[]"), Err(ParseError::NoEntries)));
         // Content that is not a JSON array is read as the older pipe format,
         // which yields nothing here rather than a parse failure.
-        assert!(matches!(parse_e2b("not a dictionary"), Err(ParseError::NoEntries)));
+        assert!(matches!(
+            parse_e2b("not a dictionary"),
+            Err(ParseError::NoEntries)
+        ));
         // A file that looks like JSON but is broken reports the parse failure.
-        assert!(matches!(parse_e2b("[{\"en\":1}]"), Err(ParseError::Json(_))));
+        assert!(matches!(
+            parse_e2b("[{\"en\":1}]"),
+            Err(ParseError::Json(_))
+        ));
     }
 
     #[test]
@@ -274,7 +280,11 @@ mod tests {
         let map = parse_ipa(";;; comment\nABBEY\tˈæbi\nBEACH\tbiːtʃ\n\n");
         assert_eq!(map.get("ABBEY").map(String::as_str), Some("ˈæbi"));
         // Lookups go through the dictionary, which upper-cases for the caller.
-        let dicts = Dictionaries::new(parse_e2b("[{\"en\":\"abbey\",\"bn\":\"মঠ\"}]").unwrap(), HashMap::new(), map);
+        let dicts = Dictionaries::new(
+            parse_e2b("[{\"en\":\"abbey\",\"bn\":\"মঠ\"}]").unwrap(),
+            HashMap::new(),
+            map,
+        );
         assert_eq!(dicts.ipa("abbey"), Some("ˈæbi"));
     }
 

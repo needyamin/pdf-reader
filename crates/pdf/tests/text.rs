@@ -112,7 +112,9 @@ fn a_point_inside_a_glyph_finds_that_glyph() {
     let x = (character.rect.min_x + character.rect.max_x) / 2.0;
     let y = (character.rect.min_y + character.rect.max_y) / 2.0;
 
-    let hit = page.char_at(x, y).expect("the centre of a box is inside it");
+    let hit = page
+        .char_at(x, y)
+        .expect("the centre of a box is inside it");
     assert_eq!(page.chars[hit as usize].ch, character.ch);
 }
 
@@ -135,7 +137,10 @@ fn a_click_widens_to_a_whole_word_on_a_real_page() {
         .expect("a point on a glyph resolves to a word");
     let text = page.range_text(range);
     assert!(!text.trim().is_empty(), "the word must hold text");
-    assert!(!text.contains(' '), "a word must not span a space: {text:?}");
+    assert!(
+        !text.contains(' '),
+        "a word must not span a space: {text:?}"
+    );
 }
 
 #[test]

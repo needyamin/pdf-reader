@@ -201,6 +201,8 @@ impl Store {
             | Command::ToggleAutoSpeak
             | Command::SetFormFont(_)
             | Command::SetFormFontSize(_)
+            | Command::SetFormFontColor(_, _, _)
+            | Command::SetFormFontBold(_)
             | Command::ToggleTranslate
             | Command::SetLensTarget(_)
             | Command::ShowSettings
@@ -226,20 +228,31 @@ impl Store {
                 };
                 tab.view.selected_field = id;
 
-                // Selecting a field should bring it into view, the same way
-                // clicking an outline entry jumps to its page.
+                // A field being selected should be brought into view — but only
+                // if it is not already there. Selecting is what the user does
+                // immediately before typing, and jumping the page to the top
+                // moved the field out from under the pointer. The shell decides
+                // whether any scrolling is needed; the reducer only supplies the
+                // field's rectangle.
                 let Some(field_id) = id else {
                     return Vec::new();
                 };
-                let Some(page) = tab
+                let Some((page, rect)) = tab
                     .form
                     .as_ref()
                     .and_then(|form| form.field(field_id))
-                    .map(|field| field.id.page)
+                    .map(|field| (field.id.page, field.rect))
                 else {
                     return Vec::new();
                 };
-                self.dispatch(Command::GoToPage(page))
+                let Some(tab_id) = self.state.active_tab else {
+                    return Vec::new();
+                };
+                vec![Effect::RevealField {
+                    tab: tab_id,
+                    page,
+                    rect,
+                }]
             }
 
             Command::SetFormFieldValue { id, value } => {
@@ -249,9 +262,13 @@ impl Store {
                 let Some(doc) = tab.document.as_ref().map(|d| d.id) else {
                     return Vec::new();
                 };
-                // Radio buttons can be selected but not cleared (the engine has
-                // no uncheck), and push buttons carry no value: filter both out
-                // here so the UI never emits a write that must fail.
+                // A radio button can be selected but not cleared — the binding
+                // has no uncheck — and a push button carries no value at all:
+                // filter both out here so the UI never emits a write that must
+                // fail. Selecting a radio is allowed, and the value is applied
+                // to the form below. Where the group's value cannot be written,
+                // the engine draws the choice into the page instead, so it is
+                // still shown, printed and saved.
                 let writable = tab
                     .form
                     .as_ref()
@@ -277,7 +294,12 @@ impl Store {
                     return Vec::new();
                 }
                 tab.dirty = true;
-                vec![Effect::SetField { doc, id, value }, Effect::InvalidateTiles]
+                // No `InvalidateTiles`: PDFium never regenerates a widget's
+                // appearance after a value write, so the page raster is
+                // unchanged — the canvas draws form values itself. Invalidating
+                // re-rasterized every tile of the page on every keystroke, which
+                // is what made typing in a field stutter.
+                vec![Effect::SetField { doc, id, value }]
             }
 
             Command::SetTool(tool) => {
@@ -402,6 +424,9 @@ impl Store {
                 // memory: cached tiles keep the old pixels until a scroll.
                 vec![
                     Effect::AddAnnotation { doc, page, new },
+                    // Re-list so the panel and the canvas pick up the new note
+                    // immediately; the engine answers with AnnotationsLoaded.
+                    Effect::LoadAnnotations { doc },
                     Effect::InvalidateTiles,
                 ]
             }
@@ -429,6 +454,9 @@ impl Store {
                 }
                 vec![
                     Effect::DeleteAnnotation { doc, id },
+                    // Re-list so the removed note disappears from the panel and
+                    // the canvas without a document reload.
+                    Effect::LoadAnnotations { doc },
                     Effect::InvalidateTiles,
                 ]
             }
@@ -662,6 +690,37 @@ impl Store {
                 });
                 self.state.active_tab = Some(id);
                 vec![Effect::OpenDocument { tab: id, path }]
+            }
+
+            Command::RestoreTabs { tabs, active } => {
+                let mut effects = Vec::new();
+                let mut active_id = None;
+                for (index, (path, view)) in tabs.into_iter().enumerate() {
+                    self.next_tab_id += 1;
+                    let id = TabId::from_raw(self.next_tab_id);
+                    self.state.tabs.push(Tab {
+                        id,
+                        path: path.clone(),
+                        document: None,
+                        form: None,
+                        // The tab opens where it was left, before it is drawn,
+                        // so the first frame lands on the saved scroll offset.
+                        view,
+                        loading: true,
+                        error: None,
+                        dirty: false,
+                        annotations: None,
+                        undo_stack: Vec::new(),
+                        redo_stack: Vec::new(),
+                    });
+                    if Some(index) == active {
+                        active_id = Some(id);
+                    }
+                    effects.push(Effect::OpenDocument { tab: id, path });
+                }
+                // Fall back to the last tab when the saved active one is gone.
+                self.state.active_tab = active_id.or_else(|| self.state.tabs.last().map(|t| t.id));
+                effects
             }
 
             Command::DocumentOpened { tab, mut document } => {
@@ -1130,7 +1189,7 @@ mod tests {
     use crate::export::{ExportDpi, ExportTask, ImageFormat, ImagePageSize, PageRange};
     use crate::form::{FieldId, FieldValue, FormFieldInfo, FormFieldType, FormKind};
     use crate::rect::Rect;
-    use crate::view::ViewMode;
+    use crate::view::{ViewMode, ViewState, ZoomMode};
     use std::path::PathBuf;
 
     fn doc_with_pages(pages: u32) -> Document {
@@ -1164,6 +1223,55 @@ mod tests {
         assert_eq!(s.state().tabs.len(), 1);
         assert!(s.state().active().unwrap().loading);
         assert!(matches!(effects[0], Effect::OpenDocument { .. }));
+    }
+
+    /// Restoring a session reopens every remembered file, keeps each tab's
+    /// saved view, and selects the tab that was active — not simply the last.
+    #[test]
+    fn restoring_tabs_reopens_them_at_their_saved_view() {
+        let saved = ViewState {
+            zoom: 2.0,
+            zoom_mode: ZoomMode::Fixed(2.0),
+            scroll_y: 500.0,
+            current_page: 3,
+            ..ViewState::default()
+        };
+
+        let mut s = Store::new();
+        let effects = s.dispatch(Command::RestoreTabs {
+            tabs: vec![
+                (PathBuf::from("a.pdf"), ViewState::default()),
+                (PathBuf::from("b.pdf"), saved),
+            ],
+            active: Some(0),
+        });
+
+        assert_eq!(s.state().tabs.len(), 2);
+        assert_eq!(
+            effects
+                .iter()
+                .filter(|e| matches!(e, Effect::OpenDocument { .. }))
+                .count(),
+            2,
+            "every restored tab asks the shell to load its file"
+        );
+
+        let active = s.state().active().expect("an active tab");
+        assert_eq!(
+            active.path,
+            PathBuf::from("a.pdf"),
+            "the saved active tab wins"
+        );
+
+        let second = s
+            .state()
+            .tabs
+            .iter()
+            .find(|t| t.path == PathBuf::from("b.pdf"))
+            .expect("the second tab");
+        assert_eq!(second.view.scroll_y, 500.0);
+        assert_eq!(second.view.current_page, 3);
+        assert_eq!(second.view.zoom, 2.0);
     }
 
     #[test]
@@ -1350,6 +1458,7 @@ mod tests {
         let doc = s.state().tab(tab).unwrap().document.as_ref().unwrap().id;
         let mut field = sample_field(3);
         field.id = FieldId::new(3, 1);
+        let field_rect = field.rect;
         s.dispatch(Command::FormFieldsLoaded {
             doc,
             form: FormInfo {
@@ -1361,17 +1470,27 @@ mod tests {
         let effects = s.dispatch(Command::SelectFormField(Some(FieldId::new(3, 1))));
         let tab = s.state().active().unwrap();
         assert_eq!(tab.view.selected_field, Some(FieldId::new(3, 1)));
-        assert_eq!(tab.view.current_page, 3);
+
+        // The field is *revealed*, not jumped to. Selecting a field is the last
+        // thing the user does before typing, so the shell is asked to move as
+        // little as possible — and nothing at all when the field is on screen.
+        // A page jump here would drag the page out from under the pointer.
         assert!(
-            effects
+            effects.iter().any(
+                |e| matches!(e, Effect::RevealField { page: 3, rect, .. } if *rect == field_rect)
+            ),
+            "selecting a field must ask for it to be revealed, with its rectangle"
+        );
+        assert!(
+            !effects
                 .iter()
-                .any(|e| matches!(e, Effect::ScrollToPage { page: 3, .. }))
+                .any(|e| matches!(e, Effect::ScrollToPage { .. })),
+            "selecting a field must not jump the page to the top"
         );
 
-        // Clearing the selection keeps the page where it is.
+        // Clearing the selection changes nothing about the view.
         s.dispatch(Command::SelectFormField(None));
         assert_eq!(s.state().active().unwrap().view.selected_field, None);
-        assert_eq!(s.state().active().unwrap().view.current_page, 3);
     }
 
     fn sample_field(page: u32) -> FormFieldInfo {
@@ -1386,6 +1505,7 @@ mod tests {
             read_only: false,
             required: false,
             multiline: false,
+            rendered: false,
         }
     }
 
@@ -1421,7 +1541,9 @@ mod tests {
         );
         assert!(state.tab(tab).unwrap().dirty);
         assert!(effects.iter().any(|e| matches!(e, Effect::SetField { .. })));
-        assert!(effects.iter().any(|e| matches!(e, Effect::InvalidateTiles)));
+        // The page raster does not change when a value is written, so typing
+        // must not throw the tile cache away — that is what made it stutter.
+        assert!(!effects.iter().any(|e| matches!(e, Effect::InvalidateTiles)));
 
         // The same value again changes nothing: no engine write, no dirty flag
         // churn while the user merely re-renders the panel.
@@ -1430,6 +1552,51 @@ mod tests {
             value: FieldValue::Text("typed".into()),
         });
         assert!(effects.is_empty());
+    }
+
+    /// A radio click must be accepted, applied to the form (so the page can
+    /// draw it) and sent to the engine. It used to be filtered out as
+    /// unfillable, which is why a click on a radio did nothing at all.
+    #[test]
+    fn selecting_a_radio_updates_the_form_and_asks_the_engine() {
+        let (mut s, tab) = opened_store(1);
+        let doc = s.state().tab(tab).unwrap().document.as_ref().unwrap().id;
+        let mut radio = sample_field(0);
+        radio.kind = FormFieldType::RadioButton;
+        radio.value = FieldValue::Checked(false);
+        s.dispatch(Command::FormFieldsLoaded {
+            doc,
+            form: FormInfo {
+                kind: FormKind::Acrobat,
+                fields: vec![radio],
+            },
+        });
+
+        let effects = s.dispatch(Command::SetFormFieldValue {
+            id: FieldId::new(0, 0),
+            value: FieldValue::Checked(true),
+        });
+
+        assert_eq!(
+            s.state()
+                .tab(tab)
+                .unwrap()
+                .form()
+                .unwrap()
+                .field(FieldId::new(0, 0))
+                .unwrap()
+                .value,
+            FieldValue::Checked(true),
+            "the choice must be applied so the page can draw it"
+        );
+        assert!(effects.iter().any(|e| matches!(e, Effect::SetField { .. })));
+
+        // Clearing is still refused: the binding has no uncheck.
+        let effects = s.dispatch(Command::SetFormFieldValue {
+            id: FieldId::new(0, 0),
+            value: FieldValue::Checked(false),
+        });
+        assert!(effects.is_empty(), "a radio cannot be cleared");
     }
 
     #[test]

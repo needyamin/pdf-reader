@@ -120,7 +120,8 @@ fn load_dir(dir: &Path, defs: &mut FontDefinitions, faces: &mut Vec<String>) {
         if faces.contains(&name) {
             continue;
         }
-        defs.font_data.insert(name.clone(), FontData::from_owned(bytes).into());
+        defs.font_data
+            .insert(name.clone(), FontData::from_owned(bytes).into());
         faces.push(name);
     }
 }

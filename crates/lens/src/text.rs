@@ -101,8 +101,7 @@ pub(crate) fn senses_from_raw(raw: &str) -> Vec<String> {
 
 /// Whether the text contains any Bengali character.
 pub(crate) fn contains_bangla(text: &str) -> bool {
-    text.chars()
-        .any(|c| matches!(c, '\u{0980}'..='\u{09FF}'))
+    text.chars().any(|c| matches!(c, '\u{0980}'..='\u{09FF}'))
 }
 
 /// Whether the text holds more than one word.

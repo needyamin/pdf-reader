@@ -10,7 +10,10 @@
 
 use egui::{Align, Context, Layout, RichText};
 use pdfreader_core::{Command, ThemeId, ViewMode, ZoomMode};
-use pdfreader_ui::Palette;
+use pdfreader_ui::{
+    Palette, card_frame, chip_frame, divider, heading, hint, image_frame, primary_button,
+    secondary_button, section,
+};
 
 use crate::App;
 
@@ -184,21 +187,6 @@ const fn theme_label(id: ThemeId) -> &'static str {
     }
 }
 
-/// A dimmed explanatory line under a control.
-fn hint(palette: &Palette, text: &str) -> RichText {
-    RichText::new(text).size(11.5).color(palette.text_dim)
-}
-
-/// Draw a section title with a hairline rule beneath it.
-fn section(ui: &mut egui::Ui, palette: &Palette, title: &str) {
-    ui.add_space(6.0);
-    ui.label(RichText::new(title).strong().size(13.0).color(palette.text));
-    ui.add_space(3.0);
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
-    ui.painter().rect_filled(rect, 0.0, palette.border);
-    ui.add_space(8.0);
-}
-
 impl App {
     /// Draw the Settings window when it is open.
     ///
@@ -221,9 +209,8 @@ impl App {
         let mut commands: Vec<Command> = Vec::new();
         let mut changed = false;
 
-        egui::Window::new("Settings")
+        pdfreader_ui::dialog_window("Settings", palette)
             .open(&mut open)
-            .collapsible(false)
             .resizable(true)
             .default_size([900.0, 580.0])
             .min_size([780.0, 500.0])
@@ -264,11 +251,14 @@ impl App {
                     )
                     .show(ui, |ui| {
                         ui.horizontal_centered(|ui| {
-                            if ui.button("Reset to defaults").clicked() {
+                            if ui
+                                .add(secondary_button(palette, "Reset to defaults"))
+                                .clicked()
+                            {
                                 reset = true;
                             }
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                if ui.button("Done").clicked() {
+                                if ui.add(primary_button(palette, "Done")).clicked() {
                                     close_requested = true;
                                 }
                             });
@@ -287,19 +277,19 @@ impl App {
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
                                 ui.set_width(ui.available_width());
-                                ui.label(
-                                    RichText::new(category.label())
-                                        .strong()
-                                        .size(18.0)
-                                        .color(palette.text),
-                                );
+                                ui.label(heading(palette, category.label()));
                                 ui.add_space(2.0);
                                 ui.label(hint(palette, category.blurb()));
                                 ui.add_space(6.0);
 
                                 match category {
                                     Category::Appearance => {
-                                        self.page_appearance(ui, palette, &mut commands, &mut changed);
+                                        self.page_appearance(
+                                            ui,
+                                            palette,
+                                            &mut commands,
+                                            &mut changed,
+                                        );
                                     }
                                     Category::Reading => {
                                         self.page_reading(ui, palette, &mut commands, &mut changed);
@@ -406,10 +396,7 @@ impl App {
             .selected_text(family_label)
             .show_ui(ui, |ui| {
                 for &(name, label) in pdfreader_ui::FORM_FONTS {
-                    if ui
-                        .selectable_label(self.form_font == name, label)
-                        .clicked()
-                    {
+                    if ui.selectable_label(self.form_font == name, label).clicked() {
                         commands.push(Command::SetFormFont(name.to_owned()));
                     }
                 }
@@ -442,6 +429,31 @@ impl App {
         ));
         ui.add_space(14.0);
 
+        section(ui, palette, "Colour");
+        ui.horizontal(|ui| {
+            let mut rgb = self.form_font_color;
+            if ui.color_edit_button_srgb(&mut rgb).changed() {
+                commands.push(Command::SetFormFontColor(rgb[0], rgb[1], rgb[2]));
+            }
+            ui.label(hint(palette, "Ink for filled field text."));
+        });
+        ui.add_space(14.0);
+
+        section(ui, palette, "Weight");
+        let mut bold = self.form_font_bold;
+        if ui
+            .checkbox(&mut bold, "Bold")
+            .on_hover_text("Draw typed text heavier")
+            .changed()
+        {
+            commands.push(Command::SetFormFontBold(bold));
+        }
+        ui.label(hint(
+            palette,
+            "No bold face is bundled, so this thickens the letters rather than switching typeface.",
+        ));
+        ui.add_space(14.0);
+
         section(ui, palette, "Preview");
         let preview = if self.form_font_size > 0.0 {
             self.form_font_size
@@ -453,17 +465,22 @@ impl App {
         } else {
             egui::FontFamily::Name(self.form_font.clone().into())
         };
-        egui::Frame::new()
-            .fill(palette.surface)
-            .corner_radius(6.0)
-            .inner_margin(egui::Margin::symmetric(10, 8))
-            .show(ui, |ui| {
-                ui.label(
-                    RichText::new("AnsNew PDF Reader  ·  বাংলা  ·  English")
-                        .font(egui::FontId::new(preview, family))
-                        .color(palette.text),
-                );
-            });
+        let ink = egui::Color32::from_rgb(
+            self.form_font_color[0],
+            self.form_font_color[1],
+            self.form_font_color[2],
+        );
+        card_frame(palette).show(ui, |ui| {
+            // The preview shows the same synthetic bold the canvas uses, so the
+            // choice can be judged here rather than in a field.
+            let mut text = RichText::new("AnsNew PDF Reader  ·  বাংলা  ·  English")
+                .font(egui::FontId::new(preview, family.clone()))
+                .color(ink);
+            if self.form_font_bold {
+                text = text.strong();
+            }
+            ui.label(text);
+        });
     }
 
     /// Reading: how documents open.
@@ -511,10 +528,7 @@ impl App {
 
         section(ui, palette, "Window");
         let mut maximized = self.open_maximized;
-        if ui
-            .checkbox(&mut maximized, "Open maximized")
-            .changed()
-        {
+        if ui.checkbox(&mut maximized, "Open maximized").changed() {
             self.open_maximized = maximized;
             *changed = true;
         }
@@ -544,10 +558,7 @@ impl App {
         ui.add_space(6.0);
 
         let mut speak = self.speak_enabled;
-        if ui
-            .checkbox(&mut speak, "Speak (text to speech)")
-            .changed()
-        {
+        if ui.checkbox(&mut speak, "Speak (text to speech)").changed() {
             commands.push(Command::ToggleSpeak);
         }
         ui.label(hint(
@@ -597,7 +608,10 @@ impl App {
             .selected_text(selected_text)
             .show_ui(ui, |ui| {
                 for &(code, label) in TARGETS {
-                    if ui.selectable_label(self.lens_target == code, label).clicked() {
+                    if ui
+                        .selectable_label(self.lens_target == code, label)
+                        .clicked()
+                    {
                         commands.push(Command::SetLensTarget(code.to_owned()));
                     }
                 }
@@ -612,10 +626,7 @@ impl App {
     fn page_performance(&mut self, ui: &mut egui::Ui, palette: &Palette, changed: &mut bool) {
         section(ui, palette, "Rendering");
         let mut prefetch = self.prefetch;
-        if ui
-            .checkbox(&mut prefetch, "Preload nearby pages")
-            .changed()
-        {
+        if ui.checkbox(&mut prefetch, "Preload nearby pages").changed() {
             self.prefetch = prefetch;
             self.canvas.set_prefetch(prefetch);
             *changed = true;
@@ -650,6 +661,8 @@ impl App {
         self.prefetch = true;
         self.form_font.clear();
         self.form_font_size = 0.0;
+        self.form_font_bold = false;
+        self.form_font_color = crate::canvas::DEFAULT_FORM_INK;
         self.sync_form_font();
         self.open_maximized = true;
         self.lookup_enabled = true;
@@ -691,10 +704,7 @@ impl App {
             .anchor(egui::Align2::RIGHT_TOP, [-12.0, 108.0])
             .interactable(false)
             .show(ctx, |ui| {
-                egui::Frame::new()
-                    .fill(palette.panel_bg)
-                    .stroke(egui::Stroke::new(1.0, palette.border))
-                    .corner_radius(6.0)
+                pdfreader_ui::toast_frame(palette, palette.border)
                     .inner_margin(egui::Margin::symmetric(10, 6))
                     .show(ui, |ui| {
                         ui.label(
@@ -713,22 +723,23 @@ impl App {
             return;
         }
         let mut open = true;
-        egui::Window::new("Keyboard Shortcuts")
+        pdfreader_ui::dialog_window("Keyboard Shortcuts", palette)
             .open(&mut open)
-            .collapsible(false)
             .resizable(true)
-            .default_size([470.0, 540.0])
+            .default_size([470.0, 580.0])
             .min_size([380.0, 360.0])
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.label(hint(
+                            palette,
+                            "Every shortcut the reader answers, grouped the way the menu bar is.",
+                        ));
+                        ui.add_space(10.0);
                         for (group, rows) in SHORTCUTS {
-                            ui.add_space(4.0);
-                            ui.label(
-                                RichText::new(*group).strong().size(13.0).color(palette.text),
-                            );
-                            ui.add_space(4.0);
+                            section(ui, palette, group);
                             egui::Grid::new(*group)
                                 .num_columns(2)
                                 .spacing([18.0, 7.0])
@@ -746,7 +757,6 @@ impl App {
                                         ui.end_row();
                                     }
                                 });
-                            ui.add_space(10.0);
                         }
                     });
             });
@@ -764,33 +774,24 @@ fn rail_item(ui: &mut egui::Ui, palette: &Palette, label: &str, selected: bool) 
     };
     let button = egui::Button::new(RichText::new(label).size(13.0).color(text))
         .fill(fill)
-        .corner_radius(6.0)
+        .corner_radius(palette.radius)
         .min_size(egui::vec2(ui.available_width(), 32.0));
     ui.add(button).clicked()
 }
 
 // --- About Us window ---------------------------------------------------------
 //
-// A faithful copy of the "About Us" window from the author's Media Downloader
-// app: same light palette, layout, sizes and buttons, so the two products look
-// identical. The window pins its own light visuals instead of following the
-// reader's (possibly dark) theme.
-
-/// `#333333` — body text.
-const ABOUT_TEXT: egui::Color32 = egui::Color32::from_rgb(0x33, 0x33, 0x33);
-/// `#2196F3` — links and the primary button.
-const ABOUT_PRIMARY: egui::Color32 = egui::Color32::from_rgb(0x21, 0x96, 0xF3);
-/// `#1976D2` — the role line and the pressed button fill.
-const ABOUT_SECONDARY: egui::Color32 = egui::Color32::from_rgb(0x19, 0x76, 0xD2);
-/// `#757575` — muted text.
-const ABOUT_MUTED: egui::Color32 = egui::Color32::from_rgb(0x75, 0x75, 0x75);
-/// `#F5F5F5` — the ghost button's fill.
-const ABOUT_LIGHT_GRAY: egui::Color32 = egui::Color32::from_rgb(0xF5, 0xF5, 0xF5);
+// The same window chrome, palette and buttons as every other window in the
+// reader. It used to pin its own light visuals and a set of hardcoded hex
+// colours copied from another product, which left it the one surface that did
+// not follow the theme the user picked: switch to Sunset and the About window
+// stayed stubbornly blue-on-white. Everything here now comes from `palette`, so
+// it is the reader's theme or nothing.
 
 /// The profile photo, embedded so the window works in the packaged build.
 const PROFILE_JPG: &[u8] = include_bytes!("../../../assets/profile.jpg");
 
-/// Links shown in the "Profile Links" block, matching Media Downloader.
+/// Links shown in the "Profile Links" block.
 const PROFILE_LINKS: &[(&str, &str)] = &[
     ("GitHub", "https://github.com/needyamin"),
     ("Website", "https://needyamin.github.io"),
@@ -801,6 +802,9 @@ const PROFILE_LINKS: &[(&str, &str)] = &[
 /// The GitHub profile the "Visit GitHub" button opens.
 const PROFILE_GITHUB: &str = "https://github.com/needyamin";
 
+/// Size the profile photo is drawn at.
+const PHOTO_SIZE: f32 = 76.0;
+
 /// Decode the embedded profile photo once.
 fn load_profile_texture(ctx: &egui::Context) -> Option<egui::TextureHandle> {
     let image = image::load_from_memory(PROFILE_JPG).ok()?.to_rgba8();
@@ -809,49 +813,13 @@ fn load_profile_texture(ctx: &egui::Context) -> Option<egui::TextureHandle> {
     Some(ctx.load_texture("profile-photo", color, egui::TextureOptions::LINEAR))
 }
 
-/// A flat filled button, matching Media Downloader's `color_button`.
-fn filled_button(
-    ui: &mut egui::Ui,
-    text: &str,
-    fill: egui::Color32,
-    fg: egui::Color32,
-    pressed: egui::Color32,
-    size: egui::Vec2,
-) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
-    let paint = if response.is_pointer_button_down_on() {
-        pressed
-    } else {
-        fill
-    };
-    ui.painter()
-        .rect_filled(rect, egui::CornerRadius::ZERO, paint);
-    ui.painter().text(
-        rect.center(),
-        egui::Align2::CENTER_CENTER,
-        text,
-        egui::FontId::new(13.0, egui::FontFamily::Proportional),
-        fg,
-    );
-    response
-}
-
-/// A flat light button, matching Media Downloader's `ghost_button`.
-fn ghost_button(text: &str) -> egui::Button<'static> {
-    egui::Button::new(RichText::new(text).color(ABOUT_TEXT))
-        .fill(ABOUT_LIGHT_GRAY)
-        .stroke(egui::Stroke::NONE)
-        .corner_radius(egui::CornerRadius::ZERO)
-        .min_size(egui::vec2(0.0, 28.0))
-}
-
 impl App {
     /// Draw the "About Us" window.
     ///
-    /// Long because it mirrors the reference design line for line; splitting it
-    /// would scatter that layout for no gain.
+    /// Long because it is one continuous layout — header, links, blurb, action
+    /// bar — and splitting it would scatter that for no gain.
     #[allow(clippy::too_many_lines)]
-    pub(crate) fn draw_about_window(&mut self, ctx: &egui::Context) {
+    pub(crate) fn draw_about_window(&mut self, ctx: &egui::Context, palette: &Palette) {
         if !self.about_open {
             return;
         }
@@ -865,108 +833,146 @@ impl App {
         let mut close = false;
         let mut visit: Option<&str> = None;
 
-        // The window is a fixed light design; pin the light visuals for it and
-        // restore the reader's theme afterwards.
-        ctx.set_visuals(egui::Visuals::light());
-
-        egui::Window::new("About Us")
+        pdfreader_ui::dialog_window("About Us", palette)
             .open(&mut open)
-            .collapsible(false)
-            .resizable(true)
-            .default_size([780.0, 560.0])
-            .min_width(700.0)
-            .min_height(500.0)
-            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            // A fixed, comfortable size: the profile is static, so resizing
+            // gains nothing, and the body scrolls if the screen is short.
+            .fixed_size([680.0, 610.0])
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    if let Some(texture) = &photo {
-                        ui.add(egui::Image::new((texture.id(), egui::vec2(72.0, 72.0))));
-                    }
-                    ui.vertical(|ui| {
-                        ui.label(
-                            RichText::new("Md. Yamin Hossain")
-                                .size(21.0)
-                                .strong()
-                                .color(ABOUT_TEXT),
-                        );
-                        ui.label(
-                            RichText::new("Sr. Software Engineer")
-                                .size(14.0)
-                                .color(ABOUT_SECONDARY),
-                        );
-                        ui.label(
-                            RichText::new("Dhaka, Bangladesh")
-                                .size(13.0)
-                                .color(ABOUT_MUTED),
-                        );
-                        ui.add_space(6.0);
-                        ui.label(
-                            RichText::new(
-                                "Software Engineer focused on scalable systems, infrastructure \
-                                 automation, and intuitive user experiences.",
-                            )
-                            .size(13.0)
-                            .color(ABOUT_TEXT),
-                        );
-                        ui.label(
-                            RichText::new(format!("AnsNew PDF Reader v{version}"))
-                                .size(12.0)
-                                .color(ABOUT_MUTED),
-                        );
+                // The actions stay pinned to the bottom of the window; only the
+                // profile scrolls, so a small window never hides the buttons.
+                egui::Panel::bottom("about-footer")
+                    .resizable(false)
+                    .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(0, 8)))
+                    .show(ui, |ui| {
+                        divider(ui, palette);
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if ui.add(primary_button(palette, "Visit GitHub")).clicked() {
+                                visit = Some(PROFILE_GITHUB);
+                            }
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui.add(secondary_button(palette, "Close")).clicked() {
+                                        close = true;
+                                    }
+                                },
+                            );
+                        });
                     });
-                });
-                ui.add_space(8.0);
-                ui.separator();
-                ui.add_space(8.0);
-                ui.label(
-                    RichText::new("Profile Links")
-                        .size(16.0)
-                        .strong()
-                        .color(ABOUT_TEXT),
-                );
-                for &(label, url) in PROFILE_LINKS {
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(format!("{label}:")).strong().color(ABOUT_TEXT));
-                        if ui.link(RichText::new(url).color(ABOUT_PRIMARY)).clicked() {
-                            visit = Some(url);
-                        }
-                    });
-                }
-                ui.add_space(10.0);
-                ui.label(
-                    RichText::new(
-                        "AnsNew PDF Reader is created and maintained by Md. Yamin Hossain. \
-                         This open-source desktop app focuses on fast, offline PDF reading \
-                         with a clean user experience.",
-                    )
-                    .size(13.0)
-                    .color(ABOUT_TEXT),
-                );
-                ui.add_space(12.0);
-                ui.horizontal(|ui| {
-                    let width = (ui.available_width() - 8.0).max(120.0);
-                    if filled_button(
-                        ui,
-                        "Visit GitHub",
-                        ABOUT_PRIMARY,
-                        egui::Color32::WHITE,
-                        ABOUT_SECONDARY,
-                        egui::vec2(140.0, 34.0),
-                    )
-                    .clicked()
-                    {
-                        visit = Some(PROFILE_GITHUB);
-                    }
-                    ui.add_space((width - 280.0).max(8.0));
-                    if ui.add(ghost_button("Close")).clicked() {
-                        close = true;
-                    }
-                });
-            });
 
-        // Restore the reader's own theme (the light visuals were only for the
-        // About window).
-        pdfreader_ui::apply_theme(ctx, self.store.state().theme);
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+
+                        // --- the profile card ------------------------------
+                        card_frame(palette).show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.horizontal_top(|ui| {
+                                if let Some(texture) = &photo {
+                                    image_frame(palette).show(ui, |ui| {
+                                        ui.add(
+                                            egui::Image::new((
+                                                texture.id(),
+                                                egui::vec2(PHOTO_SIZE, PHOTO_SIZE),
+                                            ))
+                                            .corner_radius(palette.radius),
+                                        );
+                                    });
+                                    ui.add_space(16.0);
+                                }
+                                ui.vertical(|ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.label(heading(palette, "Md. Yamin Hossain"));
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                chip_frame(palette).show(ui, |ui| {
+                                                    ui.label(
+                                                        RichText::new(format!("v{version}"))
+                                                            .size(11.0)
+                                                            .color(palette.text),
+                                                    );
+                                                });
+                                            },
+                                        );
+                                    });
+                                    ui.add_space(3.0);
+                                    ui.label(
+                                        RichText::new("Software Engineer")
+                                            .size(13.5)
+                                            .strong()
+                                            .color(palette.accent),
+                                    );
+                                    ui.add_space(2.0);
+                                    ui.label(
+                                        RichText::new("Dhaka, Bangladesh")
+                                            .size(12.0)
+                                            .color(palette.text_dim),
+                                    );
+                                    ui.add_space(10.0);
+                                    ui.label(
+                                        RichText::new(
+                                            "Scalable systems, infrastructure automation, \
+                                             and intuitive user experiences.",
+                                        )
+                                        .size(12.5)
+                                        .color(palette.text),
+                                    );
+                                });
+                            });
+                        });
+
+                        // --- profile links --------------------------------
+                        ui.add_space(12.0);
+                        section(ui, palette, "Profile Links");
+                        card_frame(palette).show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            egui::Grid::new("about-links")
+                                .num_columns(2)
+                                .spacing([20.0, 7.0])
+                                .show(ui, |ui| {
+                                    for &(label, url) in PROFILE_LINKS {
+                                        ui.label(
+                                            RichText::new(label)
+                                                .strong()
+                                                .size(12.0)
+                                                .color(palette.text_dim),
+                                        );
+                                        if ui
+                                            .link(
+                                                RichText::new(url).size(12.5).color(palette.accent),
+                                            )
+                                            .clicked()
+                                        {
+                                            visit = Some(url);
+                                        }
+                                        ui.end_row();
+                                    }
+                                });
+                        });
+
+                        // --- about this app -------------------------------
+                        ui.add_space(12.0);
+                        section(ui, palette, "About this app");
+                        card_frame(palette).show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.label(
+                                RichText::new(
+                                    "AnsNew PDF Reader is created and maintained by \
+                                     Md. Yamin Hossain. This open-source desktop app focuses on \
+                                     fast, offline PDF reading with a clean user experience.",
+                                )
+                                .size(12.5)
+                                .color(palette.text),
+                            );
+                        });
+
+                        ui.add_space(8.0);
+                    });
+            });
 
         if let Some(url) = visit
             && let Err(error) = pdfreader_platform::url::open(url)

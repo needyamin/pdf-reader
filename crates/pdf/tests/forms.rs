@@ -7,7 +7,7 @@
 use std::path::PathBuf;
 
 use pdfreader_core::{FieldValue, FormFieldType};
-use pdfreader_pdf::engine::{PdfEngine, PdfiumEngine};
+use pdfreader_pdf::engine::{FieldWrite, PdfEngine, PdfiumEngine};
 
 /// Workspace root, derived from this crate's manifest directory.
 fn workspace_root() -> PathBuf {
@@ -228,30 +228,31 @@ fn filled_values_survive_a_save_round_trip() {
         .expect("unchecked radio widget present");
 
     // Text: overwrite the fixture's "Jane Doe".
-    assert!(
+    assert_eq!(
         engine
             .set_field_value(handle, text_field.id, FieldValue::Text("John Smith".into()))
             .expect("text write"),
-        "text field must be writable"
+        FieldWrite::Recorded,
+        "a text field's value belongs in the form model"
     );
     // Checkbox: the fixture ships it checked, so clear it.
-    assert!(
+    assert_eq!(
         engine
             .set_field_value(handle, checkbox.id, FieldValue::Checked(false))
             .expect("checkbox write"),
-        "checkbox must be writable"
+        FieldWrite::Recorded,
+        "a checkbox carries its own value and writes back normally"
     );
     // Radio: a grouped radio keeps its value on the parent field dictionary,
     // which pdfium-render cannot write — `set_checked` writes the value onto
-    // the widget and changes nothing. Selecting one must therefore be
-    // *refused*, not reported as saved. (The assertion this replaced only
-    // checked that *some* radio in the group was checked; the fixture already
-    // had one, so it passed even while the write did nothing.)
-    assert!(
+    // the widget and changes nothing. The selection is painted into the page
+    // instead, so it survives printing and saving rather than being lost.
+    assert_eq!(
         engine
             .set_field_value(handle, radio.id, FieldValue::Checked(true))
-            .is_err(),
-        "selecting a grouped radio button must be refused, not silently dropped"
+            .expect("radio write"),
+        FieldWrite::Painted,
+        "a grouped radio's selection has to be painted, not recorded"
     );
 
     let bytes = engine.save_to_bytes(handle, false).expect("serialise");
@@ -281,27 +282,27 @@ fn filled_values_survive_a_save_round_trip() {
         .expect("checkbox still present");
     assert_eq!(subscribe.value, FieldValue::Checked(false));
 
-    // The refused radio write left the group exactly as it was: one selection,
-    // and the widget we tried to select still unset.
+    // The painted radio selection lives in the page, so it comes back after the
+    // round trip: exactly one selection, and it is the widget that was clicked.
     let colours: Vec<_> = form2
         .fields
         .iter()
         .filter(|f| f.name == "Colour")
-        .map(|f| (f.id, f.value.clone()))
+        .map(|f| (f.id, f.value.clone(), f.rendered))
         .collect();
     assert_eq!(
         colours
             .iter()
-            .filter(|(_, value)| *value == FieldValue::Checked(true))
+            .filter(|(_, value, _)| *value == FieldValue::Checked(true))
             .count(),
         1,
-        "the radio group must still hold exactly one selection, got {colours:?}"
+        "the radio group must hold exactly one selection, got {colours:?}"
     );
     assert!(
-        colours
-            .iter()
-            .any(|(id, value)| *id == radio.id && *value == FieldValue::Checked(false)),
-        "the refused radio widget must still be unset, got {colours:?}"
+        colours.iter().any(|(id, value, rendered)| *id == radio.id
+            && *value == FieldValue::Checked(true)
+            && *rendered),
+        "the clicked radio must come back selected and page-rendered, got {colours:?}"
     );
     let _ = std::fs::remove_file(&reopened_path);
 }
@@ -328,11 +329,12 @@ fn unwritable_fields_are_refused() {
 
     // An annotation index that is not a widget at all.
     let bogus = pdfreader_core::FieldId::new(0, u32::MAX);
-    assert!(
-        !engine
+    assert_eq!(
+        engine
             .set_field_value(handle, bogus, FieldValue::Text("x".into()))
-            .expect("missing widget reports false, not an error"),
-        "a missing widget must report Ok(false)"
+            .expect("missing widget is refused, not an error"),
+        FieldWrite::Refused,
+        "a missing widget must be refused"
     );
 }
 
@@ -424,6 +426,16 @@ fn created_annotations_survive_a_save_round_trip() {
         .iter()
         .find(|a| a.kind == pdfreader_core::AnnotationKind::StickyNote)
         .expect("sticky note present");
+    // The note's icon box is centred on the point it was placed at. This is
+    // what keeps the on-canvas tag pinned to the click instead of drifting
+    // half an icon away.
+    let note_cx = (note.rect.min_x + note.rect.max_x) / 2.0;
+    let note_cy = (note.rect.min_y + note.rect.max_y) / 2.0;
+    assert!(
+        (note_cx - 420.0).abs() < 2.0 && (note_cy - 700.0).abs() < 2.0,
+        "note must be centred on its placement point, got {:?}",
+        note.rect
+    );
     engine
         .set_annotation_contents(handle, note.id, "Reviewed by Yamin")
         .expect("edit contents");
@@ -549,10 +561,11 @@ fn job_application_form_fills_and_saves() {
             .iter()
             .find(|f| f.name == name && f.kind == FormFieldType::Text)
             .unwrap_or_else(|| panic!("{name} present"));
-        assert!(
+        assert_eq!(
             engine
                 .set_field_value(handle, field.id, FieldValue::Text(value.into()))
                 .expect("write"),
+            FieldWrite::Recorded,
             "{name} must be writable"
         );
     }
@@ -563,10 +576,11 @@ fn job_application_form_fills_and_saves() {
         .iter()
         .find(|f| f.name == "FullTime")
         .expect("FullTime present");
-    assert!(
+    assert_eq!(
         engine
             .set_field_value(handle, full_time.id, FieldValue::Checked(true))
             .expect("write"),
+        FieldWrite::Recorded,
         "checkbox must be writable"
     );
 
@@ -606,4 +620,164 @@ fn job_application_form_fills_and_saves() {
         .expect("field present");
     assert_eq!(checkbox.value, FieldValue::Checked(true));
     let _ = std::fs::remove_file(&out);
+}
+
+/// Count pixels darker than mid-grey inside a widget rectangle.
+///
+/// The raster is in bitmap space, measured down from the top; the rectangle is
+/// in PDF space, measured up from the bottom, so the vertical axis flips.
+fn ink_in(
+    engine: &mut PdfiumEngine,
+    handle: pdfreader_pdf::DocumentHandle,
+    rect: pdfreader_core::Rect,
+    page_size: (f32, f32),
+) -> u32 {
+    let tile = engine
+        .render_page(handle, 0, pdfreader_core::Rotation::None, 2.0)
+        .expect("render");
+    let (page_width, page_height) = page_size;
+    let sx = tile.width as f32 / page_width;
+    let sy = tile.height as f32 / page_height;
+
+    let x0 = (rect.min_x * sx).max(0.0) as u32;
+    let x1 = (rect.max_x * sx).min(tile.width as f32) as u32;
+    let y0 = (tile.height as f32 - rect.max_y * sy).max(0.0) as u32;
+    let y1 = (tile.height as f32 - rect.min_y * sy).min(tile.height as f32) as u32;
+
+    let mut dark = 0;
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let index = ((y * tile.width + x) * 4) as usize;
+            if index + 2 < tile.data.len() && tile.data[index] < 128 {
+                dark += 1;
+            }
+        }
+    }
+    dark
+}
+
+/// A radio whose group value the PDF binding cannot write must still end up on
+/// the page. Otherwise the user's answer would be visible on screen and then
+/// vanish the moment they saved — the worst of both worlds.
+#[test]
+fn a_radio_selection_is_painted_into_the_page_and_survives_a_save() {
+    let Some(dir) = find_pdfium() else {
+        eprintln!("SKIP: no PDFium library staged under target/native");
+        return;
+    };
+    let mut engine = PdfiumEngine::bind(Some(dir.as_path())).expect("bind");
+    let path = require_fixture("forms.pdf");
+    let (handle, _info) = engine.open(&path, None).expect("open");
+
+    let form = engine.form_fields(handle).expect("form read");
+    let radio = form
+        .fields
+        .iter()
+        .find(|f| f.name == "Colour" && f.value == FieldValue::Checked(false))
+        .expect("an unselected radio");
+    let (id, rect) = (radio.id, radio.rect);
+    let page_size = engine.page_size(handle, 0).expect("page size");
+
+    assert_eq!(
+        ink_in(&mut engine, handle, rect, page_size),
+        0,
+        "the fixture draws nothing in an unselected radio"
+    );
+
+    assert_eq!(
+        engine
+            .set_field_value(handle, id, FieldValue::Checked(true))
+            .expect("write"),
+        FieldWrite::Painted,
+        "a grouped radio cannot be recorded in the form model, so it is painted"
+    );
+    assert!(
+        ink_in(&mut engine, handle, rect, page_size) > 0,
+        "the selection must be drawn on the page"
+    );
+
+    // The point of painting rather than merely remembering: the mark is in the
+    // file, so it survives a save and a re-open.
+    let bytes = engine.save_to_bytes(handle, false).expect("save");
+    let out = std::env::temp_dir().join("pdf-reader-painted-radio.pdf");
+    std::fs::write(&out, &bytes).expect("write");
+    let (reopened, _) = engine.open(&out, None).expect("reopen");
+
+    assert!(
+        ink_in(&mut engine, reopened, rect, page_size) > 0,
+        "the painted mark must be in the saved file"
+    );
+    let reread = engine.form_fields(reopened).expect("form read after save");
+    let saved = reread.fields.iter().find(|f| f.id == id).expect("field");
+    assert_eq!(saved.value, FieldValue::Checked(true));
+    assert!(
+        saved.rendered,
+        "the value lives in the page, so the overlay must not draw it again"
+    );
+    let _ = std::fs::remove_file(&out);
+}
+
+/// Selecting one radio must leave the group showing exactly one answer.
+///
+/// The model still holds the value the form shipped with, so without hiding the
+/// widget it would go on drawing the *previous* selection next to the new one.
+#[test]
+fn a_painted_radio_group_still_shows_exactly_one_selection() {
+    let Some(dir) = find_pdfium() else {
+        eprintln!("SKIP: no PDFium library staged under target/native");
+        return;
+    };
+    let mut engine = PdfiumEngine::bind(Some(dir.as_path())).expect("bind");
+    let path = require_fixture("forms.pdf");
+    let (handle, _info) = engine.open(&path, None).expect("open");
+
+    let form = engine.form_fields(handle).expect("form read");
+    let radios: Vec<_> = form
+        .fields
+        .iter()
+        .filter(|f| f.name == "Colour")
+        .map(|f| (f.id, f.value.clone()))
+        .collect();
+    let selected = radios
+        .iter()
+        .find(|(_, value)| *value == FieldValue::Checked(true))
+        .map(|(id, _)| *id)
+        .expect("the fixture selects one radio");
+    let other = radios
+        .iter()
+        .find(|(_, value)| *value == FieldValue::Checked(false))
+        .map(|(id, _)| *id)
+        .expect("the fixture leaves one radio unselected");
+
+    engine
+        .set_field_value(handle, other, FieldValue::Checked(true))
+        .expect("select the other radio");
+
+    let after = engine.form_fields(handle).expect("form read");
+    let checked: Vec<_> = after
+        .fields
+        .iter()
+        .filter(|f| f.name == "Colour" && f.value == FieldValue::Checked(true))
+        .map(|f| f.id)
+        .collect();
+    assert_eq!(
+        checked,
+        vec![other],
+        "exactly the clicked radio must read as selected"
+    );
+    assert!(
+        after
+            .fields
+            .iter()
+            .filter(|f| f.name == "Colour")
+            .all(|f| f.rendered),
+        "every widget in a painted group is drawn by the page, not the overlay"
+    );
+    assert!(
+        !after
+            .fields
+            .iter()
+            .any(|f| f.id == selected && f.value == FieldValue::Checked(true)),
+        "the previous selection must not linger"
+    );
 }

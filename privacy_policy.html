@@ -1,0 +1,380 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Privacy Policy — AnsNew PDF Reader</title>
+<meta name="description" content="Privacy policy for AnsNew PDF Reader: an offline PDF reader that collects no personal data.">
+<style>
+  :root {
+    --ink: #1a1c1f;
+    --ink-soft: #4a5057;
+    --ink-faint: #6b7280;
+    --rule: #e2e5e9;
+    --panel: #f6f7f9;
+    --accent: #0b6bcb;
+    --page: #ffffff;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --ink: #e8eaed;
+      --ink-soft: #c2c7cd;
+      --ink-faint: #9aa1a9;
+      --rule: #33383e;
+      --panel: #1d2024;
+      --accent: #6cb2f5;
+      --page: #14161a;
+    }
+  }
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0;
+    padding: 0 20px 72px;
+    background: var(--page);
+    color: var(--ink);
+    font: 16px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+          "Helvetica Neue", Arial, "Noto Sans", sans-serif;
+  }
+  main { max-width: 760px; margin: 0 auto; }
+  header { padding: 48px 0 24px; border-bottom: 1px solid var(--rule); }
+  h1 { margin: 0 0 8px; font-size: 30px; line-height: 1.25; letter-spacing: -0.01em; }
+  .subtitle { margin: 0; color: var(--ink-soft); font-size: 17px; }
+  .meta { margin: 18px 0 0; color: var(--ink-faint); font-size: 13.5px; }
+  .meta span { white-space: nowrap; }
+  .meta span + span::before { content: " · "; }
+  h2 {
+    margin: 40px 0 12px;
+    font-size: 20px;
+    line-height: 1.3;
+    letter-spacing: -0.005em;
+  }
+  h3 { margin: 24px 0 6px; font-size: 16px; }
+  p, li { color: var(--ink); }
+  p { margin: 0 0 14px; }
+  ul { margin: 0 0 14px; padding-left: 22px; }
+  li { margin: 0 0 8px; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover, a:focus { text-decoration: underline; }
+  code {
+    font: 13.5px/1.5 ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    background: var(--panel);
+    border: 1px solid var(--rule);
+    border-radius: 4px;
+    padding: 1px 5px;
+    word-break: break-word;
+  }
+  .lede {
+    margin: 28px 0 0;
+    padding: 18px 20px;
+    background: var(--panel);
+    border: 1px solid var(--rule);
+    border-radius: 10px;
+  }
+  .lede h2 { margin: 0 0 10px; font-size: 15px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--ink-soft); }
+  .lede ul { margin: 0; }
+  .lede li:last-child { margin-bottom: 0; }
+  nav.toc { margin: 28px 0 0; padding: 0; }
+  nav.toc h2 { margin: 0 0 10px; font-size: 15px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--ink-soft); }
+  nav.toc ol { margin: 0; padding-left: 20px; columns: 2; column-gap: 32px; }
+  nav.toc li { margin: 0 0 4px; font-size: 14.5px; }
+  table { width: 100%; border-collapse: collapse; margin: 0 0 16px; font-size: 15px; }
+  th, td { text-align: left; vertical-align: top; padding: 9px 12px; border-bottom: 1px solid var(--rule); }
+  th { font-weight: 600; color: var(--ink-soft); }
+  td:first-child, th:first-child { padding-left: 0; }
+  footer { margin-top: 48px; padding-top: 20px; border-top: 1px solid var(--rule); color: var(--ink-faint); font-size: 13.5px; }
+  @media (max-width: 560px) {
+    nav.toc ol { columns: 1; }
+    h1 { font-size: 25px; }
+    body { padding: 0 16px 56px; }
+  }
+  @media print {
+    :root { --ink: #000; --ink-soft: #333; --ink-faint: #555; --rule: #bbb; --panel: #f4f4f4; --accent: #000; }
+    body { font-size: 11.5pt; padding: 0; }
+    nav.toc { display: none; }
+    h2 { page-break-after: avoid; }
+    a { text-decoration: none; color: #000; }
+  }
+</style>
+</head>
+<body>
+<main>
+
+<header>
+  <h1>Privacy Policy — AnsNew PDF Reader</h1>
+  <p class="subtitle">A desktop PDF reader that works entirely on your own computer.</p>
+  <p class="meta">
+    <span>Effective 10 October 2026</span>
+    <span>Applies to version 5.0.0</span>
+    <span>Publisher: ANSNEW TECH.</span>
+  </p>
+</header>
+
+<div class="lede">
+  <h2>The short version</h2>
+  <ul>
+    <li><strong>We do not collect any personal data.</strong> There is no account, no sign-in, no analytics, no crash reporting, and no advertising.</li>
+    <li><strong>The app makes no network connections.</strong> Your documents are opened, rendered, searched, filled in, printed and saved on your own machine.</li>
+    <li><strong>It keeps your preferences on your own disk</strong> — a settings file and a session file under <code>%APPDATA%\pdf-reader</code>. Nothing is sent anywhere, and deleting those files removes everything the app remembers.</li>
+    <li><strong>One button opens an external website.</strong> If you click <em>Translate</em> in the word-lookup popup, the selected word is put into a Google Translate link and opened in your own browser. That is the only time text leaves the app, and only because you asked for it.</li>
+  </ul>
+</div>
+
+<nav class="toc">
+  <h2>Contents</h2>
+  <ol>
+    <li><a href="#scope">Who this policy covers</a></li>
+    <li><a href="#collect">Data we do not collect</a></li>
+    <li><a href="#device">What is stored on your device</a></li>
+    <li><a href="#documents">Your documents</a></li>
+    <li><a href="#network">Network activity</a></li>
+    <li><a href="#third-parties">Third-party services</a></li>
+    <li><a href="#features">Local features explained</a></li>
+    <li><a href="#children">Children's privacy</a></li>
+    <li><a href="#control">Your control and how to delete data</a></li>
+    <li><a href="#security">Security</a></li>
+    <li><a href="#changes">Changes to this policy</a></li>
+    <li><a href="#contact">Contact</a></li>
+  </ol>
+</nav>
+
+<h2 id="scope">1. Who this policy covers</h2>
+<p>
+  This policy covers <strong>AnsNew PDF Reader</strong>, a desktop application for
+  Windows, macOS and Linux, published by <strong>ANSNEW TECH.</strong> It explains
+  what the application does with information on the device it runs on. It applies
+  to the app itself, whichever way you obtained it — Microsoft Store, an
+  installer, or a portable folder.
+</p>
+<p>
+  The policy does not cover any other software, website or service, and it does not
+  cover the documents you open: those belong to you or to whoever gave them to you.
+</p>
+
+<h2 id="collect">2. Data we do not collect</h2>
+<p>AnsNew PDF Reader does not collect, transmit, sell or share personal data. Specifically, it does not collect:</p>
+<table>
+  <tr><th>Category</th><th>Collected?</th></tr>
+  <tr><td>Name, email address, phone number, postal address</td><td>No</td></tr>
+  <tr><td>Account, login or profile of any kind</td><td>No</td></tr>
+  <tr><td>Device identifiers, advertising IDs, or hardware fingerprints</td><td>No</td></tr>
+  <tr><td>Location data</td><td>No</td></tr>
+  <tr><td>Usage, interaction or analytics data</td><td>No</td></tr>
+  <tr><td>Crash reports or diagnostic telemetry</td><td>No</td></tr>
+  <tr><td>The contents of documents you open, or text you select or type</td><td>No</td></tr>
+  <tr><td>Files you have opened, other than in the local session file described below</td><td>No</td></tr>
+</table>
+<p>
+  There is no server operated by us for this application, and therefore no server
+  that could receive data from it. There is no account to register, and no API key
+  or subscription involved in any feature.
+</p>
+
+<h2 id="device">3. What is stored on your device</h2>
+<p>
+  The app remembers a few things so it can reopen the way you left it. This
+  information is written to your own user profile and is never transmitted:
+</p>
+<table>
+  <tr><th>File</th><th>What it holds</th></tr>
+  <tr>
+    <td><code>%APPDATA%\pdf-reader\settings.json</code></td>
+    <td>Your preferences: theme, default view mode and zoom, whether the sidebar
+        is shown, reading and lookup options, and the face, size, weight and colour
+        used for text typed into forms.</td>
+  </tr>
+  <tr>
+    <td><code>%APPDATA%\pdf-reader\session.json</code></td>
+    <td>The documents that were open when you last quit, and where you were in each
+        one — page, scroll position, zoom and rotation — so they can be restored.</td>
+  </tr>
+</table>
+<p>
+  On macOS these files live under <code>~/Library/Application Support/pdf-reader</code>;
+  on Linux under <code>$XDG_CONFIG_HOME/pdf-reader</code> or <code>~/.config/pdf-reader</code>.
+  They contain no document content, only preferences and file locations.
+</p>
+<p>
+  If a document has unsaved changes and the settings file is ever damaged, the app
+  preserves the damaged copy alongside it rather than overwriting it, so nothing is
+  silently lost. That copy is still local to your machine.
+</p>
+
+<h2 id="documents">4. Your documents</h2>
+<p>
+  Documents are opened, decoded, rendered, searched and edited locally. Highlights,
+  notes, form entries and page edits are written into the PDF file itself, and only
+  when you choose to save — the app never writes to a file you did not ask it to
+  change. Saving is done by writing a temporary file beside the original and then
+  replacing it, so an interrupted save cannot leave a half-written document.
+</p>
+<p>
+  If you set AnsNew PDF Reader as the default application for PDF files, Windows may
+  pass the path of a document to the app when you open it. The app uses that path to
+  read the file and nothing more.
+</p>
+<p>
+  Exported images and printed pages are produced on your machine and handed to your
+  own printer driver or saved where you choose. No document content is sent to us or
+  to any third party by printing or exporting.
+</p>
+
+<h2 id="network">5. Network activity</h2>
+<p>
+  <strong>The application does not make network connections.</strong> It contains no
+  networking code, and the Windows package requests no network capability — the
+  package manifest declares only <code>runFullTrust</code>, which is what a desktop
+  application needs to run, and nothing related to the internet.
+</p>
+<p>
+  Everything the app does with a document is done locally: page rendering uses the
+  copy of PDFium bundled inside the app, and word lookups are answered from
+  dictionaries bundled with it. No feature requires an internet connection, and no
+  feature is degraded when you are offline.
+</p>
+
+<h2 id="third-parties">6. Third-party services</h2>
+<h3>Google Translate — only when you click Translate</h3>
+<p>
+  When you select a word and open the lookup popup, one of the buttons is
+  <em>Translate</em>. Pressing it builds a link of the form
+  <code>https://translate.google.com/?sl=auto&amp;tl=…&amp;text=&lt;your word&gt;</code>
+  and opens it in your default web browser. The app itself sends nothing.
+</p>
+<p>
+  Because the selected word is part of that address, it is visible to your browser
+  and to Google once the page loads, exactly as if you had typed it into Google
+  Translate yourself. That exchange is governed by Google's own privacy policy, not
+  by this one. If you never press <em>Translate</em>, no text ever leaves the app.
+  The same is true of the word you look up: it is answered from the offline
+  dictionaries and is not sent anywhere.
+</p>
+
+<h3>Links in the About window</h3>
+<p>
+  The About window and the Help menu offer links to the developer's GitHub profile,
+  personal website, ORCID record and Facebook page. These open in your browser only
+  when you click them. Opening one is a normal web visit governed by that site's
+  privacy policy; the app does not track whether you clicked.
+</p>
+
+<h3>Microsoft Store</h3>
+<p>
+  If you installed the app from the Microsoft Store, Microsoft handles the download,
+  installation and updates, and may collect information about that process under its
+  own privacy statement. That happens between you and Microsoft and is outside the
+  app: the app receives no personal data from it, and we receive no reports about
+  individual users. The Store's optional ratings and reviews are likewise handled by
+  Microsoft.
+</p>
+
+<h2 id="features">7. Local features explained</h2>
+<h3>Word lookup and pronunciation</h3>
+<p>
+  The English–Bangla dictionary, the pronunciation data and the English word list are
+  files shipped inside the application. A lookup reads them from your disk and
+  answers immediately. No query is sent anywhere, and the app keeps no history of the
+  words you look up.
+</p>
+<h3>Speak</h3>
+<p>
+  The <em>Speak</em> button pronounces a word using the text-to-speech voice already
+  installed in your operating system. The word is passed to that local system voice;
+  it is not sent over the internet, and nothing is recorded.
+</p>
+<h3>Search</h3>
+<p>
+  Searching runs over the pages of the document you have open, on your machine. The
+  query and the results stay in the app and are not stored after you close it.
+</p>
+<h3>Clipboard</h3>
+<p>
+  Copying text places it on the system clipboard, which is how every application
+  works. The app does not read the clipboard on its own.
+</p>
+
+<h2 id="children">8. Children's privacy</h2>
+<p>
+  The app is a document reader suitable for general audiences. Because it collects no
+  personal data from anyone, it collects no personal data from children, and there is
+  no content, account or communication feature directed at children. Parents and
+  guardians can let a child use it without a data-protection concern arising from the
+  application itself.
+</p>
+
+<h2 id="control">9. Your control and how to delete data</h2>
+<p>You are in control of everything the app stores, because all of it is on your own device:</p>
+<ul>
+  <li><strong>See it</strong> — open <code>%APPDATA%\pdf-reader</code> to read
+      <code>settings.json</code> and <code>session.json</code>; both are plain, readable text.</li>
+  <li><strong>Clear it</strong> — delete that folder. The app then starts with default
+      settings and no remembered tabs. Settings also offers a <em>Reset to defaults</em>
+      option that restores the original preferences.</li>
+  <li><strong>Uninstall</strong> — removing the app through Windows Settings, the
+      Microsoft Store, or the uninstaller removes the application. You may then delete
+      the folder above to remove the leftover preferences.</li>
+  <li><strong>Stop the one outbound action</strong> — simply do not press
+      <em>Translate</em>. Every other feature works fully offline.</li>
+</ul>
+<p>
+  Because we never receive your data, there is nothing for you to request from us and
+  nothing for us to delete on your behalf. There is no profile to close and no mailing
+  list to leave.
+</p>
+
+<h2 id="security">10. Security</h2>
+<p>
+  The app runs on your machine with your user account's permissions and does not
+  expose a service, port or account that could be reached from outside it. Documents
+  you open stay in your own storage; if a document is confidential, its confidentiality
+  is protected by the same file permissions and disk encryption that protect the rest
+  of your files.
+</p>
+<p>
+  Windows and macOS builds are released as signed packages. Where a package is signed
+  with a self-signed certificate, the certificate must be trusted on the machine before
+  the package can be installed — the package's integrity, not your data, is what that
+  signature protects.
+</p>
+
+<h2 id="changes">11. Changes to this policy</h2>
+<p>
+  If a future version of the app starts doing something this policy does not describe —
+  for example, adding an online feature — this page will be updated before that version
+  is released, and the effective date at the top will change. Because the app stores no
+  contact details, we cannot notify you individually; the current version of this policy
+  always lives at this address.
+</p>
+<p>
+  This policy applies to version 5.0.0 of AnsNew PDF Reader. Later releases within the
+  same behaviour remain covered by it.
+</p>
+
+<h2 id="contact">12. Contact</h2>
+<p>
+  Questions about this policy, or about privacy in the app, are welcome:
+</p>
+<ul>
+  <li><strong>Publisher</strong> — ANSNEW TECH.</li>
+  <li><strong>Developer</strong> — YAMiN HOSSAIN</li>
+  <li><strong>Issue tracker</strong> —
+      <a href="https://github.com/needyamin/pdf-reader/issues">github.com/needyamin/pdf-reader/issues</a></li>
+  <li><strong>Website</strong> —
+      <a href="https://needyamin.github.io">needyamin.github.io</a></li>
+  <li><strong>Source code</strong> —
+      <a href="https://github.com/needyamin/pdf-reader">github.com/needyamin/pdf-reader</a></li>
+</ul>
+<p>
+  The application is open source under the MIT licence, so the claims made here about
+  what it does — and does not do — can be checked directly in the code.
+</p>
+
+<footer>
+  <p>
+    Privacy policy for AnsNew PDF Reader · Effective 10 October 2026 · Applies to version 5.0.0.
+  </p>
+</footer>
+
+</main>
+</body>
+</html>

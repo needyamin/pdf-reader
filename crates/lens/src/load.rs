@@ -10,7 +10,11 @@ use std::path::{Path, PathBuf};
 use crate::dict::{Dictionaries, ParseError, parse_bangla, parse_e2b, parse_ipa};
 
 /// The files a dictionary directory must contain, in load order.
-pub const FILES: [&str; 3] = ["E2Bdatabase.json", "bangla_dictionary.txt", "cmudict-0.7b-ipa.txt"];
+pub const FILES: [&str; 3] = [
+    "E2Bdatabase.json",
+    "bangla_dictionary.txt",
+    "cmudict-0.7b-ipa.txt",
+];
 
 /// Why the dictionaries could not be loaded.
 #[derive(Debug, thiserror::Error)]
@@ -62,7 +66,9 @@ pub fn candidate_dirs(exe_dir: Option<PathBuf>) -> Vec<PathBuf> {
 
 /// The first candidate directory that actually holds the dictionaries.
 pub fn find_dir(exe_dir: Option<PathBuf>) -> Option<PathBuf> {
-    candidate_dirs(exe_dir).into_iter().find(|dir| files_present(dir))
+    candidate_dirs(exe_dir)
+        .into_iter()
+        .find(|dir| files_present(dir))
 }
 
 /// Whether every dictionary file exists in `dir`.

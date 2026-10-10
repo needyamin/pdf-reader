@@ -17,14 +17,31 @@ use crate::{binary_name, cargo, fetch_pdfium, host_triple, staged_dir};
 
 /// Product name shared by every package format.
 const PRODUCT: &str = "AnsNew PDF Reader";
-/// Publisher shared by every package format.
-const PUBLISHER: &str = "YAMiN HOSSAIN";
-/// MSIX identity name; per the Appx schema it must not contain spaces.
-const MSIX_IDENTITY: &str = "AnsNew.PDFReader";
-/// MSIX publisher; must match the signing certificate subject exactly.
-const MSIX_PUBLISHER: &str = "CN=YAMiN HOSSAIN";
-/// Subject name `signtool` matches against (the bare CN, no prefix).
-const MSIX_SIGN_SUBJECT: &str = "YAMiN HOSSAIN";
+/// Publisher shared by every package format (Store `PublisherDisplayName`).
+const PUBLISHER: &str = "ANSNEW TECH.";
+/// MSIX identity `Name` — the Store-assigned Package/Identity/Name from Partner
+/// Center. Per the Appx schema it must not contain spaces, and it MUST match the
+/// reserved identity exactly or Store ingestion rejects the upload with an
+/// "identity mismatch".
+const MSIX_IDENTITY: &str = "ANSNEWTECH.AnsNewTech.PDFReader";
+/// MSIX `Publisher` — the Store-assigned Package/Identity/Publisher. This is the
+/// reserved publisher identity (a GUID CN), not a human name; it MUST match the
+/// Partner Center value or submission fails.
+const MSIX_PUBLISHER: &str = "CN=087A9974-75CB-44FC-B893-8D3999E5E5E5";
+/// Store identity reference values from Partner Center (NOT part of the MSIX
+/// manifest; recorded here so Store-associated features can find them).
+///
+/// - Store ID (`9NDHCZFVQ4CG`): used in `ms-windows-store://pdp/?ProductId=…`
+///   deep links and the public Store listing URL once the app goes live.
+/// - Package Family Name (`ANSNEWTECH.AnsNewTech.PDFReader_7gnedkmjvvvj0`):
+///   used for app-launch and protocol deep links.
+/// - Package SID (`S-1-15-2-…`): needed only for Store-associated services
+///   (e.g. push/notification hubs, Xbox live); a plain PDF reader does not need
+///   it in the package.
+const STORE_ID: &str = "9NDHCZFVQ4CG";
+const PACKAGE_FAMILY_NAME: &str = "ANSNEWTECH.AnsNewTech.PDFReader_7gnedkmjvvvj0";
+const PACKAGE_SID: &str =
+    "S-1-15-2-4015345257-1907131891-3872909988-738859270-3564284423-3572508884-4075727998";
 /// Where every artifact lands.
 const DIST: &str = "target/dist";
 
@@ -168,9 +185,10 @@ pub fn inno() -> Result<PathBuf> {
 /// Build `pdf-reader-<version>-x64.msix` with `MakeAppx`, signing it by default.
 ///
 /// A classic Win32 desktop app ships as a full-trust MSIX. Signing uses a
-/// self-signed code-signing certificate (`CN=YAMiN HOSSAIN`) created in the
-/// current-user store and reused across runs; `signtool` signs straight from
-/// the store, so the private key never leaves it. Windows only installs the
+/// self-signed code-signing certificate carrying the Store publisher identity,
+/// created in the current-user store and reused across runs; `signtool` signs
+/// straight from the store, so the private key never leaves it. The certificate
+/// is selected by thumbprint — see [`signing_certificate`]. Windows only installs the
 /// package after that certificate is trusted, so the task prints the
 /// `certutil` command for it. `--no-sign` skips signing entirely.
 pub fn msix(no_sign: bool) -> Result<PathBuf> {
@@ -199,10 +217,7 @@ pub fn msix(no_sign: bool) -> Result<PathBuf> {
     );
     fs::write(&manifest, text).with_context(|| format!("writing {}", manifest.display()))?;
 
-    let out = std::path::absolute(root.join(format!(
-        "pdf-reader-{}-x64.msix",
-        stage.version
-    )))?;
+    let out = std::path::absolute(root.join(format!("pdf-reader-{}-x64.msix", stage.version)))?;
     if out.is_file() {
         fs::remove_file(&out)?;
     }
@@ -219,15 +234,17 @@ pub fn msix(no_sign: bool) -> Result<PathBuf> {
         bail!("makeappx pack failed");
     }
 
+    print_store_submission_hint(&out);
+
     if no_sign {
-        println!("MSIX package (unsigned): {}", out.display());
+        println!("  (unsigned — upload this .msix to Partner Center as-is)");
         return Ok(out);
     }
 
-    let cer = signing_certificate(&root)?;
+    let (cer, thumbprint) = signing_certificate(&root)?;
     let signtool = find_sdk_tool("signtool.exe")?;
     let status = Command::new(&signtool)
-        .args(["sign", "/fd", "SHA256", "/n", MSIX_SIGN_SUBJECT])
+        .args(["sign", "/fd", "SHA256", "/sha1", &thumbprint])
         .arg(&out)
         .status()
         .with_context(|| format!("running {}", signtool.display()))?;
@@ -235,10 +252,26 @@ pub fn msix(no_sign: bool) -> Result<PathBuf> {
         bail!("signtool failed (use `cargo xtask dist:msix -- --no-sign` to skip signing)");
     }
 
-    println!("MSIX package: {}", out.display());
+    print_store_submission_hint(&out);
     println!("A self-signed package only installs once its certificate is trusted:");
     println!("  certutil -user -addstore Root \"{}\"", cer.display());
     Ok(out)
+}
+
+/// Print the Store identity and the upload note after a successful pack.
+///
+/// The constants referenced here are the Partner Center values recorded above;
+/// printing them here keeps the `dist:msix` output self-documenting and stops
+/// the compiler warning about unused constants.
+fn print_store_submission_hint(out: &Path) {
+    println!("MSIX package: {}", out.display());
+    println!("Store submission identity:");
+    println!("  Store ID            : {STORE_ID}");
+    println!("  Package Family Name : {PACKAGE_FAMILY_NAME}");
+    println!("  Package SID         : {PACKAGE_SID}");
+    println!("  Store deep link     : ms-windows-store://pdp/?ProductId={STORE_ID}");
+    println!("Microsoft re-signs the package on ingestion, so the local signature");
+    println!("(or none, with --no-sign) is replaced by the Store publisher above.");
 }
 
 /// Ensure a Windows host, then build and stage everything the packagers need.
@@ -263,8 +296,7 @@ fn stage() -> Result<Stage> {
     fs::copy(&exe, dir.join(binary_name()))
         .with_context(|| format!("copying {}", exe.display()))?;
     let dll = staged_dir(&triple).join("pdfium.dll");
-    fs::copy(&dll, dir.join("pdfium.dll"))
-        .with_context(|| format!("copying {}", dll.display()))?;
+    fs::copy(&dll, dir.join("pdfium.dll")).with_context(|| format!("copying {}", dll.display()))?;
     fs::copy("LICENSE", dir.join("LICENSE")).context("copying LICENSE")?;
 
     // The offline word-lookup dictionaries ship beside the executable so the
@@ -428,13 +460,7 @@ fn find_makensis() -> Result<PathBuf> {
         "C:/Program Files/NSIS".to_string(),
     ];
     if let Some(local) = local_app_data() {
-        dirs.push(
-            local
-                .join("Programs")
-                .join("NSIS")
-                .display()
-                .to_string(),
-        );
+        dirs.push(local.join("Programs").join("NSIS").display().to_string());
     }
     for dir in dirs {
         let candidate = PathBuf::from(&dir).join("makensis.exe");
@@ -470,7 +496,9 @@ fn find_iscc() -> Result<PathBuf> {
             return Ok(candidate);
         }
     }
-    bail!("ISCC.exe not found.\nInstall Inno Setup with:\n  winget install -e --id JRSoftware.InnoSetup")
+    bail!(
+        "ISCC.exe not found.\nInstall Inno Setup with:\n  winget install -e --id JRSoftware.InnoSetup"
+    )
 }
 
 /// Locate a Windows SDK tool (makeappx, signtool) across installed kit versions.
@@ -501,7 +529,9 @@ fn find_sdk_tool(name: &str) -> Result<PathBuf> {
         }
     }
 
-    bail!("Windows SDK tool {name} not found.\nInstall the Windows SDK with:\n  winget install -e --id Microsoft.WindowsSDK.10.0.26100")
+    bail!(
+        "Windows SDK tool {name} not found.\nInstall the Windows SDK with:\n  winget install -e --id Microsoft.WindowsSDK.10.0.26100"
+    )
 }
 
 /// Create (or reuse) the self-signed code-signing certificate and export the
@@ -510,26 +540,49 @@ fn find_sdk_tool(name: &str) -> Result<PathBuf> {
 /// The certificate lives in `Cert:\CurrentUser\My` under the MSIX publisher
 /// subject and is reused across runs; the private key never leaves the store,
 /// because `signtool` signs from there by subject name.
-fn signing_certificate(root: &Path) -> Result<PathBuf> {
+fn signing_certificate(root: &Path) -> Result<(PathBuf, String)> {
     let cer = root.join("pdf-reader-sign.cer");
     let script = root.join("make-signing-cert.ps1");
-    let text = render(SIGN_CERT_SCRIPT, &[("MSIX_PUBLISHER", MSIX_PUBLISHER.to_string())]);
+    let text = render(
+        SIGN_CERT_SCRIPT,
+        &[("MSIX_PUBLISHER", MSIX_PUBLISHER.to_string())],
+    );
     fs::write(&script, text).with_context(|| format!("writing {}", script.display()))?;
 
-    let status = Command::new("powershell")
+    // Capture the output rather than letting it through: the script reports the
+    // thumbprint of the certificate it created or reused, and that is what
+    // selects the certificate for signing.
+    let output = Command::new("powershell")
         .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
         .arg(&script)
         .arg(&cer)
-        .status()
-        .context("running powershell for the signing certificate")?;
-    if !status.success() {
-        bail!("creating the self-signed signing certificate failed");
+        .output()
+        .context("running the shell host for the signing certificate")?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success() {
+        bail!("creating the self-signed signing certificate failed: {stderr}");
     }
     if !cer.is_file() {
         bail!("signing certificate export was not produced");
     }
 
-    Ok(cer)
+    // `signtool` is given this rather than the subject. `/n` matches the *bare*
+    // common name, and this certificate's common name is the Store publisher
+    // GUID — passing the full `CN=…` distinguished name finds nothing at all,
+    // which is how signing stopped working. A thumbprint is exact, and cannot
+    // drift from the certificate the script just produced.
+    let thumbprint = stdout
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("created certificate ")
+                .or_else(|| line.strip_prefix("reused certificate "))
+        })
+        .map(|token| token.trim().to_ascii_uppercase())
+        .filter(|token| token.len() == 40 && token.chars().all(|c| c.is_ascii_hexdigit()))
+        .with_context(|| format!("no thumbprint in the certificate script output: {stdout}"))?;
+
+    Ok((cer, thumbprint))
 }
 
 /// Scale `assets/icon.png` to every PNG asset the MSIX manifest references.
@@ -543,7 +596,6 @@ fn write_msix_assets(assets: &Path) -> Result<()> {
     }
     Ok(())
 }
-
 
 /// NSIS script for the setup installer.
 const NSIS_TEMPLATE: &str = r#"

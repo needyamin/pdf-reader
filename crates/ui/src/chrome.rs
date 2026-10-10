@@ -4,8 +4,10 @@
 //! domain commands and leave document state, rendering, and persistence to the
 //! application shell.
 
+use std::sync::Arc;
+
 use egui::{
-    Align2, Color32, FontId, Id, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, Ui, Vec2,
+    Align2, Color32, FontId, Galley, Id, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, Ui, Vec2,
     ViewportCommand, containers::menu::SubMenuButton,
 };
 use pdfreader_core::{
@@ -28,6 +30,98 @@ pub const STATUSBAR_HEIGHT: f32 = 28.0;
 /// Width of the right-hand tools rail.
 pub const TOOLS_RAIL_WIDTH: f32 = 44.0;
 
+// --- Sidebar spacing ------------------------------------------------------
+//
+// One scale for every sidebar surface, so the panels line up with each other
+// and no label ends up flush against an edge. Before this each panel picked its
+// own numbers — margins of 4, 6, 8 and 10, and gaps of 2, 3 and 6 — and the
+// search panel's text had no horizontal padding at all while its query box had
+// ten.
+
+/// Padding left and right of a sidebar panel's content.
+pub const SIDEBAR_PAD_X: f32 = 12.0;
+/// Padding above and below a sidebar panel's content.
+pub const SIDEBAR_PAD_Y: f32 = 8.0;
+/// Gap between stacked items in a sidebar panel.
+pub const SIDEBAR_GAP: f32 = 4.0;
+/// Padding between a clickable row's edge and its text.
+pub const ROW_PAD_X: f32 = 10.0;
+/// Padding above a row's first line and below its last.
+pub const ROW_PAD_Y: f32 = 7.0;
+/// Gap between the two lines of a row.
+pub const ROW_LINE_GAP: f32 = 4.0;
+
+/// Font size of a sidebar row's title line.
+const ROW_TITLE_PT: f32 = 11.5;
+/// Font size of a sidebar row's detail line.
+const ROW_DETAIL_PT: f32 = 10.5;
+
+/// A sidebar panel's content margin.
+pub const fn sidebar_margin() -> egui::Margin {
+    egui::Margin::symmetric(SIDEBAR_PAD_X as i8, SIDEBAR_PAD_Y as i8)
+}
+
+/// A sidebar list's margin.
+///
+/// The panel padding less the row's own inset, so a row's highlight sits the
+/// same distance from the panel edge as the panel's own text does.
+pub const fn sidebar_list_margin() -> egui::Margin {
+    egui::Margin::symmetric((SIDEBAR_PAD_X - SIDEBAR_GAP) as i8, SIDEBAR_GAP as i8)
+}
+
+/// A sidebar note's margin: full horizontal padding, a gap above and below.
+pub const fn sidebar_note_margin() -> egui::Margin {
+    egui::Margin::symmetric(SIDEBAR_PAD_X as i8, SIDEBAR_GAP as i8)
+}
+
+/// Lay out the two lines of a sidebar row and report the height the row needs.
+///
+/// The height is *measured* from the laid-out galleys rather than fixed. A
+/// hard-coded height with hand-placed baselines left no room below the second
+/// line: at 34 px for a 11.5 pt title and a 10.5 pt detail, the detail ran three
+/// tenths of a point past the row and its descenders were clipped by the row's
+/// own clip rectangle. Measuring means the padding is what is asked for, not
+/// whatever is left over.
+fn two_line_row(
+    ui: &Ui,
+    title: &str,
+    detail: &str,
+    title_color: Color32,
+    detail_color: Color32,
+) -> (Arc<Galley>, Arc<Galley>, f32) {
+    let title = ui.painter().layout_no_wrap(
+        title.to_owned(),
+        FontId::proportional(ROW_TITLE_PT),
+        title_color,
+    );
+    let detail = ui.painter().layout_no_wrap(
+        detail.to_owned(),
+        FontId::proportional(ROW_DETAIL_PT),
+        detail_color,
+    );
+    let height = ROW_PAD_Y * 2.0 + title.size().y + ROW_LINE_GAP + detail.size().y;
+    (title, detail, height)
+}
+
+/// Paint the two lines of a sidebar row inside `rect`, at the row's padding.
+///
+/// The colours are the ones the galleys were laid out with; `Painter::galley`
+/// wants a fallback for a galley that carries none, which these never do.
+fn paint_two_line_row(
+    ui: &Ui,
+    rect: Rect,
+    title: Arc<Galley>,
+    detail: Arc<Galley>,
+    title_color: Color32,
+    detail_color: Color32,
+) {
+    let painter = ui.painter().with_clip_rect(rect);
+    let left = rect.min.x + ROW_PAD_X;
+    let detail_top = rect.min.y + ROW_PAD_Y + title.size().y + ROW_LINE_GAP;
+    painter.galley(egui::pos2(left, rect.min.y + ROW_PAD_Y), title, title_color);
+    painter.galley(egui::pos2(left, detail_top), detail, detail_color);
+}
+
 /// Font families offered for form text (Settings → Text), as `(family, label)`.
 ///
 /// The empty family means egui's default proportional face. The names match the
@@ -44,6 +138,23 @@ pub const FORM_FONTS: &[(&str, &str)] = &[
     ("NotoSansTamil-Regular", "Tamil"),
     ("NotoSansThai-Regular", "Thai"),
 ];
+
+/// The font used for text typed into form fields.
+///
+/// Bundled because it travels together: the Forms panel and the quick bar above
+/// the page both edit it, and two copies of four loose arguments were easy to
+/// get out of step.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct TextStyle<'a> {
+    /// Named font family, or empty for the default proportional face.
+    pub family: &'a str,
+    /// Point size, or `0.0` to fit the field's own height.
+    pub size: f32,
+    /// Whether the text is drawn heavier.
+    pub bold: bool,
+    /// RGB ink.
+    pub color: [u8; 3],
+}
 
 const BUTTON_RADIUS: u8 = 7;
 const RAIL_RADIUS: u8 = 2;
@@ -92,6 +203,8 @@ pub enum Icon {
     More,
     Undo,
     Redo,
+    /// A sticky-note / comment glyph, used to headline the annotate toolbar.
+    Annotation,
 }
 
 /// The Edit menu: the annotation history, enabled only when there is history.
@@ -548,8 +661,14 @@ pub fn toolbar(
                     // caption and the toolbar keeps the space a separate
                     // "Find" label used to take.
                     let width = if compact { 186.0 } else { 240.0 };
-                    let outcome =
-                        search_field(ui, palette, search_query, width, "Search document", focus_search);
+                    let outcome = search_field(
+                        ui,
+                        palette,
+                        search_query,
+                        width,
+                        "Search document",
+                        focus_search,
+                    );
                     if outcome.submitted {
                         commands.push(Command::Search(search_query.trim().to_owned()));
                     }
@@ -933,8 +1052,11 @@ pub fn sidebar_tabs(ui: &mut Ui, state: &AppState, palette: &Palette) -> Vec<Com
     let mut commands = Vec::new();
     egui::Frame::new()
         .fill(palette.panel_bg)
-        .inner_margin(egui::Margin::symmetric(10, 8))
+        .inner_margin(sidebar_margin())
         .show(ui, |ui| {
+            // One row, as before: the buttons size to their content and the
+            // strip scrolls rather than wraps when the sidebar is dragged very
+            // narrow.
             ui.horizontal(|ui| {
                 for (id, label, icon) in available_sidebar_tabs(state) {
                     if sidebar_tab_button(ui, palette, label, icon, state.sidebar_tab == id) {
@@ -963,10 +1085,9 @@ pub fn outline_tree(ui: &mut Ui, palette: &Palette, outline: &Outline) -> Vec<Co
         .auto_shrink([false, false])
         .show(ui, |ui| {
             egui::Frame::new()
-                .inner_margin(egui::Margin::symmetric(10, 6))
+                .inner_margin(sidebar_margin())
                 .show(ui, |ui| {
-                    // A little vertical rhythm between outline entries.
-                    ui.spacing_mut().item_spacing.y = 3.0;
+                    ui.spacing_mut().item_spacing.y = SIDEBAR_GAP;
                     let mut next_id = 0u64;
                     for node in &outline.root {
                         show_outline_node(ui, palette, node, &mut next_id, &mut commands, 0);
@@ -1003,7 +1124,12 @@ pub const ANNOTATION_BAR_HEIGHT: f32 = 30.0;
 /// Rendered as a thin row above the canvas. Text labels rather than icons —
 /// eight hand-drawn glyphs for tools this specialised would cost more than the
 /// words, and the strip only exists while a document is open.
-pub fn annotation_bar(ui: &mut Ui, palette: &Palette, state: &AppState) -> Vec<Command> {
+pub fn annotation_bar(
+    ui: &mut Ui,
+    palette: &Palette,
+    state: &AppState,
+    style: TextStyle<'_>,
+) -> Vec<Command> {
     let mut commands = Vec::new();
     egui::Frame::new()
         .fill(palette.panel_bg)
@@ -1011,7 +1137,21 @@ pub fn annotation_bar(ui: &mut Ui, palette: &Palette, state: &AppState) -> Vec<C
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.set_min_height(ANNOTATION_BAR_HEIGHT - 4.0);
-                ui.label(RichText::new("Annotate").color(palette.text_dim).size(11.0));
+                // Boxed "Annotate" header chip: the label inside a
+                // palette-coloured frame, matching the shared chrome style.
+                let chip = egui::Frame::new()
+                    .fill(palette.surface)
+                    .stroke(egui::Stroke::new(1.0, palette.border))
+                    .corner_radius(palette.radius.max(4.0))
+                    .inner_margin(egui::Margin::symmetric(7, 3));
+                chip.show(ui, |ui| {
+                    ui.label(
+                        RichText::new("Annotate")
+                            .color(palette.text)
+                            .size(11.0)
+                            .strong(),
+                    );
+                });
                 for tool in Tool::ALL {
                     let active = state.tool == tool;
                     let label = RichText::new(tool.label()).size(11.5).color(if active {
@@ -1030,6 +1170,14 @@ pub fn annotation_bar(ui: &mut Ui, palette: &Palette, state: &AppState) -> Vec<C
                         commands.push(Command::SetTool(tool));
                     }
                 }
+                // Quick controls for the text being typed, sitting right after
+                // the text tools. Shown only while a field is open, so the row
+                // does not carry controls that do nothing the rest of the time.
+                if editing_text_field(state) {
+                    ui.separator();
+                    quick_text_style(ui, palette, style, &mut commands);
+                }
+
                 ui.separator();
                 let undoable = state.active().is_some_and(|tab| !tab.undo_stack.is_empty());
                 let redoable = state.active().is_some_and(|tab| !tab.redo_stack.is_empty());
@@ -1069,8 +1217,104 @@ pub fn annotation_bar(ui: &mut Ui, palette: &Palette, state: &AppState) -> Vec<C
     commands
 }
 
-/// Height of one row in the Comments panel.
-const COMMENT_ROW_HEIGHT: f32 = 34.0;
+/// Whether a text field is open for typing.
+///
+/// The quick text controls belong on screen exactly when there is text to
+/// affect: a field the user can type into is selected.
+fn editing_text_field(state: &AppState) -> bool {
+    let Some(tab) = state.active() else {
+        return false;
+    };
+    let Some(id) = tab.view.selected_field else {
+        return false;
+    };
+    tab.form
+        .as_ref()
+        .and_then(|form| form.field(id))
+        .is_some_and(|field| field.kind == FormFieldType::Text && field.is_editable())
+}
+
+/// Face, size, weight and ink for the text being typed.
+///
+/// The same settings the Forms panel edits, placed next to the page so a face
+/// that cannot show the script being typed, or a size too small to read, is one
+/// click away rather than a trip to the sidebar.
+fn quick_text_style(
+    ui: &mut Ui,
+    palette: &Palette,
+    style: TextStyle<'_>,
+    commands: &mut Vec<Command>,
+) {
+    let chip = egui::Frame::new()
+        .fill(palette.surface)
+        .stroke(egui::Stroke::new(1.0, palette.border))
+        .corner_radius(palette.radius.max(4.0))
+        .inner_margin(egui::Margin::symmetric(7, 3));
+    chip.show(ui, |ui| {
+        ui.label(
+            RichText::new("Text")
+                .color(palette.text)
+                .size(11.0)
+                .strong(),
+        );
+    });
+
+    // The face picker is the widest control here, so it is the one that gives
+    // way first when the window is too narrow for the whole group.
+    if ui.available_width() > 300.0 {
+        let label = FORM_FONTS
+            .iter()
+            .find(|(name, _)| *name == style.family)
+            .map_or("Default", |(_, label)| *label);
+        egui::ComboBox::from_id_salt("quick-form-font")
+            .selected_text(RichText::new(label).size(11.5).color(palette.text))
+            .width(116.0)
+            .show_ui(ui, |ui| {
+                for &(name, text) in FORM_FONTS {
+                    if ui.selectable_label(style.family == name, text).clicked() {
+                        commands.push(Command::SetFormFont(name.to_owned()));
+                    }
+                }
+            });
+    }
+
+    let mut size = style.size;
+    let response = ui
+        .add(
+            egui::DragValue::new(&mut size)
+                .range(0.0..=48.0)
+                .speed(0.25)
+                .fixed_decimals(1)
+                .custom_formatter(|value, _| {
+                    if value <= 0.0 {
+                        "Auto".to_owned()
+                    } else {
+                        format!("{value:.1}")
+                    }
+                }),
+        )
+        .on_hover_text("Size for typed text — Auto fits each field's own height");
+    if response.changed() {
+        commands.push(Command::SetFormFontSize(size));
+    }
+
+    if ui
+        .selectable_label(style.bold, RichText::new("B").strong())
+        .on_hover_text("Bold")
+        .clicked()
+    {
+        commands.push(Command::SetFormFontBold(!style.bold));
+    }
+
+    let mut rgb = style.color;
+    if ui
+        .color_edit_button_srgb(&mut rgb)
+        .on_hover_text("Ink for typed text")
+        .changed()
+    {
+        commands.push(Command::SetFormFontColor(rgb[0], rgb[1], rgb[2]));
+    }
+}
 
 /// The Comments panel: every annotation, clickable to jump, editable, deletable.
 ///
@@ -1097,7 +1341,7 @@ pub fn comments_panel(
     }
 
     egui::Frame::new()
-        .inner_margin(egui::Margin::symmetric(10, 6))
+        .inner_margin(sidebar_margin())
         .show(ui, |ui| {
             let label = if annotations.len() == 1 {
                 "1 annotation".to_string()
@@ -1112,9 +1356,9 @@ pub fn comments_panel(
         .auto_shrink([false, false])
         .show(ui, |ui| {
             egui::Frame::new()
-                .inner_margin(egui::Margin::symmetric(6, 4))
+                .inner_margin(sidebar_list_margin())
                 .show(ui, |ui| {
-                    ui.spacing_mut().item_spacing.y = 2.0;
+                    ui.spacing_mut().item_spacing.y = SIDEBAR_GAP;
                     for annotation in annotations {
                         let is_selected = selected == Some(annotation.id);
                         let response = show_comment_row(ui, palette, annotation, is_selected);
@@ -1144,9 +1388,17 @@ fn show_comment_row(
     annotation: &AnnotationInfo,
     is_selected: bool,
 ) -> egui::Response {
+    let title = format!("{} · p.{}", annotation.kind.label(), annotation.id.page + 1);
+    let preview = if annotation.display_contents().is_empty() {
+        "—".to_string()
+    } else {
+        truncate(annotation.display_contents(), 30)
+    };
+    let (title, detail, height) =
+        two_line_row(ui, &title, &preview, palette.text, palette.text_dim);
+
     let width = ui.available_width();
-    let (rect, response) =
-        ui.allocate_exact_size(Vec2::new(width, COMMENT_ROW_HEIGHT), Sense::click());
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, height), Sense::click());
 
     if !ui.is_rect_visible(rect) {
         return response;
@@ -1159,29 +1411,8 @@ fn show_comment_row(
     } else {
         Color32::TRANSPARENT
     };
-    ui.painter().rect_filled(rect.expand(1.0), 4.0, fill);
-
-    let painter = ui.painter().with_clip_rect(rect);
-    let left = rect.min.x + 8.0;
-    painter.text(
-        egui::pos2(left, rect.min.y + 4.0),
-        Align2::LEFT_TOP,
-        format!("{} · p.{}", annotation.kind.label(), annotation.id.page + 1),
-        FontId::proportional(11.5),
-        palette.text,
-    );
-    let preview = if annotation.display_contents().is_empty() {
-        "—".to_string()
-    } else {
-        truncate(annotation.display_contents(), 30)
-    };
-    painter.text(
-        egui::pos2(left, rect.min.y + 20.0),
-        Align2::LEFT_TOP,
-        preview,
-        FontId::proportional(10.5),
-        palette.text_dim,
-    );
+    ui.painter().rect_filled(rect, 4.0, fill);
+    paint_two_line_row(ui, rect, title, detail, palette.text, palette.text_dim);
     response
 }
 
@@ -1197,7 +1428,7 @@ fn draw_comment_editor(
     commands: &mut Vec<Command>,
 ) {
     egui::Frame::new()
-        .inner_margin(egui::Margin::symmetric(8, 4))
+        .inner_margin(sidebar_list_margin())
         .show(ui, |ui| {
             let editable = matches!(
                 annotation.kind,
@@ -1247,9 +1478,6 @@ fn draw_comment_editor(
         });
 }
 
-/// Height of one row in the Forms panel: field name over type and value.
-const FORM_ROW_HEIGHT: f32 = 36.0;
-
 /// egui memory key for one field's in-progress text draft.
 fn draft_key(doc: DocumentId, id: FieldId) -> Id {
     Id::new(("form-draft", doc.raw(), id.page, id.annot_index))
@@ -1268,7 +1496,7 @@ fn draw_field_editor(
     }
 
     egui::Frame::new()
-        .inner_margin(egui::Margin::symmetric(8, 4))
+        .inner_margin(sidebar_list_margin())
         .show(ui, |ui| {
             match field.kind {
                 FormFieldType::Text => {
@@ -1397,8 +1625,7 @@ pub fn forms_panel(
     doc: DocumentId,
     form: &FormInfo,
     selected: Option<FieldId>,
-    form_font: &str,
-    form_font_size: f32,
+    style: TextStyle<'_>,
 ) -> Vec<Command> {
     let mut commands = Vec::new();
 
@@ -1414,7 +1641,7 @@ pub fn forms_panel(
     }
 
     egui::Frame::new()
-        .inner_margin(egui::Margin::symmetric(10, 6))
+        .inner_margin(sidebar_margin())
         .show(ui, |ui| {
             // The total is every widget; "to fill" counts only the ones the
             // reader can actually write, so the note below explains the gap.
@@ -1427,56 +1654,82 @@ pub fn forms_panel(
             ui.label(RichText::new(summary).color(palette.text_dim).size(11.0));
         });
 
-    // Some widget kinds have no write path in the PDF binding at all. Saying so
-    // up front beats a click that does nothing, or an error after one.
-    let unwritable = form.fields.iter().any(|field| {
-        !field.read_only
-            && matches!(
-                field.kind,
-                FormFieldType::RadioButton | FormFieldType::ComboBox | FormFieldType::ListBox
-            )
-    });
+    // Dropdowns and lists have no write path in the PDF binding at all. Saying
+    // so up front beats a click that does nothing, or an error after one.
+    let unwritable = form
+        .fields
+        .iter()
+        .any(|field| !field.read_only && field.kind.has_options());
     if unwritable {
-        let note = if form.kind.is_xfa() {
-            "This is an XFA form. Radio buttons and dropdowns cannot be filled here — the PDF \
-             library has no way to write their values, so those fields are not offered. Fill \
-             them in another viewer; text fields and checkboxes work."
-        } else {
-            "Radio buttons and dropdowns cannot be filled here — the PDF library has no way to \
-             write their values, so those fields are not offered. Fill them in another viewer; \
-             text fields and checkboxes work."
-        };
         egui::Frame::new()
-            .inner_margin(egui::Margin::symmetric(10, 4))
+            .inner_margin(sidebar_note_margin())
             .show(ui, |ui| {
-                ui.label(RichText::new(note).color(palette.text_dim).size(10.5));
+                ui.label(
+                    RichText::new(
+                        "Dropdowns and lists cannot be filled here — the PDF library carries no \
+                         setter for them, so those fields are not offered. Fill them in another \
+                         viewer; text, checkbox and radio fields work here.",
+                    )
+                    .color(palette.text_dim)
+                    .size(10.5),
+                );
+            });
+    }
+
+    // A radio group may keep its value on a parent dictionary the binding
+    // cannot reach. Selecting one still works: the reader draws the choice into
+    // the page, so it shows on screen, prints, and is saved with the document.
+    let radios = form
+        .fields
+        .iter()
+        .any(|field| !field.read_only && field.kind == FormFieldType::RadioButton);
+    if radios {
+        egui::Frame::new()
+            .inner_margin(sidebar_note_margin())
+            .show(ui, |ui| {
+                ui.label(
+                    RichText::new("Click a radio to select it.")
+                        .color(palette.text_dim)
+                        .size(10.5),
+                );
             });
     }
 
     // Font controls for filling: the face and size used for typed values, so a
     // script the form's own font lacks (Bengali) and a hard-coded size that is
-    // too small are both fixable without leaving the panel.
+    // too small are both fixable without leaving the panel. Titled and explained
+    // because it is the one control here that changes every field at once.
     egui::Frame::new()
-        .inner_margin(egui::Margin::symmetric(10, 6))
+        .inner_margin(sidebar_margin())
         .show(ui, |ui| {
-            ui.label(RichText::new("Form text").color(palette.text_dim).size(11.0));
-            ui.add_space(4.0);
+            ui.label(
+                RichText::new("Typing font")
+                    .strong()
+                    .color(palette.text)
+                    .size(11.5),
+            );
+            ui.label(
+                RichText::new("Face and size for text typed into fields.")
+                    .color(palette.text_dim)
+                    .size(10.5),
+            );
+            ui.add_space(SIDEBAR_GAP + 2.0);
             let label = FORM_FONTS
                 .iter()
-                .find(|(name, _)| *name == form_font)
+                .find(|(name, _)| *name == style.family)
                 .map_or("Default", |(_, label)| *label);
             egui::ComboBox::from_id_salt("sidebar-form-font")
                 .selected_text(label)
                 .width(ui.available_width())
                 .show_ui(ui, |ui| {
                     for &(name, text) in FORM_FONTS {
-                        if ui.selectable_label(form_font == name, text).clicked() {
+                        if ui.selectable_label(style.family == name, text).clicked() {
                             commands.push(Command::SetFormFont(name.to_owned()));
                         }
                     }
                 });
-            ui.add_space(4.0);
-            let mut size = form_font_size;
+            ui.add_space(SIDEBAR_GAP);
+            let mut size = style.size;
             ui.add(
                 egui::Slider::new(&mut size, 0.0..=48.0)
                     .step_by(0.5)
@@ -1488,9 +1741,28 @@ pub fn forms_panel(
                         }
                     }),
             );
-            if (size - form_font_size).abs() > f32::EPSILON {
+            if (size - style.size).abs() > f32::EPSILON {
                 commands.push(Command::SetFormFontSize(size));
             }
+
+            // Ink and weight for the typed values. A form's own colour can be
+            // too pale to read once the value is drawn at a legible size.
+            ui.add_space(SIDEBAR_GAP);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Colour").color(palette.text_dim).size(10.5));
+                let mut rgb = style.color;
+                if ui.color_edit_button_srgb(&mut rgb).changed() {
+                    commands.push(Command::SetFormFontColor(rgb[0], rgb[1], rgb[2]));
+                }
+                ui.add_space(SIDEBAR_GAP + 2.0);
+                if ui
+                    .selectable_label(style.bold, RichText::new("B").strong())
+                    .on_hover_text("Bold")
+                    .clicked()
+                {
+                    commands.push(Command::SetFormFontBold(!style.bold));
+                }
+            });
         });
     ui.separator();
 
@@ -1498,9 +1770,9 @@ pub fn forms_panel(
         .auto_shrink([false, false])
         .show(ui, |ui| {
             egui::Frame::new()
-                .inner_margin(egui::Margin::symmetric(6, 4))
+                .inner_margin(sidebar_list_margin())
                 .show(ui, |ui| {
-                    ui.spacing_mut().item_spacing.y = 2.0;
+                    ui.spacing_mut().item_spacing.y = SIDEBAR_GAP;
                     for field in &form.fields {
                         let is_selected = selected == Some(field.id);
                         let response = show_form_row(ui, palette, field, is_selected);
@@ -1538,34 +1810,6 @@ fn show_form_row(
     field: &FormFieldInfo,
     is_selected: bool,
 ) -> egui::Response {
-    let width = ui.available_width();
-    let (rect, response) =
-        ui.allocate_exact_size(Vec2::new(width, FORM_ROW_HEIGHT), Sense::click());
-
-    if !ui.is_rect_visible(rect) {
-        return response;
-    }
-
-    let fill = if is_selected {
-        palette.accent_soft
-    } else if response.hovered() {
-        palette.surface_hover
-    } else {
-        Color32::TRANSPARENT
-    };
-    ui.painter().rect_filled(rect.expand(1.0), 4.0, fill);
-
-    let painter = ui.painter().with_clip_rect(rect);
-    let left = rect.min.x + 8.0;
-
-    painter.text(
-        egui::pos2(left, rect.min.y + 4.0),
-        Align2::LEFT_TOP,
-        short_field_name(field.display_name()),
-        FontId::proportional(11.5),
-        palette.text,
-    );
-
     // Second line: what kind of field it is, and what it currently holds.
     // A blank field shows a dash rather than nothing, so the column does not
     // collapse and look like a rendering bug.
@@ -1590,14 +1834,25 @@ fn show_form_row(
         detail
     };
 
-    painter.text(
-        egui::pos2(left, rect.min.y + 20.0),
-        Align2::LEFT_TOP,
-        detail,
-        FontId::proportional(10.5),
-        palette.text_dim,
-    );
+    let title = short_field_name(field.display_name());
+    let (title, detail, height) = two_line_row(ui, &title, &detail, palette.text, palette.text_dim);
 
+    let width = ui.available_width();
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, height), Sense::click());
+
+    if !ui.is_rect_visible(rect) {
+        return response;
+    }
+
+    let fill = if is_selected {
+        palette.accent_soft
+    } else if response.hovered() {
+        palette.surface_hover
+    } else {
+        Color32::TRANSPARENT
+    };
+    ui.painter().rect_filled(rect, 4.0, fill);
+    paint_two_line_row(ui, rect, title, detail, palette.text, palette.text_dim);
     response
 }
 
@@ -1731,9 +1986,7 @@ fn menu_button(ui: &mut Ui, palette: &Palette, label: &str, add_contents: impl F
 /// A top-level menu-bar item that performs an action directly, styled like the
 /// dropdown labels beside it (dim text, no frame until hover).
 fn menu_action(ui: &mut Ui, palette: &Palette, label: &str) -> egui::Response {
-    ui.add(
-        egui::Button::new(RichText::new(label).color(palette.text_dim).size(11.5)).frame(false),
-    )
+    ui.add(egui::Button::new(RichText::new(label).color(palette.text_dim).size(11.5)).frame(false))
 }
 
 fn menu_item(ui: &mut Ui, label: &str, shortcut: &str) -> egui::Response {
@@ -1835,29 +2088,54 @@ fn sidebar_tab_button(
     icon: Icon,
     active: bool,
 ) -> bool {
-    let response = ui.add(
-        egui::Button::new(
-            RichText::new(format!("  {label}"))
-                .size(11.0)
-                .color(palette.text),
-        )
-        .fill(if active {
-            palette.accent_soft
-        } else {
-            Color32::TRANSPARENT
-        })
-        .corner_radius(6.0)
-        .min_size(Vec2::new(66.0, 28.0)),
-    );
+    // Build the button from a measured icon+label layout rather than the old
+    // trick of drawing the icon at a fixed offset and padding the label with
+    // spaces. A measured width gives every tab the same icon-to-text gap and a
+    // consistent padding, and the button sizes to its content so the strip can
+    // wrap cleanly when the sidebar is narrowed.
+    let icon_slot = 16.0;
+    let gap = 5.0;
+    let hpad = 8.0;
+    let height = 28.0;
+
+    let font_id = FontId::proportional(11.0);
+    let text_w = ui
+        .painter()
+        .layout_no_wrap(label.to_owned(), font_id.clone(), Color32::WHITE)
+        .rect
+        .width();
+    // Never ask for more than the strip can give; the label is short enough
+    // that this only kicks in on a deliberately crushed sidebar.
+    let width = (hpad + icon_slot + gap + text_w + hpad).min(ui.available_width());
+
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, height), Sense::click());
+    let painter = ui.painter();
+    let fill = if active {
+        palette.accent_soft
+    } else if response.hovered() {
+        palette.surface_hover
+    } else {
+        Color32::TRANSPARENT
+    };
+    if fill != Color32::TRANSPARENT {
+        painter.rect_filled(rect, 6.0, fill);
+    }
     draw_icon(
-        ui.painter(),
-        response.rect.left_center() + Vec2::new(12.0, 0.0),
+        painter,
+        rect.min + Vec2::new(hpad + icon_slot / 2.0, height / 2.0),
         icon,
         if active {
             palette.accent
         } else {
             palette.text_dim
         },
+    );
+    painter.text(
+        rect.min + Vec2::new(hpad + icon_slot + gap, height / 2.0),
+        Align2::LEFT_CENTER,
+        label,
+        font_id,
+        if active { palette.accent } else { palette.text },
     );
     response.on_hover_text(label).clicked()
 }
@@ -1884,9 +2162,9 @@ fn empty_sidebar(ui: &mut Ui, palette: &Palette, icon: Icon, title: &str, body: 
         ui.painter()
             .circle_filled(rect.center(), 21.0, palette.surface);
         draw_icon(ui.painter(), rect.center(), icon, palette.accent);
-        ui.add_space(10.0);
+        ui.add_space(SIDEBAR_PAD_Y + SIDEBAR_GAP);
         ui.label(RichText::new(title).strong().color(palette.text).size(12.0));
-        ui.add_space(4.0);
+        ui.add_space(SIDEBAR_GAP);
         ui.label(RichText::new(body).color(palette.text_dim).size(11.0));
     });
 }
@@ -2196,6 +2474,20 @@ fn draw_icon(painter: &egui::Painter, center: Pos2, icon: Icon, color: Color32) 
                 painter.circle_filled(c + Vec2::new(x, 0.0), 1.5, color);
             }
         }
+        Icon::Annotation => {
+            // A sticky-note / speech-bubble glyph: rounded square with a small
+            // tail at the bottom-left, the conventional "note" mark.
+            let r = Rect::from_center_size(c + Vec2::new(0.0, -1.0), Vec2::new(11.0, 10.0));
+            painter.rect_stroke(r, 2.6, stroke, StrokeKind::Inside);
+            painter.line(
+                vec![
+                    c + Vec2::new(-5.5, 4.0),
+                    c + Vec2::new(-5.5, 7.5),
+                    c + Vec2::new(-2.0, 4.0),
+                ],
+                stroke,
+            );
+        }
     }
 }
 
@@ -2211,6 +2503,56 @@ mod tests {
         Command, Document, DocumentId, Effect, Outline, PageGeometry, Rotation, Store, ThemeId,
     };
     use std::path::PathBuf;
+
+    /// A sidebar row must fit both of its lines with the padding it asks for.
+    ///
+    /// The row height is measured from the galleys, so the contract is that
+    /// padding plus both lines plus the gap adds up to exactly the height — and
+    /// that the second line therefore ends above the row's bottom edge rather
+    /// than being clipped by it.
+    #[test]
+    fn a_sidebar_row_fits_its_lines_and_its_padding() {
+        use super::{ROW_LINE_GAP, ROW_PAD_Y, two_line_row};
+
+        let ctx = Context::default();
+        let raw = RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(280.0, 120.0),
+            )),
+            ..Default::default()
+        };
+        let mut measured = None;
+        let mut output = ctx.run_ui(raw, |ui| {
+            let (title, detail, height) = two_line_row(
+                ui,
+                "FullName",
+                "Text · Jane Doe",
+                egui::Color32::WHITE,
+                egui::Color32::GRAY,
+            );
+            measured = Some((title.size().y, detail.size().y, height));
+        });
+        output.textures_delta.clear();
+
+        let (title, detail, height) = measured.expect("a frame ran");
+        assert!(
+            title > 0.0 && detail > 0.0,
+            "both lines must have been laid out"
+        );
+        let expected = ROW_PAD_Y * 2.0 + title + ROW_LINE_GAP + detail;
+        assert!(
+            (height - expected).abs() < 1e-3,
+            "the row must be its padding plus its content: {height} vs {expected}"
+        );
+        // The bottom edge has to clear the detail line, which is what a fixed
+        // row height got wrong.
+        let detail_bottom = ROW_PAD_Y + title + ROW_LINE_GAP + detail;
+        assert!(
+            detail_bottom <= height - ROW_PAD_Y + 1e-3,
+            "the second line must end inside the row's padding"
+        );
+    }
 
     /// Width the find field is drawn at in these tests.
     const TEST_FIELD_WIDTH: f32 = 240.0;
@@ -2256,7 +2598,14 @@ mod tests {
         let palette = Theme::from_id(ThemeId::default()).palette;
         let mut outcome = SearchFieldOutput::default();
         let mut output = ctx.run_ui(raw, |ui| {
-            outcome = search_field(ui, &palette, query, TEST_FIELD_WIDTH, "Search document", false);
+            outcome = search_field(
+                ui,
+                &palette,
+                query,
+                TEST_FIELD_WIDTH,
+                "Search document",
+                false,
+            );
         });
         let shapes = output.shapes.len();
         output.textures_delta.clear();

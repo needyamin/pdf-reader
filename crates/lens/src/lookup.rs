@@ -260,13 +260,12 @@ impl Dictionaries {
                 .and_then(|raw| senses_from_raw(raw).into_iter().next())
                 .map(|first| {
                     let (_, bare) = split_pos(&first);
-                    if bare.is_empty() {
-                        first
-                    } else {
-                        bare
-                    }
+                    if bare.is_empty() { first } else { bare }
                 })
-                .or_else(|| self.extra_meanings(&lower).and_then(|meanings| meanings.first().cloned()));
+                .or_else(|| {
+                    self.extra_meanings(&lower)
+                        .and_then(|meanings| meanings.first().cloned())
+                });
 
             match replacement {
                 Some(meaning) => {
@@ -354,7 +353,9 @@ mod tests {
 
     #[test]
     fn an_unknown_word_falls_back_to_the_text_dictionary() {
-        let lookup = dictionaries().lookup("bright").expect("bright has a text meaning");
+        let lookup = dictionaries()
+            .lookup("bright")
+            .expect("bright has a text meaning");
         assert_eq!(lookup.translation, "উজ্জ্বল");
         assert_eq!(lookup.groups.len(), 1);
     }
@@ -368,7 +369,9 @@ mod tests {
     #[test]
     fn an_empty_selection_says_so() {
         assert_eq!(
-            dictionaries().lookup("  ...  ").expect_err("nothing selected"),
+            dictionaries()
+                .lookup("  ...  ")
+                .expect_err("nothing selected"),
             LookupError::EmptySelection
         );
     }

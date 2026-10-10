@@ -83,7 +83,6 @@ impl PageTextCache {
         self.pages.retain(|(id, _), _| *id != doc);
         self.inflight.retain(|(id, _)| *id != doc);
     }
-
 }
 
 /// A word or phrase the user picked on the page.
@@ -199,25 +198,22 @@ impl LensPopup {
         target: &str,
         speak_enabled: bool,
         translate_enabled: bool,
-    ) {
+    ) -> Option<egui::Rect> {
         if !self.open {
-            return;
+            return None;
         }
 
         let mut close = false;
         let mut speak: Option<(String, &'static str)> = None;
         let mut translate = None;
 
-        egui::Area::new(Id::new("lens-popup"))
+        let area = egui::Area::new(Id::new("lens-popup"))
             .order(egui::Order::Foreground)
             .fixed_pos(self.anchor)
             .constrain(true)
             .interactable(true)
             .show(ctx, |ui| {
-                egui::Frame::new()
-                    .fill(palette.panel_bg)
-                    .stroke(egui::Stroke::new(1.0, palette.border))
-                    .corner_radius(12.0)
+                pdfreader_ui::window_frame(palette)
                     .inner_margin(Margin::same(0))
                     .shadow(egui::epaint::Shadow {
                         offset: [0, 4],
@@ -311,7 +307,9 @@ impl LensPopup {
                                         );
                                     }
                                     Answer::Missing(reason) => {
-                                        ui.label(RichText::new(reason).color(palette.danger).size(13.0));
+                                        ui.label(
+                                            RichText::new(reason).color(palette.danger).size(13.0),
+                                        );
                                     }
                                     Answer::Ready(lookup) => {
                                         if !lookup.translation.is_empty() {
@@ -348,11 +346,9 @@ impl LensPopup {
                                                         );
                                                     }
                                                     for term in &group.terms {
-                                                        egui::Frame::new()
-                                                            .fill(palette.surface)
-                                                            .corner_radius(6.0)
-                                                            .inner_margin(Margin::symmetric(8, 2))
-                                                            .show(ui, |ui| {
+                                                        pdfreader_ui::chip_frame(palette).show(
+                                                            ui,
+                                                            |ui| {
                                                                 // Single line, so a
                                                                 // chip that does not
                                                                 // fit wraps as a whole
@@ -368,7 +364,8 @@ impl LensPopup {
                                                                         egui::TextWrapMode::Extend,
                                                                     ),
                                                                 );
-                                                            });
+                                                            },
+                                                        );
                                                     }
                                                 });
                                             }
@@ -418,6 +415,11 @@ impl LensPopup {
         if close || ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
             self.close();
         }
+
+        // Hand back the card's screen rect so the caller can tell when the
+        // pointer is over it — a floating area swallows the wheel, and the
+        // shell uses this to keep the canvas scrolling underneath it.
+        self.open.then_some(area.response.rect)
     }
 }
 
@@ -448,6 +450,53 @@ mod tests {
         pdfreader_pdf::text::build(Vec::new())
     }
 
+    /// The popup must report its screen rect while open so the shell can keep
+    /// the canvas scrolling underneath it — a floating card otherwise swallows
+    /// the wheel, which is what broke scrolling right after selecting text.
+    #[test]
+    fn an_open_popup_reports_its_rect() {
+        let ctx = egui::Context::default();
+        let palette =
+            pdfreader_ui::theme::Theme::from_id(pdfreader_core::ThemeId::default()).palette;
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(800.0, 600.0),
+            )),
+            ..Default::default()
+        };
+
+        let mut popup = LensPopup::new();
+        let mut out = ctx.run_ui(raw.clone(), |ui| {
+            assert!(
+                popup
+                    .show(ui.ctx(), &palette, "zh-CN", true, true)
+                    .is_none(),
+                "a closed card has no rect"
+            );
+        });
+        out.textures_delta.clear();
+
+        popup.open(
+            LookupRequest {
+                page: 0,
+                text: "hello".into(),
+                anchor: egui::pos2(120.0, 120.0),
+            },
+            Answer::Loading,
+            false,
+        );
+        let mut out = ctx.run_ui(raw, |ui| {
+            assert!(
+                popup
+                    .show(ui.ctx(), &palette, "zh-CN", true, true)
+                    .is_some(),
+                "an open card reports its rect"
+            );
+        });
+        out.textures_delta.clear();
+    }
+
     #[test]
     fn a_page_is_requested_once() {
         let mut cache = PageTextCache::new();
@@ -466,7 +515,10 @@ mod tests {
         assert!(cache.request(doc, 3));
         cache.failed(doc, 3);
         assert!(!cache.request(doc, 3));
-        assert!(cache.get(doc, 3).is_some(), "a failed page reads as empty text");
+        assert!(
+            cache.get(doc, 3).is_some(),
+            "a failed page reads as empty text"
+        );
     }
 
     #[test]

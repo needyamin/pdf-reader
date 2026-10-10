@@ -42,7 +42,12 @@ fn a_known_word_has_a_bangla_meaning() {
     };
     let lookup = dicts.lookup("abandon").expect("abandon is a common word");
     assert!(!lookup.translation.is_empty());
-    assert!(lookup.translation.chars().any(|c| matches!(c, '\u{0980}'..='\u{09FF}')));
+    assert!(
+        lookup
+            .translation
+            .chars()
+            .any(|c| matches!(c, '\u{0980}'..='\u{09FF}'))
+    );
     assert!(!lookup.groups.is_empty());
 }
 
@@ -60,9 +65,16 @@ fn a_phrase_is_translated_word_by_word() {
     let Some(dicts) = dictionaries() else {
         return;
     };
-    let lookup = dicts.lookup("abandon the abbey").expect("both words are known");
+    let lookup = dicts
+        .lookup("abandon the abbey")
+        .expect("both words are known");
     assert!(lookup.partial);
-    assert!(lookup.translation.chars().any(|c| matches!(c, '\u{0980}'..='\u{09FF}')));
+    assert!(
+        lookup
+            .translation
+            .chars()
+            .any(|c| matches!(c, '\u{0980}'..='\u{09FF}'))
+    );
 }
 
 #[test]

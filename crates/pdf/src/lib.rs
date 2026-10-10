@@ -9,10 +9,11 @@ pub mod engine;
 pub mod error;
 pub mod export;
 pub mod form;
+pub mod formmark;
 pub mod geometry;
 pub mod text;
 
-pub use engine::{DocumentHandle, PdfEngine, TilePixels, TileRequest};
+pub use engine::{DocumentHandle, FieldWrite, PdfEngine, TilePixels, TileRequest};
 pub use error::EngineError;
 pub use export::{JobProgress, MAX_EXPORT_MEGAPIXELS};
 // The annotation and form domain types live in `core` so the UI can use them

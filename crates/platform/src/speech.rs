@@ -131,7 +131,14 @@ fn speech_command(text: &str, lang: &str) -> Result<Command, SpeechError> {
         text = powershell_quote(text),
     );
     let mut command = Command::new("powershell");
-    command.args(["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", &script]);
+    command.args([
+        "-NoProfile",
+        "-NonInteractive",
+        "-WindowStyle",
+        "Hidden",
+        "-Command",
+        &script,
+    ]);
     Ok(command)
 }
 

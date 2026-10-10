@@ -23,7 +23,9 @@ fn main() {
     let mut engine = PdfiumEngine::bind(bind_dir.as_deref()).expect("bind pdfium");
 
     // Pick a text field and a radio group to exercise both write paths.
-    let (handle, _info) = engine.open(std::path::Path::new(&path), None).expect("open");
+    let (handle, _info) = engine
+        .open(std::path::Path::new(&path), None)
+        .expect("open");
     let form = engine.form_fields(handle).expect("form");
     println!("kind: {:?}, fields: {}", form.kind, form.fields.len());
 
@@ -48,12 +50,12 @@ fn main() {
         let written = engine
             .set_field_value(handle, id, FieldValue::Text("Yamin Hossain".to_owned()))
             .expect("set text");
-        println!("text write ok: {written}");
+        println!("text write ok: {written:?}");
     }
     if let Some(id) = radio {
         println!("radio target: id=({},{})", id.page, id.annot_index);
         match engine.set_field_value(handle, id, FieldValue::Checked(true)) {
-            Ok(written) => println!("radio write ok: {written}"),
+            Ok(written) => println!("radio write: {written:?}"),
             // Expected for a grouped radio: the value lives on the parent field
             // dictionary, which the library cannot write.
             Err(error) => println!("radio write refused: {error}"),
@@ -62,7 +64,7 @@ fn main() {
     if let Some(id) = checkbox {
         println!("checkbox target: id=({},{})", id.page, id.annot_index);
         match engine.set_field_value(handle, id, FieldValue::Checked(true)) {
-            Ok(written) => println!("checkbox write ok: {written}"),
+            Ok(written) => println!("checkbox write ok: {written:?}"),
             Err(error) => println!("checkbox write refused: {error}"),
         }
     }
@@ -71,8 +73,10 @@ fn main() {
     // write was lost on save".
     let after = engine.form_fields(handle).expect("form");
     for f in &after.fields {
-        if matches!(f.kind, FormFieldType::Text | FormFieldType::RadioButton | FormFieldType::CheckBox)
-            && !f.value.is_empty()
+        if matches!(
+            f.kind,
+            FormFieldType::Text | FormFieldType::RadioButton | FormFieldType::CheckBox
+        ) && !f.value.is_empty()
         {
             println!(
                 "in memory: id=({},{}) {:?} = {:?}",
@@ -82,7 +86,9 @@ fn main() {
     }
 
     let bytes = engine.save_to_bytes(handle, false).expect("save");
-    let out = std::env::current_dir().unwrap().join("target/form_fill_out.pdf");
+    let out = std::env::current_dir()
+        .unwrap()
+        .join("target/form_fill_out.pdf");
     std::fs::write(&out, &bytes).expect("write");
     println!("saved {} bytes to {}", bytes.len(), out.display());
 
@@ -102,8 +108,10 @@ fn main() {
     }
     let form = engine.form_fields(handle).expect("form");
     for f in &form.fields {
-        if matches!(f.kind, FormFieldType::Text | FormFieldType::RadioButton | FormFieldType::CheckBox)
-            && !f.value.is_empty()
+        if matches!(
+            f.kind,
+            FormFieldType::Text | FormFieldType::RadioButton | FormFieldType::CheckBox
+        ) && !f.value.is_empty()
         {
             println!(
                 "read back: id=({},{}) {:?} {:?} = {:?}",

@@ -21,6 +21,7 @@ use crate::annot;
 use crate::error::EngineError;
 use crate::export::{self, JobProgress};
 use crate::form::{read_form, read_widget_value};
+use crate::formmark;
 use crate::text::{CharBox, TextPage};
 use crate::{DocumentInfo, Result};
 
@@ -36,6 +37,21 @@ impl DocumentHandle {
     pub const fn raw(self) -> u64 {
         self.0
     }
+}
+
+/// What became of a form write.
+///
+/// The distinction matters to the caller: a recorded write is already reflected
+/// by the page raster, while a painted one only shows up after the page is
+/// re-rendered — and a refused one should never be reported as done.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FieldWrite {
+    /// The PDF form model now holds the value.
+    Recorded,
+    /// The model could not hold it, so the reader drew it into the page.
+    Painted,
+    /// Nothing was written: the widget is gone or read-only.
+    Refused,
 }
 
 /// One tile to rasterize.
@@ -100,6 +116,12 @@ pub trait PdfEngine {
         scale: f32,
     ) -> Result<TilePixels>;
 
+    /// Point size of a page, before any rotation.
+    ///
+    /// Callers that must size a rasterization *before* doing it need this:
+    /// a print job picking its resolution, an export checking its budget.
+    fn page_size(&self, handle: DocumentHandle, index: u32) -> Result<(f32, f32)>;
+
     /// Extract the text geometry of a page.
     fn page_text(&mut self, handle: DocumentHandle, page: u32) -> Result<TextPage>;
 
@@ -112,15 +134,17 @@ pub trait PdfEngine {
     /// Write a value into one form field.
     ///
     /// `id` is the `(page, annotation index)` pair reported by
-    /// [`Self::form_fields`]. Returns `Ok(true)` when the value was written,
-    /// `Ok(false)` when the widget is missing or read-only, and an error when
-    /// the widget type cannot be written at all.
+    /// [`Self::form_fields`]. Returns [`FieldWrite::Recorded`] when the PDF form
+    /// model now holds the value, [`FieldWrite::Painted`] when the model could
+    /// not hold it and the reader drew it into the page instead,
+    /// [`FieldWrite::Refused`] when the widget is missing or read-only, and an
+    /// error when the widget type cannot be written at all.
     fn set_field_value(
         &mut self,
         handle: DocumentHandle,
         id: pdfreader_core::FieldId,
         value: pdfreader_core::FieldValue,
-    ) -> Result<bool>;
+    ) -> Result<FieldWrite>;
 
     /// Serialise the document, optionally flattening annotations and form
     /// values into page content first.
@@ -230,6 +254,13 @@ pub trait PdfEngine {
 pub struct PdfiumEngine {
     pdfium: &'static Pdfium,
     documents: HashMap<DocumentHandle, PdfDocument<'static>>,
+    /// Widgets the reader has drawn into page content, per document.
+    ///
+    /// A radio group whose value the PDF binding cannot write is painted into
+    /// the page instead (see [`crate::formmark`]); keeping the record here is
+    /// what lets a later change erase the previous mark rather than stack a
+    /// second one on top of it.
+    painted: HashMap<DocumentHandle, HashMap<pdfreader_core::FieldId, formmark::Painted>>,
     next_handle: u64,
     /// Reusable tile bitmap, so steady-state rendering does not allocate.
     scratch: Option<ScratchBitmap>,
@@ -268,6 +299,7 @@ impl PdfiumEngine {
         Ok(Self {
             pdfium,
             documents: HashMap::new(),
+            painted: HashMap::new(),
             next_handle: 0,
             scratch: None,
         })
@@ -290,12 +322,129 @@ impl PdfiumEngine {
         }
     }
 
+    /// Draw a boolean widget into the page content, replacing any earlier mark.
+    ///
+    /// A radio group is painted as a whole: every widget sharing the field's
+    /// name is hidden and re-drawn, because the model's previous selection would
+    /// otherwise still be drawn on top and the group would show two answers at
+    /// once. A checkbox stands alone and is painted on its own.
+    fn paint_widget(
+        &mut self,
+        handle: DocumentHandle,
+        id: pdfreader_core::FieldId,
+        selected: bool,
+        is_radio: bool,
+        name: &str,
+        rect: pdfreader_core::Rect,
+    ) -> Result<()> {
+        let shape = if is_radio {
+            formmark::Shape::Radio
+        } else {
+            formmark::Shape::CheckBox
+        };
+
+        // Which widgets this mark covers.
+        let mut targets: Vec<(pdfreader_core::FieldId, pdfreader_core::Rect)> = Vec::new();
+        if is_radio && !name.is_empty() {
+            if let Ok(document) = self.document(handle) {
+                for field in read_form(document).fields {
+                    if field.kind == pdfreader_core::FormFieldType::RadioButton
+                        && field.id.page == id.page
+                        && field.name == name
+                    {
+                        targets.push((field.id, field.rect));
+                    }
+                }
+            }
+        }
+        // An unnamed or single-widget group falls back to the widget itself.
+        if targets.is_empty() {
+            targets.push((id, rect));
+        }
+
+        // What was drawn for these widgets before, so it can be erased rather
+        // than left to accumulate under the new mark.
+        let stale: Vec<formmark::Painted> = {
+            let marks = self.painted.get(&handle);
+            targets
+                .iter()
+                .filter_map(|(field, _)| marks.and_then(|m| m.get(field)).cloned())
+                .collect()
+        };
+        if let Some(marks) = self.painted.get_mut(&handle) {
+            for (field, _) in &targets {
+                marks.remove(field);
+            }
+        }
+
+        let mut added: Vec<formmark::Painted> = Vec::new();
+        {
+            let document = self
+                .documents
+                .get_mut(&handle)
+                .ok_or(EngineError::NotOpen(handle.raw()))?;
+            for mark in &stale {
+                formmark::erase(document, mark.id.page, &mark.objects)?;
+            }
+            for (field, target) in &targets {
+                let objects = formmark::paint(
+                    document,
+                    field.page,
+                    field.annot_index,
+                    *target,
+                    shape,
+                    *field == id && selected,
+                )?;
+                added.push(formmark::Painted {
+                    id: *field,
+                    selected: *field == id && selected,
+                    objects,
+                });
+            }
+        }
+
+        let marks = self.painted.entry(handle).or_default();
+        for mark in added {
+            marks.insert(mark.id, mark);
+        }
+        Ok(())
+    }
+
     /// Build the render config shared by tile and full-page rendering.
-    fn config(rotation: Rotation, scale: f32) -> PdfRenderConfig {
-        PdfRenderConfig::new()
+    /// Build the render config for one rendering path.
+    ///
+    /// `form_data` decides whether PDFium paints form *values* into the raster
+    /// (through `FFLDraw`), and it is a per-path decision because the two paths
+    /// answer to different masters:
+    ///
+    /// * Screen tiles pass `false`. The canvas draws every value itself, in the
+    ///   face, size and colour the user chose, inside the field's own rectangle.
+    ///   Letting PDFium draw them too put the same value on screen **twice** —
+    ///   once where the form author placed it and once where the canvas places
+    ///   it — so the text appeared to jump to the top of the box the moment a
+    ///   field was committed. The widget's own appearance (its box, its rules)
+    ///   is still drawn; only the value is left to us.
+    /// * Print, export and thumbnails pass `true`. Nothing else paints values
+    ///   into those rasters, and a printed page has to carry them.
+    ///
+    /// `origin` is the top-left of the region being rendered, in output pixels,
+    /// and is only meaningful when `form_data` is `false` — see below.
+    fn config(
+        rotation: Rotation,
+        scale: f32,
+        form_data: bool,
+        origin: (f32, f32),
+    ) -> Result<PdfRenderConfig> {
+        let config = PdfRenderConfig::new()
             .scale_page_by_factor(scale)
             .rotate(Self::pdfium_rotation(rotation), true)
             .set_format(PdfBitmapFormat::BGRA)
+            // Keep PDFium's native BGRA byte order. We read the raw buffer with
+            // `bgra_to_color_image`, which expects B,G,R,A layout and swaps to
+            // R,G,B,A itself. Enabling the reverse-byte-order flag would make
+            // PDFium emit R,G,B,A, and the subsequent swap would invert the red
+            // and blue channels — the page would render with wrong colors.
+            .set_reverse_byte_order(false)
             .render_annotations(true)
             .limit_render_image_cache_size(true)
             // Tiles at the right and bottom edges of a page are only partly
@@ -303,16 +452,26 @@ impl PdfiumEngine {
             // keeps whatever the previous tile left behind, which shows up as
             // smeared garbage along page edges.
             .clear_before_rendering(true)
-            .set_clear_color(PdfColor::WHITE)
-    }
+            .set_clear_color(PdfColor::WHITE);
 
-    /// Point size of a page, for the checks that must happen before rendering.
-    ///
-    /// Rotation would swap the two values, but every caller here cares about
-    /// their product, so the unrotated size is the honest answer.
-    fn page_size(&self, handle: DocumentHandle, index: u32) -> Result<(f32, f32)> {
-        let page = page_of(self.document(handle)?, index)?;
-        Ok((page.width().value, page.height().value))
+        if form_data {
+            return Ok(config.render_form_data(true));
+        }
+
+        // PDFium renders *either* form data *or* through a custom matrix, never
+        // both — and with form data off it also stops honouring the origin
+        // offset that tiling relies on. So the offset moves into the matrix.
+        //
+        // `translate` takes page points and is applied before the scale, so a
+        // pixel offset is divided by the scale to land in the right place.
+        // `pdfium-render` clears the form-data flag as a side effect, which is
+        // exactly what this path wants.
+        config
+            .translate(
+                PdfPoints::new(-origin.0 / scale),
+                PdfPoints::new(-origin.1 / scale),
+            )
+            .map_err(|error| EngineError::Pdfium(error.to_string()))
     }
 }
 
@@ -363,14 +522,33 @@ impl PdfEngine for PdfiumEngine {
 
     fn close(&mut self, handle: DocumentHandle) {
         self.documents.remove(&handle);
+        // The record of painted marks describes a document that is going away;
+        // keeping it would leak, and a reused handle would inherit it.
+        self.painted.remove(&handle);
     }
 
     fn form_fields(&mut self, handle: DocumentHandle) -> Result<FormInfo> {
-        let document = self
-            .documents
-            .get(&handle)
-            .ok_or(EngineError::NotOpen(handle.raw()))?;
-        Ok(read_form(document))
+        let mut form = {
+            let document = self
+                .documents
+                .get(&handle)
+                .ok_or(EngineError::NotOpen(handle.raw()))?;
+            read_form(document)
+        };
+
+        // Widgets the reader painted into the page carry no value in the form
+        // model, so report what was drawn instead: without this the Forms panel
+        // would show the choice as unset the moment it was made.
+        if let Some(marks) = self.painted.get(&handle) {
+            for mark in marks.values() {
+                if let Some(field) = form.field_mut(mark.id) {
+                    field.rendered = true;
+                    field.value = pdfreader_core::FieldValue::Checked(mark.selected);
+                }
+            }
+        }
+
+        Ok(form)
     }
 
     fn set_field_value(
@@ -378,12 +556,7 @@ impl PdfEngine for PdfiumEngine {
         handle: DocumentHandle,
         id: pdfreader_core::FieldId,
         value: pdfreader_core::FieldValue,
-    ) -> Result<bool> {
-        let Self { documents, .. } = self;
-        let document = documents
-            .get_mut(&handle)
-            .ok_or(EngineError::NotOpen(handle.raw()))?;
-
+    ) -> Result<FieldWrite> {
         let text_value = match &value {
             pdfreader_core::FieldValue::Text(text) => Some(text.clone()),
             _ => None,
@@ -396,7 +569,11 @@ impl PdfEngine for PdfiumEngine {
         };
 
         // Phase 1: write through the target widget.
-        let (outcome, shared_name, is_radio) = {
+        let (outcome, shared_name, is_radio, rect) = {
+            let document = self
+                .documents
+                .get_mut(&handle)
+                .ok_or(EngineError::NotOpen(handle.raw()))?;
             let mut page = page_of(document, id.page)?;
             // A stale or bogus widget id means "nothing to write", not a
             // failure: the form was re-read or the document changed between
@@ -405,14 +582,26 @@ impl PdfEngine for PdfiumEngine {
                 .annotations_mut()
                 .get(id.annot_index as PdfPageAnnotationIndex)
             else {
-                return Ok(false);
+                return Ok(FieldWrite::Refused);
             };
 
+            // Read the geometry before borrowing the field mutably: the widget's
+            // rectangle is what a painted mark is positioned by, and the field
+            // borrow would otherwise still be alive.
+            let rect = annotation.bounds().ok().map(|b| {
+                pdfreader_core::Rect::from_xywh(
+                    b.left().value,
+                    b.bottom().value,
+                    b.width().value,
+                    b.height().value,
+                )
+            });
+
             let Some(field) = annotation.as_form_field_mut() else {
-                return Ok(false);
+                return Ok(FieldWrite::Refused);
             };
             if field.is_read_only() {
-                return Ok(false);
+                return Ok(FieldWrite::Refused);
             }
 
             let shared_name: Option<String> = field.name().map(|n| n.to_string());
@@ -457,7 +646,7 @@ impl PdfEngine for PdfiumEngine {
                     Err(EngineError::Unsupported("clearing this widget".to_string()))
                 }
             };
-            (outcome, shared_name, is_radio)
+            (outcome, shared_name, is_radio, rect)
         };
 
         outcome?;
@@ -473,9 +662,12 @@ impl PdfEngine for PdfiumEngine {
         if let Some(on) = checked_target {
             let wanted = pdfreader_core::FieldValue::Checked(on);
             let landed = {
+                let document = self.document(handle)?;
                 let page = page_of(document, id.page)?;
-                let annotations = page.annotations();
-                match annotations.get(id.annot_index as PdfPageAnnotationIndex) {
+                match page
+                    .annotations()
+                    .get(id.annot_index as PdfPageAnnotationIndex)
+                {
                     Ok(annotation) => match annotation.as_form_field() {
                         Some(field) => read_widget_value(field) == wanted,
                         None => false,
@@ -484,18 +676,16 @@ impl PdfEngine for PdfiumEngine {
                 }
             };
             if !landed {
-                // A radio group keeps its value on the parent field dictionary,
-                // which `pdfium-render` does not expose, so `set_checked` writes
-                // the *widget* and changes nothing. Remember the selection
-                // instead of losing it: `form_fields` reports it back and
-                // `save_to_bytes` draws it into the page.
-                return Err(EngineError::Unsupported(
-                    if is_radio {
-                        "selecting a radio button in this form".to_string()
-                    } else {
-                        "writing this checkbox".to_string()
-                    },
-                ));
+                // The PDF form model cannot hold this value — a radio group
+                // keeps it on a parent dictionary this binding cannot reach.
+                // Paint the widget into the page instead: content is what
+                // PDFium rasterizes, what the printer receives, and what a save
+                // writes, so one change makes the choice survive everywhere the
+                // model alone could not carry it.
+                let name = shared_name.unwrap_or_default();
+                let rect = rect.unwrap_or(pdfreader_core::Rect::from_xywh(0.0, 0.0, 0.0, 0.0));
+                self.paint_widget(handle, id, on, is_radio, &name, rect)?;
+                return Ok(FieldWrite::Painted);
             }
         }
 
@@ -504,10 +694,14 @@ impl PdfEngine for PdfiumEngine {
         // write; writing every widget's own dictionary keeps the text in the
         // document and consistent across our UI.
         if let (Some(text), Some(name)) = (text_value, shared_name) {
+            let document = self
+                .documents
+                .get_mut(&handle)
+                .ok_or(EngineError::NotOpen(handle.raw()))?;
             annot::sync_shared_text_fields(document, &name, &text)
                 .map_err(|error| EngineError::Pdfium(error.to_string()))?;
         }
-        Ok(true)
+        Ok(FieldWrite::Recorded)
     }
 
     fn save_to_bytes(&mut self, handle: DocumentHandle, flatten: bool) -> Result<Vec<u8>> {
@@ -618,13 +812,16 @@ impl PdfEngine for PdfiumEngine {
         };
         let bitmap = &mut scratch.bitmap;
 
-        // Tiling uses `set_origin`, not `clip`. PDFium switches to a different
-        // render path when a clip rectangle is set, and that path ignores the
-        // origin entirely — every tile would show the same region. Offsetting
-        // the page inside a tile-sized bitmap gets the clipping from the
-        // bitmap's own bounds and leaves form rendering intact.
-        let config = Self::config(request.rotation, request.scale)
-            .set_origin(-request.origin_x, -request.origin_y);
+        // The tile's offset within the page is applied through the transform
+        // matrix, not `set_origin` and not `clip`: PDFium's origin offset is
+        // ignored once form-data rendering is off, and its clipping path
+        // ignores the origin outright — every tile would show the same region.
+        let config = Self::config(
+            request.rotation,
+            request.scale,
+            false,
+            (request.origin_x as f32, request.origin_y as f32),
+        )?;
 
         page.render_into_bitmap_with_config(bitmap, &config)
             .map_err(|e| EngineError::Pdfium(format!("{e:?}")))?;
@@ -647,7 +844,7 @@ impl PdfEngine for PdfiumEngine {
 
         let page = page_of(document, page_index)?;
 
-        let config = Self::config(rotation, scale);
+        let config = Self::config(rotation, scale, true, (0.0, 0.0))?;
         let bitmap = page
             .render_with_config(&config)
             .map_err(|e| EngineError::Pdfium(format!("{e:?}")))?;
@@ -659,6 +856,13 @@ impl PdfEngine for PdfiumEngine {
             height: bitmap.height() as u32,
             data: bitmap.as_raw_bytes(),
         })
+    }
+
+    /// Rotation would swap the two values, but every caller here cares about
+    /// their product, so the unrotated size is the honest answer.
+    fn page_size(&self, handle: DocumentHandle, index: u32) -> Result<(f32, f32)> {
+        let page = page_of(self.document(handle)?, index)?;
+        Ok((page.width().value, page.height().value))
     }
 
     fn page_text(&mut self, handle: DocumentHandle, page_index: u32) -> Result<TextPage> {
@@ -738,7 +942,7 @@ impl PdfEngine for PdfiumEngine {
             export::check_render_budget(width, height, scale)?;
         }
 
-        std::fs::create_dir_all(dir).map_err(|error| EngineError::Io {
+        std::fs::create_dir_all(dir).map_err(|error| EngineError::Write {
             path: dir.to_path_buf(),
             reason: error.to_string(),
         })?;
@@ -842,4 +1046,3 @@ fn convert_bookmark(bookmark: &PdfBookmark, depth: usize) -> OutlineNode {
         children,
     }
 }
-
