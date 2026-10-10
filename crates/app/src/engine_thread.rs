@@ -136,6 +136,28 @@ pub enum EngineRequest {
         /// The new text.
         contents: String,
     },
+    /// Move / resize an annotation.
+    UpdateAnnotationBounds {
+        /// Document to edit.
+        doc: DocumentId,
+        /// Document to edit.
+        handle: DocumentHandle,
+        /// Which annotation.
+        id: pdfreader_core::AnnotationId,
+        /// The new bounds, in PDF page space.
+        rect: pdfreader_core::Rect,
+    },
+    /// Recolour an annotation. The alpha byte is the rendered opacity.
+    SetAnnotationColor {
+        /// Document to edit.
+        doc: DocumentId,
+        /// Document to edit.
+        handle: DocumentHandle,
+        /// Which annotation.
+        id: pdfreader_core::AnnotationId,
+        /// RGBA bytes; the alpha byte is the rendered opacity.
+        color: [u8; 4],
+    },
     /// Extract and search all pages of a document on the engine thread.
     Search {
         /// Document the results belong to.
@@ -769,6 +791,52 @@ fn run(
             } => {
                 let response = match engine.set_annotation_contents(handle, id, &contents) {
                     Ok(()) => match engine.annotations(handle) {
+                        Ok(annotations) => EngineResponse::Annotations { doc, annotations },
+                        Err(error) => EngineResponse::AnnotationsFailed {
+                            doc,
+                            reason: error.to_string(),
+                        },
+                    },
+                    Err(error) => EngineResponse::AnnotationsFailed {
+                        doc,
+                        reason: error.to_string(),
+                    },
+                };
+                if responses.send(response).is_err() {
+                    return;
+                }
+            }
+            EngineRequest::UpdateAnnotationBounds {
+                doc,
+                handle,
+                id,
+                rect,
+            } => {
+                let response = match engine.update_annotation_bounds(handle, id, rect) {
+                    Ok(_) => match engine.annotations(handle) {
+                        Ok(annotations) => EngineResponse::Annotations { doc, annotations },
+                        Err(error) => EngineResponse::AnnotationsFailed {
+                            doc,
+                            reason: error.to_string(),
+                        },
+                    },
+                    Err(error) => EngineResponse::AnnotationsFailed {
+                        doc,
+                        reason: error.to_string(),
+                    },
+                };
+                if responses.send(response).is_err() {
+                    return;
+                }
+            }
+            EngineRequest::SetAnnotationColor {
+                doc,
+                handle,
+                id,
+                color,
+            } => {
+                let response = match engine.set_annotation_color(handle, id, color) {
+                    Ok(_) => match engine.annotations(handle) {
                         Ok(annotations) => EngineResponse::Annotations { doc, annotations },
                         Err(error) => EngineResponse::AnnotationsFailed {
                             doc,

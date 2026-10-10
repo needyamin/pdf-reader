@@ -123,11 +123,14 @@ pub enum Tool {
     Square,
     /// Sticky note placed by a click.
     StickyNote,
+    /// Deletes the annotation under the cursor. Clicking an annotation removes
+    /// it; it creates nothing of its own, so it has no annotation kind.
+    Eraser,
 }
 
 impl Tool {
     /// Every tool, in toolbar order.
-    pub const ALL: [Tool; 7] = [
+    pub const ALL: [Tool; 8] = [
         Tool::Select,
         Tool::Highlight,
         Tool::Underline,
@@ -135,6 +138,7 @@ impl Tool {
         Tool::Squiggly,
         Tool::Square,
         Tool::StickyNote,
+        Tool::Eraser,
     ];
 
     /// The annotation kind this tool creates, if any.
@@ -147,6 +151,7 @@ impl Tool {
             Self::Squiggly => Some(AnnotationKind::Squiggly),
             Self::Square => Some(AnnotationKind::Square),
             Self::StickyNote => Some(AnnotationKind::StickyNote),
+            Self::Eraser => None,
         }
     }
 
@@ -160,6 +165,7 @@ impl Tool {
             Self::Squiggly => "Squiggly",
             Self::Square => "Rectangle",
             Self::StickyNote => "Note",
+            Self::Eraser => "Eraser",
         }
     }
 }
@@ -248,6 +254,11 @@ pub struct AnnotationInfo {
     pub rect: Rect,
     /// Author-supplied text (note body, free-text contents), when present.
     pub contents: Option<String>,
+    /// The annotation's stroke colour as RGBA bytes (alpha = opacity), when
+    /// the document reports one. This is the colour markup and rectangle
+    /// annotations draw with and what the properties panel edits.
+    #[serde(default)]
+    pub color: Option<[u8; 4]>,
 }
 
 impl AnnotationInfo {

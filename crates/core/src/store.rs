@@ -51,6 +51,24 @@ pub enum UndoAction {
         /// The text after the edit; redo restores this.
         next: Option<String>,
     },
+    /// An annotation was moved or resized.
+    Geometry {
+        /// Which annotation.
+        id: crate::annotation::AnnotationId,
+        /// The bounds before the edit; undo restores this.
+        previous: crate::rect::Rect,
+        /// The bounds after the edit; redo restores this.
+        next: crate::rect::Rect,
+    },
+    /// An annotation was recoloured (the alpha byte is its opacity).
+    Color {
+        /// Which annotation.
+        id: crate::annotation::AnnotationId,
+        /// The colour before the edit; undo restores this.
+        previous: [u8; 4],
+        /// The colour after the edit; redo restores this.
+        next: [u8; 4],
+    },
 }
 
 /// A single open document and how it is being viewed.
@@ -490,6 +508,99 @@ impl Store {
                     Effect::SetAnnotationContents { doc, id, contents },
                     Effect::InvalidateTiles,
                 ]
+            }
+
+            Command::UpdateAnnotationBounds { id, rect } => {
+                let Some(tab) = self.state.active_mut() else {
+                    return Vec::new();
+                };
+                let Some(doc) = tab.document.as_ref().map(|d| d.id) else {
+                    return Vec::new();
+                };
+                let Some(a) = tab
+                    .annotations
+                    .as_mut()
+                    .and_then(|list| list.iter_mut().find(|a| a.id == id))
+                else {
+                    return Vec::new();
+                };
+                if (a.rect.min_x - rect.min_x).abs() < f32::EPSILON
+                    && (a.rect.min_y - rect.min_y).abs() < f32::EPSILON
+                    && (a.rect.max_x - rect.max_x).abs() < f32::EPSILON
+                    && (a.rect.max_y - rect.max_y).abs() < f32::EPSILON
+                {
+                    // A drag that ended where it started is a click, not an
+                    // edit; recording it would put a no-op on the undo stack.
+                    return Vec::new();
+                }
+                let previous = a.rect;
+                a.rect = rect;
+                tab.dirty = true;
+                push_history(
+                    &mut tab.undo_stack,
+                    UndoAction::Geometry {
+                        id,
+                        previous,
+                        next: rect,
+                    },
+                );
+                tab.redo_stack.clear();
+                vec![
+                    Effect::UpdateAnnotationBounds { doc, id, rect },
+                    Effect::InvalidateTiles,
+                ]
+            }
+
+            Command::SetAnnotationColor { id, color } => {
+                let Some(tab) = self.state.active_mut() else {
+                    return Vec::new();
+                };
+                let Some(doc) = tab.document.as_ref().map(|d| d.id) else {
+                    return Vec::new();
+                };
+                let Some(a) = tab
+                    .annotations
+                    .as_mut()
+                    .and_then(|list| list.iter_mut().find(|a| a.id == id))
+                else {
+                    return Vec::new();
+                };
+                let Some(previous) = a.color else {
+                    return Vec::new();
+                };
+                if previous == color {
+                    return Vec::new();
+                }
+                a.color = Some(color);
+                tab.dirty = true;
+                push_history(
+                    &mut tab.undo_stack,
+                    UndoAction::Color {
+                        id,
+                        previous,
+                        next: color,
+                    },
+                );
+                tab.redo_stack.clear();
+                vec![
+                    Effect::SetAnnotationColor { doc, id, color },
+                    Effect::InvalidateTiles,
+                ]
+            }
+
+            Command::SelectAnnotationInPlace(id) => {
+                let Some(tab) = self.state.active_mut() else {
+                    return Vec::new();
+                };
+                let resolves = id.is_none_or(|sel| {
+                    tab.annotations
+                        .as_ref()
+                        .is_some_and(|list| list.iter().any(|a| a.id == sel))
+                });
+                if resolves {
+                    tab.view.selected_annotation = id;
+                }
+                Vec::new()
             }
 
             Command::Undo => self.history_step(HistoryDirection::Back),
@@ -1074,6 +1185,58 @@ impl Store {
                             doc,
                             id: *id,
                             contents: restored,
+                        },
+                        invalidate,
+                    ),
+                    entry.clone(),
+                ))
+            }
+            UndoAction::Geometry { id, previous, next } => {
+                let target = match direction {
+                    HistoryDirection::Back => *previous,
+                    HistoryDirection::Forward => *next,
+                };
+                let tab = self.state.active_mut()?;
+                let found = tab
+                    .annotations
+                    .as_mut()
+                    .and_then(|list| list.iter_mut().find(|a| a.id == *id));
+                // A stale id after a delete must not move whichever
+                // annotation shifted into its slot.
+                let annotation = found?;
+                annotation.rect = target;
+                tab.dirty = true;
+                Some((
+                    cons(
+                        Effect::UpdateAnnotationBounds {
+                            doc,
+                            id: *id,
+                            rect: target,
+                        },
+                        invalidate,
+                    ),
+                    entry.clone(),
+                ))
+            }
+            UndoAction::Color { id, previous, next } => {
+                let target = match direction {
+                    HistoryDirection::Back => *previous,
+                    HistoryDirection::Forward => *next,
+                };
+                let tab = self.state.active_mut()?;
+                let found = tab
+                    .annotations
+                    .as_mut()
+                    .and_then(|list| list.iter_mut().find(|a| a.id == *id));
+                let annotation = found?;
+                annotation.color = Some(target);
+                tab.dirty = true;
+                Some((
+                    cons(
+                        Effect::SetAnnotationColor {
+                            doc,
+                            id: *id,
+                            color: target,
                         },
                         invalidate,
                     ),
@@ -1676,7 +1839,8 @@ mod tests {
             kind: crate::annotation::AnnotationKind::Highlight,
             rect: Rect::from_xywh(0.0, 0.0, 10.0, 10.0),
             contents: None,
-        }]);
+                color: None,
+}]);
         let effects = s.dispatch(Command::SetAnnotationContents {
             id: crate::annotation::AnnotationId::new(0, 0),
             contents: "hello".into(),
@@ -1707,13 +1871,15 @@ mod tests {
                 kind: crate::annotation::AnnotationKind::Highlight,
                 rect: Rect::from_xywh(0.0, 0.0, 10.0, 10.0),
                 contents: None,
-            },
+                        color: None,
+},
             crate::annotation::AnnotationInfo {
                 id: crate::annotation::AnnotationId::new(0, 1),
                 kind: crate::annotation::AnnotationKind::StickyNote,
                 rect: Rect::from_xywh(20.0, 20.0, 30.0, 30.0),
                 contents: Some("note".into()),
-            },
+                        color: None,
+},
         ];
         s.state.tabs[0].annotations = Some(annotations);
 
@@ -1753,7 +1919,8 @@ mod tests {
             kind: crate::annotation::AnnotationKind::StickyNote,
             rect: Rect::from_xywh(20.0, 20.0, 30.0, 30.0),
             contents: Some("note".into()),
-        }];
+                color: None,
+}];
         s.dispatch(Command::AnnotationsLoaded {
             doc,
             annotations: shifted,
@@ -1783,7 +1950,8 @@ mod tests {
             kind: crate::annotation::AnnotationKind::Highlight,
             rect: Rect::from_xywh(0.0, 0.0, 10.0, 10.0),
             contents: None,
-        }]);
+                color: None,
+}]);
         s.dispatch(Command::AnnotationsLoadFailed { doc });
         assert_eq!(
             s.state
@@ -1826,7 +1994,8 @@ mod tests {
             kind: crate::annotation::AnnotationKind::Highlight,
             rect: Rect::from_xywh(0.0, 0.0, 10.0, 10.0),
             contents: None,
-        }];
+                color: None,
+}];
         s.dispatch(Command::AnnotationsLoaded {
             doc,
             annotations: annotations.clone(),
@@ -1884,7 +2053,8 @@ mod tests {
                 kind: crate::annotation::AnnotationKind::Highlight,
                 rect: Rect::from_xywh(0.0, 0.0, 10.0, 10.0),
                 contents: None,
-            }],
+                        color: None,
+}],
             created: Some(crate::annotation::AnnotationId::new(0, 0)),
         });
         s.dispatch(Command::Undo);
@@ -1919,7 +2089,8 @@ mod tests {
             kind: crate::annotation::AnnotationKind::Square,
             rect: Rect::from_xywh(30.0, 40.0, 48.0, 48.0),
             contents: None,
-        }]);
+                color: None,
+}]);
 
         s.dispatch(Command::DeleteAnnotation(
             crate::annotation::AnnotationId::new(0, 3),
@@ -1942,13 +2113,15 @@ mod tests {
                     kind: crate::annotation::AnnotationKind::Highlight,
                     rect: Rect::from_xywh(0.0, 0.0, 5.0, 5.0),
                     contents: None,
-                },
+                                color: None,
+},
                 crate::annotation::AnnotationInfo {
                     id: crate::annotation::AnnotationId::new(0, 1),
                     kind: crate::annotation::AnnotationKind::Square,
                     rect: Rect::from_xywh(30.0, 40.0, 48.0, 48.0),
                     contents: None,
-                },
+                                color: None,
+},
             ],
             created: Some(crate::annotation::AnnotationId::new(0, 1)),
         });
@@ -1974,7 +2147,8 @@ mod tests {
             kind: crate::annotation::AnnotationKind::FreeText,
             rect: Rect::from_xywh(0.0, 0.0, 100.0, 20.0),
             contents: Some("before".into()),
-        }]);
+                color: None,
+}]);
 
         s.dispatch(Command::SetAnnotationContents {
             id: crate::annotation::AnnotationId::new(0, 0),
@@ -2009,7 +2183,8 @@ mod tests {
             kind: crate::annotation::AnnotationKind::FreeText,
             rect: Rect::from_xywh(0.0, 0.0, 100.0, 20.0),
             contents: Some("before".into()),
-        }]);
+                color: None,
+}]);
 
         s.dispatch(Command::SetAnnotationContents {
             id: crate::annotation::AnnotationId::new(0, 0),
@@ -2041,7 +2216,8 @@ mod tests {
             kind: crate::annotation::AnnotationKind::StickyNote,
             rect: Rect::from_xywh(30.0, 40.0, 48.0, 48.0),
             contents: Some("kept text".into()),
-        }]);
+                color: None,
+}]);
 
         s.dispatch(Command::DeleteAnnotation(
             crate::annotation::AnnotationId::new(0, 3),
@@ -2080,7 +2256,8 @@ mod tests {
             kind: crate::annotation::AnnotationKind::FreeText,
             rect: Rect::from_xywh(0.0, 0.0, 100.0, 20.0),
             contents: Some("before".into()),
-        }]);
+                color: None,
+}]);
 
         s.dispatch(Command::SetAnnotationContents {
             id: crate::annotation::AnnotationId::new(0, 0),
@@ -2288,5 +2465,131 @@ mod tests {
                 output: PathBuf::from("merged.pdf"),
             }]
         );
+    }
+
+    /// Moving an annotation updates the listed rectangle, records an undo
+    /// entry, and undoes and redoes through the engine effect — the whole
+    /// loop a canvas drag depends on.
+    #[test]
+    fn annotation_move_updates_list_and_is_undoable() {
+        let (mut s, _tab) = opened_store(1);
+        let id = crate::annotation::AnnotationId::new(0, 0);
+        s.state.tabs[0].annotations = Some(vec![crate::annotation::AnnotationInfo {
+            id,
+            kind: crate::annotation::AnnotationKind::Highlight,
+            rect: Rect::from_xywh(10.0, 20.0, 40.0, 10.0),
+            contents: None,
+            color: Some([255, 202, 40, 255]),
+        }]);
+        // The selection must survive a geometry edit: the user drags the mark
+        // they selected, and the handles must not vanish mid-gesture.
+        s.state.tabs[0].view.selected_annotation = Some(id);
+
+        let effects = s.dispatch(Command::UpdateAnnotationBounds {
+            id,
+            rect: Rect::from_xywh(30.0, 25.0, 80.0, 12.0),
+        });
+
+        let list = s.state.active().unwrap().annotations.clone().unwrap();
+        assert_eq!(list[0].rect, Rect::from_xywh(30.0, 25.0, 80.0, 12.0));
+        assert_eq!(s.state.active().unwrap().view.selected_annotation, Some(id));
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::UpdateAnnotationBounds { rect, .. } if *rect == Rect::from_xywh(30.0, 25.0, 80.0, 12.0))),
+            "the move must reach the engine"
+        );
+        assert!(
+            effects.iter().any(|e| matches!(e, Effect::InvalidateTiles)),
+            "the move must invalidate tiles"
+        );
+        assert!(matches!(
+            s.state.active().unwrap().undo_stack.last(),
+            Some(UndoAction::Geometry { .. })
+        ));
+
+        // Undo restores the original rectangle and drives the engine with it.
+        let effects = s.dispatch(Command::Undo);
+        let list = s.state.active().unwrap().annotations.clone().unwrap();
+        assert_eq!(list[0].rect, Rect::from_xywh(10.0, 20.0, 40.0, 10.0));
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::UpdateAnnotationBounds { rect, .. } if *rect == Rect::from_xywh(10.0, 20.0, 40.0, 10.0))),
+            "undo must replay the previous geometry"
+        );
+
+        // Redo puts it back.
+        s.dispatch(Command::Redo);
+        let list = s.state.active().unwrap().annotations.clone().unwrap();
+        assert_eq!(list[0].rect, Rect::from_xywh(30.0, 25.0, 80.0, 12.0));
+    }
+
+    /// Recolouring works the same way: list updates, undo/redo round-trips,
+    /// and a stale id edits nothing.
+    #[test]
+    fn annotation_recolor_updates_list_and_is_undoable() {
+        let (mut s, _tab) = opened_store(1);
+        let id = crate::annotation::AnnotationId::new(0, 0);
+        s.state.tabs[0].annotations = Some(vec![crate::annotation::AnnotationInfo {
+            id,
+            kind: crate::annotation::AnnotationKind::Square,
+            rect: Rect::from_xywh(0.0, 0.0, 40.0, 40.0),
+            contents: None,
+            color: Some([244, 67, 54, 255]),
+        }]);
+
+        let effects = s.dispatch(Command::SetAnnotationColor {
+            id,
+            color: [33, 150, 243, 128],
+        });
+        let list = s.state.active().unwrap().annotations.clone().unwrap();
+        assert_eq!(list[0].color, Some([33, 150, 243, 128]));
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::SetAnnotationColor { color, .. } if *color == [33, 150, 243, 128])),
+            "the recolour must reach the engine"
+        );
+
+        s.dispatch(Command::Undo);
+        let list = s.state.active().unwrap().annotations.clone().unwrap();
+        assert_eq!(list[0].color, Some([244, 67, 54, 255]));
+
+        s.dispatch(Command::Redo);
+        let list = s.state.active().unwrap().annotations.clone().unwrap();
+        assert_eq!(list[0].color, Some([33, 150, 243, 128]));
+
+        // A stale id edits nothing: no effects, no history, no list change.
+        let before = s.state.active().unwrap().undo_stack.len();
+        let effects = s.dispatch(Command::SetAnnotationColor {
+            id: crate::annotation::AnnotationId::new(0, 99),
+            color: [0, 0, 0, 255],
+        });
+        assert!(effects.is_empty());
+        assert_eq!(s.state.active().unwrap().undo_stack.len(), before);
+    }
+
+    /// A drag that ends where it began is a click, not an edit: no effects
+    /// and no undo entry, so undo never replays a phantom move.
+    #[test]
+    fn moving_an_annotation_to_the_same_rect_is_a_noop() {
+        let (mut s, _tab) = opened_store(1);
+        let id = crate::annotation::AnnotationId::new(0, 0);
+        s.state.tabs[0].annotations = Some(vec![crate::annotation::AnnotationInfo {
+            id,
+            kind: crate::annotation::AnnotationKind::Highlight,
+            rect: Rect::from_xywh(10.0, 20.0, 40.0, 10.0),
+            contents: None,
+            color: None,
+        }]);
+
+        let effects = s.dispatch(Command::UpdateAnnotationBounds {
+            id,
+            rect: Rect::from_xywh(10.0, 20.0, 40.0, 10.0),
+        });
+        assert!(effects.is_empty());
+        assert!(s.state.active().unwrap().undo_stack.is_empty());
+        assert!(!s.state.active().unwrap().dirty);
     }
 }

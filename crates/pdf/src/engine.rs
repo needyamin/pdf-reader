@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use pdfium_render::prelude::*;
 use pdfreader_core::{
     AnnotationId, AnnotationInfo, FormInfo, ImageFormat, ImagePageSize, NewAnnotation, Outline,
-    OutlineNode, PageGeometry, PageRange, Rotation,
+    OutlineNode, PageGeometry, PageRange, Rect, Rotation,
 };
 
 use crate::annot;
@@ -179,6 +179,25 @@ pub trait PdfEngine {
         id: AnnotationId,
         contents: &str,
     ) -> Result<()>;
+
+    /// Move / resize one annotation to cover `rect` (PDF page space).
+    ///
+    /// Returns `Ok(false)` when the id no longer resolves, matching
+    /// [`Self::delete_annotation`]'s stale-id convention.
+    fn update_annotation_bounds(
+        &mut self,
+        handle: DocumentHandle,
+        id: AnnotationId,
+        rect: Rect,
+    ) -> Result<bool>;
+
+    /// Recolour one annotation. The alpha byte is the rendered opacity.
+    fn set_annotation_color(
+        &mut self,
+        handle: DocumentHandle,
+        id: AnnotationId,
+        color: [u8; 4],
+    ) -> Result<bool>;
 
     /// Rasterize one page and write it to `path` as an image file.
     ///
@@ -499,9 +518,22 @@ impl PdfEngine for PdfiumEngine {
 
         let mut pages = Vec::new();
         for page in document.pages().iter() {
+            // The page's visible box (CropBox, falling back to MediaBox) defines the
+            // PDF coordinate origin. The rendered bitmap is anchored at that origin,
+            // so the UI transform must offset by it — scanned/image PDFs routinely
+            // carry a non-zero origin, and without it annotations land off the
+            // cursor.
+            let origin = page
+                .boundaries()
+                .crop()
+                .or_else(|_| page.boundaries().media())
+                .map(|b| (b.bounds.left().value, b.bounds.bottom().value))
+                .unwrap_or((0.0, 0.0));
             pages.push(PageGeometry {
                 width_pt: page.width().value,
                 height_pt: page.height().value,
+                origin_x: origin.0,
+                origin_y: origin.1,
             });
         }
 
@@ -768,6 +800,34 @@ impl PdfEngine for PdfiumEngine {
             .get_mut(&handle)
             .ok_or(EngineError::NotOpen(handle.raw()))?;
         annot::change_contents(document, id, contents)
+            .map_err(|error| EngineError::Pdfium(error.to_string()))
+    }
+
+    fn update_annotation_bounds(
+        &mut self,
+        handle: DocumentHandle,
+        id: AnnotationId,
+        rect: Rect,
+    ) -> Result<bool> {
+        let document = self
+            .documents
+            .get_mut(&handle)
+            .ok_or(EngineError::NotOpen(handle.raw()))?;
+        annot::update_annotation_bounds(document, id, rect)
+            .map_err(|error| EngineError::Pdfium(error.to_string()))
+    }
+
+    fn set_annotation_color(
+        &mut self,
+        handle: DocumentHandle,
+        id: AnnotationId,
+        color: [u8; 4],
+    ) -> Result<bool> {
+        let document = self
+            .documents
+            .get_mut(&handle)
+            .ok_or(EngineError::NotOpen(handle.raw()))?;
+        annot::set_annotation_color(document, id, color)
             .map_err(|error| EngineError::Pdfium(error.to_string()))
     }
 

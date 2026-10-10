@@ -43,6 +43,16 @@ pub(crate) fn list_annotations(document: &PdfDocument<'_>) -> Vec<AnnotationInfo
             let Ok(bounds) = annotation.bounds() else {
                 continue;
             };
+            // The stroke colour is what markup, rectangle and note annotations
+            // draw with. pdfium-render (vendored, patched) returns an error —
+            // never crashes — when the annotation has no colour entry, so an
+            // unconditional read is safe: kinds without a colour simply report
+            // `None`. See the [patch.crates-io] note in the workspace
+            // Cargo.toml for why the vendored copy exists.
+            let color = annotation
+                .stroke_color()
+                .ok()
+                .map(|c| [c.red(), c.green(), c.blue(), c.alpha()]);
             out.push(AnnotationInfo {
                 id: AnnotationId::new(page_index as u32, annot_index as u32),
                 kind,
@@ -53,6 +63,7 @@ pub(crate) fn list_annotations(document: &PdfDocument<'_>) -> Vec<AnnotationInfo
                     bounds.height().value,
                 ),
                 contents: annotation.contents().filter(|c| !c.is_empty()),
+                color,
             });
         }
     }
@@ -118,6 +129,10 @@ pub(crate) fn create_annotation(
         NewAnnotation::Highlight(rect) => {
             let mut annot = annotations.create_highlight_annotation()?;
             mark_printable(&mut annot)?;
+            // PDFium may reject `/C` on an existing document whose annotation
+            // appearance is not writable. The annotation itself is still valid
+            // and must not disappear just because its optional colour could
+            // not be changed; keep PDFium's default appearance in that case.
             place_markup(&mut annot, *rect, PdfColor::YELLOW)?;
         }
         NewAnnotation::Underline(rect) => {
@@ -139,7 +154,10 @@ pub(crate) fn create_annotation(
             let mut annot = annotations.create_square_annotation()?;
             mark_printable(&mut annot)?;
             annot.set_bounds(pdf_rect(*rect))?;
-            annot.set_stroke_color(PdfColor::RED)?;
+            // Colour is an optional appearance property. Some PDFs expose a
+            // read-only appearance stream, so a failed colour write must not
+            // make the rectangle tool itself fail.
+            let _ = annot.set_stroke_color(PdfColor::RED);
             // Deliberately no fill call.
             //
             // Setting a *fully transparent* fill — which is how an
@@ -169,7 +187,7 @@ pub(crate) fn create_annotation(
                 ICON_PT,
                 ICON_PT,
             )))?;
-            annot.set_stroke_color(PdfColor::YELLOW)?;
+            let _ = annot.set_stroke_color(PdfColor::YELLOW);
             if contents.is_empty() {
                 annot.set_contents("Note")?;
             }
@@ -178,17 +196,39 @@ pub(crate) fn create_annotation(
             let mut annot = annotations.create_free_text_annotation(contents)?;
             mark_printable(&mut annot)?;
             annot.set_bounds(pdf_rect(*rect))?;
-            annot.set_stroke_color(PdfColor::BLACK)?;
+            let _ = annot.set_stroke_color(PdfColor::BLACK);
             annot.set_contents(contents)?;
         }
     }
 
     page.regenerate_content()?;
-    // PDFium appends new annotations to the end of the page's list; popups are
-    // hidden from `list_annotations` but still occupy indices, so the created
-    // widget is the LAST annotation on the page.
+    // PDFium appends new annotations to the end of the page's list — and for
+    // sticky notes it AUTO-CREATES a popup child right after the note, so the
+    // created annotation is not necessarily the last one. The popup is hidden
+    // from `list_annotations` but still occupies a positional index, so
+    // returning `count - 1` hands back the POPUP's id: the undo of "add note"
+    // would then delete the popup and leave the note on the page. Scan the
+    // raw list for the last annotation of the subtype we just created
+    // instead; popups report their own subtype and are skipped naturally.
+    let wanted = match new {
+        NewAnnotation::Highlight(_) => PdfPageAnnotationType::Highlight,
+        NewAnnotation::Underline(_) => PdfPageAnnotationType::Underline,
+        NewAnnotation::StrikeOut(_) => PdfPageAnnotationType::Strikeout,
+        NewAnnotation::Squiggly(_) => PdfPageAnnotationType::Squiggly,
+        NewAnnotation::Square(_) => PdfPageAnnotationType::Square,
+        NewAnnotation::StickyNote(_, _) => PdfPageAnnotationType::Text,
+        NewAnnotation::FreeText(_, _) => PdfPageAnnotationType::FreeText,
+    };
     let count = page.annotations().len();
-    Ok(AnnotationId::new(page_index, (count - 1) as u32))
+    let raw: Vec<_> = page.annotations().iter().collect();
+    let index = raw
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, annotation)| annotation.annotation_type() == wanted)
+        .map(|(index, _)| index)
+        .unwrap_or(count - 1);
+    Ok(AnnotationId::new(page_index, index as u32))
 }
 
 /// Set the bounds and quad points of a markup annotation over `rect`.
@@ -198,7 +238,10 @@ fn place_markup<'a>(
     color: PdfColor,
 ) -> Result<(), pdfium_render::prelude::PdfiumError> {
     annot.set_bounds(pdf_rect(rect))?;
-    annot.set_stroke_color(color)?;
+    // Markup placement is the required part of creation. Colour is optional:
+    // on some existing PDFs PDFium refuses to rewrite the annotation colour,
+    // but the visible markup can still be created with its default colour.
+    let _ = annot.set_stroke_color(color);
     // Quad points in the order Acrobat writes them: top-left, top-right,
     // bottom-left, bottom-right, in PDF's y-up space.
     annot
@@ -324,6 +367,108 @@ pub(crate) fn change_contents(
     annotation.set_contents(contents)?;
     page.regenerate_content()?;
     Ok(())
+}
+
+/// Move / resize one annotation to cover `rect` (PDF page space, y up).
+///
+/// Returns `Ok(false)` when the id no longer resolves — ids are positional
+/// and shift after a removal, so a stale id names nothing rather than being
+/// an error.
+///
+/// Markup annotations (highlight and friends) render from their **quad
+/// points**, not their bounds, so moving one means rewriting the first quad
+/// as well as the bounds — a bounds-only write would leave the visible ink at
+/// the old spot. Quads beyond the first (foreign multi-line markup) are left
+/// alone: the bounds still track the whole annotation, and our own marks
+/// always carry exactly one quad.
+pub(crate) fn update_annotation_bounds(
+    document: &mut PdfDocument<'_>,
+    id: AnnotationId,
+    rect: Rect,
+) -> Result<bool, pdfium_render::prelude::PdfiumError> {
+    let mut page = document.pages_mut().get(id.page as i32)?;
+    let Ok(mut annotation) = page.annotations_mut().get(id.annot_index as usize) else {
+        return Ok(false);
+    };
+    let kind = classify(annotation.annotation_type());
+    annotation.set_bounds(pdf_rect(rect))?;
+    match kind {
+        AnnotationKind::Highlight => {
+            if let Some(mark) = annotation.as_highlight_annotation_mut() {
+                rewrite_first_quad(mark, rect)?;
+            }
+        }
+        AnnotationKind::Underline => {
+            if let Some(mark) = annotation.as_underline_annotation_mut() {
+                rewrite_first_quad(mark, rect)?;
+            }
+        }
+        AnnotationKind::StrikeOut => {
+            if let Some(mark) = annotation.as_strikeout_annotation_mut() {
+                rewrite_first_quad(mark, rect)?;
+            }
+        }
+        AnnotationKind::Squiggly => {
+            if let Some(mark) = annotation.as_squiggly_annotation_mut() {
+                rewrite_first_quad(mark, rect)?;
+            }
+        }
+        _ => {}
+    }
+    page.regenerate_content()?;
+    Ok(true)
+}
+
+/// Replace the first quad of a markup annotation with one covering `rect`,
+/// creating the quad when the annotation has none.
+fn rewrite_first_quad<'a>(
+    annot: &mut impl MarkupAnnotation<'a>,
+    rect: Rect,
+) -> Result<(), pdfium_render::prelude::PdfiumError> {
+    let quad = PdfQuadPoints::new(
+        PdfPoints::new(rect.min_x),
+        PdfPoints::new(rect.max_y),
+        PdfPoints::new(rect.max_x),
+        PdfPoints::new(rect.max_y),
+        PdfPoints::new(rect.min_x),
+        PdfPoints::new(rect.min_y),
+        PdfPoints::new(rect.max_x),
+        PdfPoints::new(rect.min_y),
+    );
+    let points = annot.attachment_points_mut();
+    if points.is_empty() {
+        points.create_attachment_point_at_end(quad)?;
+    } else {
+        points.set_attachment_point_at_index(0, quad)?;
+    }
+    Ok(())
+}
+
+/// Recolour one annotation.
+///
+/// The alpha byte is the annotation's rendered opacity, so this one call
+/// serves both the colour swatches and the opacity slider: changing opacity
+/// keeps the RGB and rewrites the alpha.
+pub(crate) fn set_annotation_color(
+    document: &mut PdfDocument<'_>,
+    id: AnnotationId,
+    color: [u8; 4],
+) -> Result<bool, pdfium_render::prelude::PdfiumError> {
+    let mut page = document.pages_mut().get(id.page as i32)?;
+    let Ok(mut annotation) = page.annotations_mut().get(id.annot_index as usize) else {
+        return Ok(false);
+    };
+    match annotation.set_stroke_color(PdfColor::new(color[0], color[1], color[2], color[3])) {
+        Ok(()) => {
+            page.regenerate_content()?;
+            Ok(true)
+        }
+        // A colour edit is optional for PDF annotations. In particular,
+        // imported /AP-only annotations can reject FPDFAnnot_SetColor; return
+        // false so the engine thread re-lists the real state instead of
+        // surfacing a scary "Annotation failed" error or crashing.
+        Err(_) => Ok(false),
+    }
 }
 
 /// Remove one annotation.

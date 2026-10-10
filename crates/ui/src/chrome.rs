@@ -17,6 +17,7 @@ use pdfreader_core::{
 };
 
 use crate::theme::Palette;
+use crate::window::dialog_window;
 
 /// Height of the compact application menu.
 pub const MENUBAR_HEIGHT: f32 = 28.0;
@@ -2784,4 +2785,203 @@ mod tests {
             output.textures_delta.clear();
         }
     }
+}
+
+// --- Annotation properties -------------------------------------------------
+//
+// The panel edits the annotation that is selected on the canvas: colour
+// swatches, an opacity slider, and the rectangle as four numeric fields. Every
+// control emits a domain command; the reducer owns the state, the engine owns
+// the pixels, and undo records every change.
+
+/// Colour presets the properties panel offers, as RGBA bytes. The alpha byte
+/// is the annotation's rendered opacity, so these swatches are fully opaque.
+const ANNOTATION_SWATCHES: [[u8; 4]; 8] = [
+    [255, 202, 40, 255],  // yellow — the highlight default
+    [76, 175, 80, 255],   // green
+    [33, 150, 243, 255],  // blue
+    [244, 67, 54, 255],   // red — the rectangle default
+    [255, 152, 0, 255],   // orange
+    [156, 39, 176, 255],  // purple
+    [96, 125, 139, 255],  // grey
+    [233, 30, 99, 255],   // pink
+];
+
+/// The floating properties window for the selected annotation.
+///
+/// Returns nothing when nothing (or nothing editable) is selected: links and
+/// foreign annotation types are listed in the Comments panel but their
+/// internals are not ours to edit.
+pub fn annotation_properties_window(
+    ctx: &egui::Context,
+    palette: &Palette,
+    annotations: &[AnnotationInfo],
+    selected: Option<AnnotationId>,
+) -> Vec<Command> {
+    let mut commands = Vec::new();
+    let Some(selected) = selected else {
+        return commands;
+    };
+    let Some(annotation) = annotations.iter().find(|a| a.id == selected) else {
+        return commands;
+    };
+    if !annotation.kind.is_creatable() {
+        return commands;
+    }
+
+    let title = format!("{} · page {}", annotation.kind.label(), annotation.id.page + 1);
+    dialog_window(&title, palette)
+        .anchor(Align2::RIGHT_CENTER, Vec2::new(-24.0, 0.0))
+        .default_width(240.0)
+        .show(ctx, |ui| {
+            ui.spacing_mut().item_spacing.y = 8.0;
+
+            // Colour. One row of swatches; the current colour is outlined.
+            ui.label(
+                RichText::new("Colour").size(11.0).color(palette.text_dim),
+            );
+            let current = annotation.color.unwrap_or([0, 0, 0, 255]);
+            egui::Grid::new("swatches")
+                .num_columns(8)
+                .spacing([6.0, 6.0])
+                .show(ui, |ui| {
+                    for swatch in ANNOTATION_SWATCHES {
+                        let fill = Color32::from_rgba_unmultiplied(
+                            swatch[0],
+                            swatch[1],
+                            swatch[2],
+                            swatch[3],
+                        );
+                        let is_current = swatch[0..3] == current[0..3];
+                        let size = Vec2::splat(18.0);
+                        let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+                        let painter = ui.painter();
+                        painter.rect_filled(rect, 4.0, fill);
+                        if is_current {
+                            painter.rect_stroke(
+                                rect,
+                                4.0,
+                                Stroke::new(2.0, palette.text),
+                                StrokeKind::Inside,
+                            );
+                        } else if response.hovered() {
+                            painter.rect_stroke(
+                                rect,
+                                4.0,
+                                Stroke::new(1.0, palette.text_dim),
+                                StrokeKind::Inside,
+                            );
+                        }
+                        if response.clicked() {
+                            commands.push(Command::SetAnnotationColor {
+                                id: annotation.id,
+                                color: swatch,
+                            });
+                        }
+                    }
+                    ui.end_row();
+                });
+
+            // Opacity. One control, one meaning: the alpha byte of the same
+            // colour. Changing it keeps the RGB.
+            ui.label(
+                RichText::new("Opacity")
+                    .size(11.0)
+                    .color(palette.text_dim),
+            );
+            let mut percent = (current[3] as f32 / 255.0 * 100.0).round();
+            let slider = egui::Slider::new(&mut percent, 10.0..=100.0)
+                .suffix("%")
+                .show_value(true);
+            let response = ui.add(slider);
+            if response.drag_stopped() || response.lost_focus() {
+                let alpha = (percent / 100.0 * 255.0).round().clamp(26.0, 255.0) as u8;
+                commands.push(Command::SetAnnotationColor {
+                    id: annotation.id,
+                    color: [current[0], current[1], current[2], alpha],
+                });
+            }
+
+            // Geometry. The four numbers are the annotation's PDF-space
+            // rectangle; W and H grow from the bottom-left corner.
+            ui.label(
+                RichText::new("Size & position (pt)")
+                    .size(11.0)
+                    .color(palette.text_dim),
+            );
+            egui::Grid::new("geometry")
+                .num_columns(4)
+                .spacing([8.0, 4.0])
+                .show(ui, |ui| {
+                    let w = annotation.rect.width();
+                    let h = annotation.rect.height();
+                    for (label, value, min) in [
+                        ("X", annotation.rect.min_x, f32::NEG_INFINITY),
+                        ("Y", annotation.rect.min_y, f32::NEG_INFINITY),
+                        ("W", w, 1.0),
+                        ("H", h, 1.0),
+                    ] {
+                        ui.label(RichText::new(label).size(11.0).color(palette.text_dim));
+                        let mut v = value;
+                        let response = ui.add(
+                            egui::DragValue::new(&mut v)
+                                .speed(0.5)
+                                .range(min..=f32::INFINITY),
+                        );
+                        if (response.drag_stopped() || response.lost_focus()) && v != value {
+                            let rect = match label {
+                                "X" => pdf_rect_moved_x(annotation.rect, v),
+                                "Y" => pdf_rect_moved_y(annotation.rect, v),
+                                "W" => pdf_rect_with_width(annotation.rect, v),
+                                _ => pdf_rect_with_height(annotation.rect, v),
+                            };
+                            commands.push(Command::UpdateAnnotationBounds {
+                                id: annotation.id,
+                                rect,
+                            });
+                        }
+                    }
+                    ui.end_row();
+                });
+
+            ui.separator();
+            let delete = egui::Button::new(
+                RichText::new("Delete").color(Color32::from_rgb(198, 40, 40)),
+            );
+            if ui.add(delete).clicked() {
+                commands.push(Command::DeleteAnnotation(annotation.id));
+            }
+        });
+
+    commands
+}
+
+/// The rectangle with `min_x` moved to `x`, size preserved.
+fn pdf_rect_moved_x(rect: pdfreader_core::Rect, x: f32) -> pdfreader_core::Rect {
+    pdfreader_core::Rect::from_xywh(
+        x,
+        rect.min_y,
+        rect.width(),
+        rect.height(),
+    )
+}
+
+/// The rectangle with `min_y` moved to `y`, size preserved.
+fn pdf_rect_moved_y(rect: pdfreader_core::Rect, y: f32) -> pdfreader_core::Rect {
+    pdfreader_core::Rect::from_xywh(
+        rect.min_x,
+        y,
+        rect.width(),
+        rect.height(),
+    )
+}
+
+/// The rectangle with its width set to `w`, corner fixed.
+fn pdf_rect_with_width(rect: pdfreader_core::Rect, w: f32) -> pdfreader_core::Rect {
+    pdfreader_core::Rect::from_xywh(rect.min_x, rect.min_y, w.max(1.0), rect.height())
+}
+
+/// The rectangle with its height set to `h`, corner fixed.
+fn pdf_rect_with_height(rect: pdfreader_core::Rect, h: f32) -> pdfreader_core::Rect {
+    pdfreader_core::Rect::from_xywh(rect.min_x, rect.min_y, rect.width(), h.max(1.0))
 }

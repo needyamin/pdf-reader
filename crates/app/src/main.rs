@@ -34,7 +34,7 @@ use pdfreader_pdf::engine::{DocumentHandle, PdfiumEngine};
 use pdfreader_search::SearchMatch;
 use pdfreader_ui::{
     MENUBAR_HEIGHT, STATUSBAR_HEIGHT, TABBAR_HEIGHT, TOOLBAR_HEIGHT, TOOLS_RAIL_WIDTH, TextStyle,
-    annotation_bar, comments_panel, forms_panel, menu_bar, outline_tree, sidebar_tabs, status_bar,
+    annotation_bar, annotation_properties_window, comments_panel, forms_panel, menu_bar, outline_tree, sidebar_tabs, status_bar,
     tab_bar, toolbar, tools_rail,
 };
 use serde::{Deserialize, Serialize};
@@ -1113,6 +1113,24 @@ impl App {
                             id,
                             contents,
                         });
+                    }
+                    self.canvas.invalidate_page(doc, id.page);
+                }
+                Effect::UpdateAnnotationBounds { doc, id, rect } => {
+                    if let Some(handle) = self.handles.get(&doc).copied() {
+                        self.engine.send(EngineRequest::UpdateAnnotationBounds {
+                            doc,
+                            handle,
+                            id,
+                            rect,
+                        });
+                    }
+                    self.canvas.invalidate_page(doc, id.page);
+                }
+                Effect::SetAnnotationColor { doc, id, color } => {
+                    if let Some(handle) = self.handles.get(&doc).copied() {
+                        self.engine
+                            .send(EngineRequest::SetAnnotationColor { doc, handle, id, color });
                     }
                     self.canvas.invalidate_page(doc, id.page);
                 }
@@ -2799,6 +2817,17 @@ impl eframe::App for App {
                                     tab.view.selected_annotation,
                                 );
                                 tiles.extend(pending);
+
+                                // The properties window for whichever
+                                // annotation is selected on the canvas. Drawn
+                                // in the same frame as the canvas so a fresh
+                                // selection opens the panel immediately.
+                                commands.extend(annotation_properties_window(
+                                    ui.ctx(),
+                                    &palette,
+                                    tab.annotations.as_deref().unwrap_or(&[]),
+                                    tab.view.selected_annotation,
+                                ));
 
                                 // Text for every page on screen, so a click can
                                 // be hit-tested to a character. Extraction is

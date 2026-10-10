@@ -240,6 +240,14 @@ pub enum Command {
     /// Select an annotation, or clear the selection with `None`.
     SelectAnnotation(Option<crate::annotation::AnnotationId>),
 
+    /// Select an annotation without scrolling to it.
+    ///
+    /// The canvas uses this when the user clicks an annotation that is
+    /// already on screen: centring the view on every click would yank the
+    /// page out from under the pointer, and a drag that began at the click
+    /// would compute its delta against a moving viewport.
+    SelectAnnotationInPlace(Option<crate::annotation::AnnotationId>),
+
     /// Create an annotation with the current tool.
     ///
     /// The reducer marks the document dirty and emits an effect; the engine
@@ -261,6 +269,29 @@ pub enum Command {
         id: crate::annotation::AnnotationId,
         /// The new text.
         contents: String,
+    },
+
+    /// Move / resize an annotation to a new rectangle.
+    ///
+    /// `rect` is in unrotated PDF page space, exactly like
+    /// [`crate::annotation::AnnotationInfo::rect`]. The reducer updates the
+    /// listed annotation immediately (the engine call only repaints) and
+    /// records the geometry change for undo.
+    UpdateAnnotationBounds {
+        /// Which annotation.
+        id: crate::annotation::AnnotationId,
+        /// The new bounds, in PDF page space.
+        rect: crate::rect::Rect,
+    },
+
+    /// Recolour an annotation. RGBA bytes; the alpha byte is the rendered
+    /// opacity, so one command serves both the colour swatches and the
+    /// opacity slider.
+    SetAnnotationColor {
+        /// Which annotation.
+        id: crate::annotation::AnnotationId,
+        /// The new colour.
+        color: [u8; 4],
     },
 
     /// Undo the last annotation operation on the active document.
@@ -528,6 +559,26 @@ pub enum Effect {
         id: crate::annotation::AnnotationId,
         /// The new text.
         contents: String,
+    },
+
+    /// Move / resize an annotation on the engine thread.
+    UpdateAnnotationBounds {
+        /// Document to edit.
+        doc: crate::document::DocumentId,
+        /// Which annotation.
+        id: crate::annotation::AnnotationId,
+        /// The new bounds, in PDF page space.
+        rect: crate::rect::Rect,
+    },
+
+    /// Recolour an annotation on the engine thread.
+    SetAnnotationColor {
+        /// Document to edit.
+        doc: crate::document::DocumentId,
+        /// Which annotation.
+        id: crate::annotation::AnnotationId,
+        /// RGBA bytes; the alpha byte is the rendered opacity.
+        color: [u8; 4],
     },
 
     /// Rasterize one page and write it out as an image file.

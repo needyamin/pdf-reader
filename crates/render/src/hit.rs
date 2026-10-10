@@ -142,8 +142,14 @@ impl PageSpace {
             _ => (w - v, u),
         };
 
-        // Flip into PDF's bottom-left origin.
-        (ux, h - vy)
+        // Flip into PDF's bottom-left origin and offset by the page's real
+        // coordinate origin. Many scanned/image PDFs carry a non-zero MediaBox
+        // origin; skipping this offset drops the mark somewhere other than where
+        // it was drawn.
+        (
+            ux + self.geom.origin_x,
+            h - vy + self.geom.origin_y,
+        )
     }
 
     /// Convert an unrotated PDF-space point back to layout space.
@@ -151,7 +157,8 @@ impl PageSpace {
     /// Inverse of [`Self::to_page`].
     pub fn to_screen_point(self, p: (f32, f32)) -> (f32, f32) {
         let (w, h) = (self.geom.width_pt, self.geom.height_pt);
-        let (x, y) = p;
+        // Work in the page's coordinate origin before flipping into layout space.
+        let (x, y) = (p.0 - self.geom.origin_x, p.1 - self.geom.origin_y);
 
         // Rotate into the displayed image, measuring `v` from the top.
         let (u, v) = match self.rotation.quarter_turns() {
@@ -220,6 +227,8 @@ mod tests {
     const A4: PageGeometry = PageGeometry {
         width_pt: 595.28,
         height_pt: 841.89,
+        origin_x: 0.0,
+        origin_y: 0.0,
     };
 
     fn page(rotation: Rotation) -> PageSpace {

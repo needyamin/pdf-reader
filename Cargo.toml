@@ -100,3 +100,14 @@ opt-level = 1
 # crash with an internal compiler error (ICE). Turning incremental off
 # trades a little rebuild speed for a build that always works.
 incremental = false
+
+# The vendored pdfium-render carries one patch: upstream's colour accessors
+# "fall back" to FPDFPageObj_{Get,Set}{Fill,Stroke}Color with the annotation
+# handle cast to FPDF_PAGEOBJECT whenever FPDFAnnot_{Get,Set}Color returns
+# false. An FPDF_ANNOTATION is not an FPDF_PAGEOBJECT; that cast is type
+# confusion into PDFium and crashes the process (0xc0000005) the moment a
+# document lists an annotation without a colour entry - links, stamps, foreign
+# types, any real-world file. The vendored copy returns an error instead. See
+# vendor/pdfium-render/src/pdf/document/page/annotation/private.rs.
+[patch.crates-io]
+pdfium-render = { path = "vendor/pdfium-render" }

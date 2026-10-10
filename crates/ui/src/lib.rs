@@ -10,6 +10,7 @@ pub mod theme;
 pub mod window;
 
 pub use chrome::{
+    annotation_properties_window,
     ANNOTATION_BAR_HEIGHT, FORM_FONTS, MENUBAR_HEIGHT, ROW_PAD_X, ROW_PAD_Y, SIDEBAR_GAP,
     SIDEBAR_PAD_X, SIDEBAR_PAD_Y, SIDEBAR_TABS, STATUSBAR_HEIGHT, SearchFieldOutput, TABBAR_HEIGHT,
     TOOLBAR_HEIGHT, TOOLS_RAIL_WIDTH, TextStyle, annotation_bar, available_sidebar_tabs,

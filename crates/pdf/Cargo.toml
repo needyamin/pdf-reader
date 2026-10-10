@@ -18,5 +18,8 @@ tracing = { workspace = true }
 # re-export the crate that defines it.
 image = { workspace = true }
 
+[dev-dependencies]
+pdfreader-render = { workspace = true }
+
 [lints]
 workspace = true

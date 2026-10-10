@@ -313,6 +313,21 @@ pub struct Canvas {
     /// select, so a drag that starts there moves the view instead of doing
     /// nothing at all.
     press_on_background: bool,
+    /// The annotation the eraser most recently deleted during the current
+    /// press. Held only for the length of one press: a sweeping drag should
+    /// erase several marks in a row, but the annotation list lags a frame or
+    /// two behind the store, so without this the same mark is re-deleted
+    /// every frame until the refreshed list arrives.
+    erase_last: Option<AnnotationId>,
+    /// An in-progress drag of a selected annotation: moving it, or resizing
+    /// it by one of its handles. While it is set the text selection must not
+    /// react to the same gesture, and the dragged annotation is drawn as a
+    /// ghost at its target position until the engine re-renders the page.
+    ann_drag: Option<AnnDrag>,
+    /// The rectangle the in-progress drag has produced so far, in PDF page
+    /// space. Computed every frame from the pointer; on release it is what
+    /// gets committed to the store.
+    ann_drag_rect: Option<PdfSpaceRect>,
     /// Whether tiles just outside the viewport are requested ahead of time.
     /// Turning this off (Settings → Performance) saves memory and bandwidth at
     /// the cost of a brief blank flash when scrolling into a new area.
@@ -333,6 +348,64 @@ pub struct Canvas {
     /// lookup popup.
     lookup: Option<LookupRequest>,
 }
+
+/// What an in-progress annotation drag is doing.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum AnnDrag {
+    /// The whole annotation is being dragged: `start` is the content-local
+    /// pointer position at press, `rect` the annotation's bounds then.
+    Move {
+        id: AnnotationId,
+        page: u32,
+        start: (f32, f32),
+        rect: PdfSpaceRect,
+    },
+    /// One resize handle is being dragged; `rect` is the annotation's bounds
+    /// at press, and the handle's opposite corner or edge stays fixed.
+    Resize {
+        id: AnnotationId,
+        page: u32,
+        handle: ResizeHandle,
+        rect: PdfSpaceRect,
+    },
+}
+
+impl AnnDrag {
+    fn id(self) -> AnnotationId {
+        match self {
+            AnnDrag::Move { id, .. } | AnnDrag::Resize { id, .. } => id,
+        }
+    }
+
+    fn page(self) -> u32 {
+        match self {
+            AnnDrag::Move { page, .. } | AnnDrag::Resize { page, .. } => page,
+        }
+    }
+
+    fn rect(self) -> PdfSpaceRect {
+        match self {
+            AnnDrag::Move { rect, .. } | AnnDrag::Resize { rect, .. } => rect,
+        }
+    }
+}
+
+/// Which resize handle of a selected annotation is being dragged.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ResizeHandle {
+    NorthWest,
+    North,
+    NorthEast,
+    East,
+    SouthEast,
+    South,
+    SouthWest,
+    West,
+}
+
+/// The smallest allowed width or height of a resized annotation, in PDF
+/// points. Below this a drag would collapse the mark into an invisible line.
+const MIN_ANN_SIZE: f32 = 8.0;
 
 impl Default for Canvas {
     fn default() -> Self {
@@ -377,6 +450,9 @@ impl Canvas {
             select_start: None,
             selecting: false,
             press_on_background: false,
+            erase_last: None,
+            ann_drag: None,
+            ann_drag_rect: None,
             pressing_page: false,
             prefetch: true,
             form_font: FormFont::default(),
@@ -1094,11 +1170,96 @@ impl Canvas {
                 }
             }
 
+            // Selecting and dragging existing annotations with the Select
+            // tool. A press on a selected annotation's resize handle starts a
+            // resize; a press on any editable annotation selects it (without
+            // scrolling, unlike the Comments panel) and starts a move. Both
+            // own the whole gesture: the text selection below must not also
+            // react to it.
+            if tool == Tool::Select && !self.pan_tool {
+                let pointer = ui.input(|i| i.pointer.clone());
+                let in_view = pointer
+                    .latest_pos()
+                    .is_some_and(|pos| ui.clip_rect().contains(pos));
+                let press = pointer.primary_pressed() && in_view;
+                if press {
+                    if let Some(pos) = pointer.interact_pos().or(pointer.latest_pos()) {
+                        let local = (pos.x - content_origin.x, pos.y - content_origin.y);
+                        let screen = pos;
+                        let mut started = false;
+
+                        // Handles of the current selection take priority over
+                        // everything: without this a handle sitting over
+                        // another annotation could never be grabbed.
+                        if let Some(sel) = selected_annotation {
+                            if let Some(info) = annotations.iter().find(|a| a.id == sel) {
+                                if info.kind != AnnotationKind::StickyNote {
+                                    if let Some(space) =
+                                        page_spaces.iter().find(|sp| sp.index == info.id.page)
+                                    {
+                                        if let Some(handle) =
+                                            handle_hit(space, info.rect, screen)
+                                        {
+                                            self.ann_drag = Some(AnnDrag::Resize {
+                                                id: info.id,
+                                                page: info.id.page,
+                                                handle,
+                                                rect: info.rect,
+                                            });
+                                            started = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Then the body of any editable annotation.
+                        if !started {
+                            let editable: Vec<AnnotationInfo> = annotations
+                                .iter()
+                                .filter(|a| a.kind.is_creatable())
+                                .cloned()
+                                .collect();
+                                if let Some(id) =
+                                    select_hit(&page_spaces, &editable, pos2(local.0, local.1))
+                                {
+                                    if selected_annotation != Some(id) {
+                                        self.edits
+                                            .push(Command::SelectAnnotationInPlace(Some(id)));
+                                    }
+                                if let Some(info) = annotations.iter().find(|a| a.id == id) {
+                                    self.ann_drag = Some(AnnDrag::Move {
+                                        id,
+                                        page: id.page,
+                                        start: local,
+                                        rect: info.rect,
+                                    });
+                                }
+                                started = true;
+                            }
+                        }
+
+                        if started {
+                            // The click must not ALSO clear the selection or
+                            // re-select a note card on release.
+                            self.clicked_at = None;
+                        }
+                    }
+                }
+            }
+
             // Text selection. With no annotation tool active, a click widens to
             // the word under it and a drag selects a phrase. Neither is
             // interpreted here: the pick is handed to the shell, which owns the
-            // dictionaries and the popup.
-            if tool.annotation_kind().is_none() && !self.pan_tool {
+            // dictionaries and the popup. The eraser is excluded: it is a
+            // click tool like selection, but its press erases instead, so the
+            // two must never both answer the same gesture. An in-progress
+            // annotation drag owns the gesture too.
+            if tool.annotation_kind().is_none()
+                && !self.pan_tool
+                && tool != Tool::Eraser
+                && self.ann_drag.is_none()
+            {
                 let pointer = ui.input(|i| i.pointer.clone());
                 let in_view = pointer
                     .latest_pos()
@@ -1429,6 +1590,148 @@ impl Canvas {
                 }
             }
 
+            // An in-progress annotation drag: compute the target rectangle
+            // from the pointer every frame, draw the annotation as a ghost at
+            // that position (its real pixels are baked into tiles and cannot
+            // move), and commit the new bounds to the store on release.
+            if let Some(drag) = self.ann_drag {
+                let pointer = ui.input(|i| i.pointer.clone());
+                if let (Some(space), Some(pos)) = (
+                    page_spaces.iter().find(|sp| sp.index == drag.page()),
+                    pointer.interact_pos().or(pointer.latest_pos()),
+                ) {
+                    let local = (pos.x - content_origin.x, pos.y - content_origin.y);
+                    let start_pdf = space.to_page(local);
+                    let new = match drag {
+                        AnnDrag::Move { start, rect, .. } => {
+                            let anchor = space.to_page(start);
+                            PdfSpaceRect::from_xywh(
+                                rect.min_x + (start_pdf.0 - anchor.0),
+                                rect.min_y + (start_pdf.1 - anchor.1),
+                                rect.width(),
+                                rect.height(),
+                            )
+                        }
+                        AnnDrag::Resize { handle, rect, .. } => {
+                            resize_rect(rect, handle, start_pdf)
+                        }
+                    };
+                    self.ann_drag_rect = Some(new);
+
+                    let held = pointer.primary_down();
+                    if held {
+                        let screen = space.to_screen(new);
+                        let ghost = Rect::from_min_size(
+                            pos2(screen.x, screen.y),
+                            vec2(screen.w.max(1.0), screen.h.max(1.0)),
+                        )
+                        .translate(content_origin.to_vec2());
+                        painter.rect_filled(
+                            ghost,
+                            2.0,
+                            Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 40),
+                        );
+                        painter.rect_stroke(
+                            ghost,
+                            2.0,
+                            Stroke::new(1.5, accent),
+                            StrokeKind::Outside,
+                        );
+                    } else {
+                        // Release. The recorded click is consumed UNCONDITION-
+                        // ALLY here: the press selected the annotation, and
+                        // without this the release-click would fall through
+                        // to the click resolution below, which treats a click
+                        // on empty paper as "deselect" — instantly wiping the
+                        // selection the press just made. That is exactly the
+                        // "select → immediately deselected, can't edit"
+                        // report; a click on the body is selection, not an
+                        // edit, so a no-move release commits nothing.
+                        self.clicked_at = None;
+                        if let Some(id) = self.ann_drag.take().map(|d| d.id()) {
+                            if let Some(final_rect) = self.ann_drag_rect.take() {
+                                let start_rect = drag.rect();
+                                let moved = (final_rect.min_x - start_rect.min_x).abs()
+                                    > f32::EPSILON
+                                    || (final_rect.min_y - start_rect.min_y).abs() > f32::EPSILON
+                                    || (final_rect.max_x - start_rect.max_x).abs() > f32::EPSILON
+                                    || (final_rect.max_y - start_rect.max_y).abs()
+                                        > f32::EPSILON;
+                                if moved {
+                                    self.edits.push(Command::UpdateAnnotationBounds {
+                                        id,
+                                        rect: final_rect,
+                                    });
+                                    // Echo the mark at its NEW position until
+                                    // the re-rendered tiles land: the ink is
+                                    // baked into the old tiles, so without
+                                    // the echo the mark visibly jumps back to
+                                    // where it was for a few frames — the
+                                    // "GUI does not come smoothly" half of
+                                    // the report.
+                                    if let Some(info) =
+                                        annotations.iter().find(|a| a.id == id)
+                                    {
+                                        let screen = space.to_screen(final_rect);
+                                        self.pending.push(PendingEcho {
+                                            doc: doc.id,
+                                            page: drag.page(),
+                                            kind: info.kind,
+                                            rect: Some(Rect::from_min_size(
+                                                pos2(screen.x, screen.y),
+                                                vec2(screen.w.max(1.0), screen.h.max(1.0)),
+                                            )),
+                                            point: None,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // The selected annotation: an accent outline plus resize handles
+            // on every editable kind except sticky notes, whose icon box is
+            // fixed-sized. Handles are drawn even while an edit drag runs, so
+            // the user never loses the grip they started from.
+            if let Some(sel) = selected_annotation {
+                if self.ann_drag.is_none() {
+                    if let Some(info) = annotations.iter().find(|a| a.id == sel) {
+                        if let Some(space) = page_spaces.iter().find(|sp| sp.index == info.id.page)
+                        {
+                            let screen = space.to_screen(info.rect);
+                            let outline = Rect::from_min_size(
+                                pos2(screen.x, screen.y),
+                                vec2(screen.w.max(1.0), screen.h.max(1.0)),
+                            )
+                            .translate(content_origin.to_vec2());
+                            painter.rect_stroke(
+                                outline,
+                                2.0,
+                                Stroke::new(1.4, accent),
+                                StrokeKind::Outside,
+                            );
+                            if info.kind != AnnotationKind::StickyNote {
+                                for point in handle_points(outline) {
+                                    painter.rect_filled(
+                                        Rect::from_center_size(point, vec2(7.0, 7.0)),
+                                        1.5,
+                                        Color32::WHITE,
+                                    );
+                                    painter.rect_stroke(
+                                        Rect::from_center_size(point, vec2(7.0, 7.0)),
+                                        1.5,
+                                        Stroke::new(1.0, accent),
+                                        StrokeKind::Inside,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             // The text selection, one box per line so a multi-line pick follows
             // the text instead of covering the gutter. Drawn above the opaque
             // tiles and below the tool preview.
@@ -1511,15 +1814,153 @@ impl Canvas {
             // consumes the click so the form-field hit-test below does not also
             // fire; a click on empty page clears the selection but is left
             // intact so field picking still runs.
-            if tool.annotation_kind().is_none() {
-                if let Some(pt) = click {
-                    let screen_pt = pos2(pt.0 + content_origin.x, pt.1 + content_origin.y);
+            if let Some(pt) = click {
+                let screen_pt = pos2(pt.0 + content_origin.x, pt.1 + content_origin.y);
+                if tool == Tool::Eraser {
+                    // Deletion happens on *press* in the eraser block below —
+                    // the mark should vanish the instant the button goes down,
+                    // and a held drag should sweep across several marks. This
+                    // arm only consumes the click so `clicked_at` cannot leak
+                    // into later frames or re-trigger anything on release.
+                    self.clicked_at = None;
+                } else if tool.annotation_kind().is_none() {
                     match topmost_card(&cards, screen_pt) {
                         Some(id) => {
                             self.edits.push(Command::SelectAnnotation(Some(id)));
                             self.clicked_at = None;
                         }
                         None => self.edits.push(Command::SelectAnnotation(None)),
+                    }
+                }
+            }
+
+            // The eraser: pressing erases the mark under the pointer, and
+            // holding the button sweeps across several marks in one gesture.
+            // While the tool is up the pointer carries a visible eraser cursor
+            // and the mark about to be deleted is highlighted, so a click can
+            // never delete a surprise.
+            if tool == Tool::Eraser {
+                let pointer = ui.input(|i| i.pointer.clone());
+                // The eraser sleeps while a pan is in progress (or the hand
+                // tool is up), and over a popup or window it must neither
+                // highlight nor delete: those live on a layer above the
+                // canvas, so the mark under the pointer there is not what the
+                // user actually sees.
+                let blocked = self.panning
+                    || self.pan_tool
+                    || pointer.latest_pos().is_some_and(|pos| {
+                        ui.ctx()
+                            .layer_id_at(pos)
+                            .map_or(false, |top| top != ui.layer_id())
+                    });
+                let in_view = !blocked
+                    && pointer
+                        .latest_pos()
+                        .is_some_and(|pos| ui.clip_rect().contains(pos));
+                let hover = if in_view {
+                    pointer
+                        .interact_pos()
+                        .or(pointer.latest_pos())
+                        .and_then(|pos| {
+                            let local = (pos.x - content_origin.x, pos.y - content_origin.y);
+                            erase_hit(&page_spaces, annotations, pos2(local.0, local.1))
+                        })
+                } else {
+                    None
+                };
+
+                // Press deletes. `erase_last` stops a still-held press from
+                // re-deleting the same mark every frame while the refreshed
+                // annotation list catches up; moving to a different mark
+                // deletes that one too, which is what makes the sweep work.
+                if pointer.primary_down() {
+                    if let Some(id) = hover {
+                        if self.erase_last != Some(id) {
+                            self.edits.push(Command::DeleteAnnotation(id));
+                            self.erase_last = Some(id);
+                        }
+                    }
+                } else {
+                    self.erase_last = None;
+                }
+
+                // Highlight the mark the eraser is over, in screen space.
+                if let Some(id) = hover {
+                    if let Some(ann) = annotations.iter().find(|a| a.id == id) {
+                        if let Some(space) = page_spaces.iter().find(|sp| sp.index == ann.id.page)
+                        {
+                            let screen = space.to_screen(ann.rect);
+                            let rect = Rect::from_min_size(
+                                pos2(screen.x, screen.y),
+                                vec2(screen.w.max(1.0), screen.h.max(1.0)),
+                            )
+                            .translate(content_origin.to_vec2());
+                            painter.rect_filled(
+                                rect.expand(2.0),
+                                2.0,
+                                Color32::from_rgba_unmultiplied(220, 60, 60, 30),
+                            );
+                            painter.rect_stroke(
+                                rect.expand(2.0),
+                                2.0,
+                                Stroke::new(1.5, Color32::from_rgb(220, 60, 60)),
+                                StrokeKind::Outside,
+                            );
+                        }
+                    }
+                }
+
+                // The eraser cursor itself: a small two-tone block whose
+                // top-left corner is the pointer position — the same point
+                // the erase hit-test uses, so what the corner touches is
+                // exactly what gets erased. It turns red over a mark it can
+                // delete. Drawn on the canvas because the OS cursors have no
+                // eraser shape.
+                if in_view {
+                    if let Some(pos) = pointer.interact_pos().or(pointer.latest_pos()) {
+                        let tip = pos;
+                        let body = Rect::from_min_size(tip, vec2(21.0, 14.0));
+                        let band = Rect::from_min_size(pos2(tip.x + 1.0, tip.y + 8.5), vec2(19.0, 4.5));
+                        painter.rect_filled(
+                            body.translate(vec2(1.0, 1.5)),
+                            3.0,
+                            Color32::from_rgba_unmultiplied(0, 0, 0, 45),
+                        );
+                        painter.rect_filled(body, 3.0, Color32::WHITE);
+                        painter.rect_filled(
+                            band,
+                            2.0,
+                            if hover.is_some() {
+                                Color32::from_rgb(220, 60, 60)
+                            } else {
+                                Color32::from_rgb(250, 130, 160)
+                            },
+                        );
+                        painter.rect_stroke(
+                            body,
+                            3.0,
+                            Stroke::new(1.0, Color32::from_rgb(90, 90, 90)),
+                            StrokeKind::Inside,
+                        );
+                    }
+                }
+            }
+
+            // A painted miniature beside the pointer for every drawing tool.
+            // The OS cursor set has no per-tool shapes, and winit's Windows
+            // backend silently falls back to a plain arrow for any icon it
+            // does not know — so this badge, not the cursor icon, is what
+            // makes the armed tool visible. It always works, on every
+            // platform. While it shows, the OS cursor hides, so exactly one
+            // pointer is on screen.
+            if tool_uses_pointer_badge(tool) && !self.panning && !self.pan_tool {
+                let pointer = ui.input(|i| i.pointer.clone());
+                let in_view = pointer
+                    .latest_pos()
+                    .is_some_and(|pos| ui.clip_rect().contains(pos));
+                if in_view {
+                    if let Some(pos) = pointer.interact_pos().or(pointer.latest_pos()) {
+                        draw_tool_badge(&painter, tool, pos);
                     }
                 }
             }
@@ -1537,11 +1978,13 @@ impl Canvas {
         // "the app is stuck" on a trackpad.
         let (panning, pan_delta) = ui.input(|input| {
             let pointer = &input.pointer;
+            // The eraser owns the primary drag: a held press sweeps across
+            // marks, so it must never be read as a pan gesture.
             let wants_pan = drag_pans(
                 pointer.middle_down(),
                 pointer.primary_down(),
                 self.pan_tool,
-                self.press_on_background,
+                self.press_on_background && tool != Tool::Eraser,
                 tool.annotation_kind().is_some(),
             );
             (
@@ -1586,12 +2029,37 @@ impl Canvas {
         }
 
         if ui.rect_contains_pointer(ui.clip_rect()) {
+            // The drawing tools paint their own cursor badge, which becomes
+            // the one and only pointer: while it shows, the OS cursor hides.
+            // Over a popup, window or tooltip the badge would paint beneath
+            // it, so there the OS cursor stays instead — still exactly one
+            // visible pointer either way.
+            let badge_active = tool_uses_pointer_badge(tool)
+                && !self.panning
+                && !self.pan_tool
+                && ui.input(|i| i.pointer.latest_pos()).is_some_and(|pos| {
+                    ui.clip_rect().contains(pos)
+                        && ui
+                            .ctx()
+                            .layer_id_at(pos)
+                            .map_or(true, |top| top == ui.layer_id())
+                });
             let cursor = if self.panning {
-                egui::CursorIcon::Grabbing
+                // `Grabbing` is not in winit's Windows mapping and would fall
+                // back to a plain arrow; the four-way move arrows read as
+                // "the view is being dragged".
+                egui::CursorIcon::Move
+            } else if self.ann_drag.is_some() {
+                // An annotation is being moved or resized.
+                egui::CursorIcon::Move
             } else if self.pan_tool {
-                egui::CursorIcon::Grab
+                // Same: `Grab` falls back to an arrow on Windows, while the
+                // pointing hand is mapped and reads as "the hand tool".
+                egui::CursorIcon::PointingHand
+            } else if badge_active {
+                egui::CursorIcon::None
             } else {
-                egui::CursorIcon::Default
+                tool_cursor(tool)
             };
             ui.ctx().set_cursor_icon(cursor);
         }
@@ -1871,6 +2339,143 @@ fn topmost_card(cards: &[(AnnotationId, Rect)], pt: Pos2) -> Option<AnnotationId
         .map(|(id, _)| *id)
 }
 
+/// Find the annotation to delete for an eraser click.
+///
+/// `pt` is in **content-local layout space** — the same space `self.clicked_at`
+/// is stored in (pointer position with `content_origin` already subtracted), and
+/// the same space `page_spaces` and `to_page` use. Do NOT pass the global
+/// `screen_pt` here: `hit_page` compares against page boxes that are also in
+/// content-local space, so a global point would fall outside every box and the
+/// eraser would delete nothing.
+///
+/// We locate the page under the point, convert the point into PDF page space,
+/// then return the id of the smallest annotation rect that contains it — so the
+/// most specific annotation at the cursor is erased. Returns `None` when the
+/// click is on empty page.
+fn erase_hit(
+    page_spaces: &[PageSpace],
+    annotations: &[AnnotationInfo],
+    screen_pt: Pos2,
+) -> Option<AnnotationId> {
+    let space = hit_page(page_spaces, (screen_pt.x, screen_pt.y))?;
+    let (px, py) = space.to_page((screen_pt.x, screen_pt.y));
+    let mut best: Option<(AnnotationId, f32)> = None;
+    for ann in annotations.iter().filter(|a| a.id.page == space.index) {
+        if ann.rect.contains(px, py) {
+            let area = ann.rect.area();
+            match best {
+                Some((_, best_area)) if best_area <= area => {}
+                _ => best = Some((ann.id, area)),
+            }
+        }
+    }
+    best.map(|(id, _)| id)
+}
+
+/// Find an editable annotation to select at a Select-tool click.
+///
+/// Same hit rule as [`erase_hit`] — smallest containing rect — but restricted
+/// to kinds the reader can create and edit, so links and foreign annotation
+/// types are never picked up by the selection tool.
+fn select_hit(
+    page_spaces: &[PageSpace],
+    annotations: &[AnnotationInfo],
+    screen_pt: Pos2,
+) -> Option<AnnotationId> {
+    let editable: Vec<AnnotationInfo> = annotations
+        .iter()
+        .filter(|a| a.kind.is_creatable())
+        .cloned()
+        .collect();
+    erase_hit(page_spaces, &editable, screen_pt)
+}
+
+/// Screen-space centres of the eight resize handles around `outline`.
+fn handle_points(outline: Rect) -> Vec<Pos2> {
+    let (l, r, t, b) = (
+        outline.left(),
+        outline.right(),
+        outline.top(),
+        outline.bottom(),
+    );
+    let (mx, my) = (outline.center().x, outline.center().y);
+    vec![
+        pos2(l, t),
+        pos2(mx, t),
+        pos2(r, t),
+        pos2(r, my),
+        pos2(r, b),
+        pos2(mx, b),
+        pos2(l, b),
+        pos2(l, my),
+    ]
+}
+
+/// The resize handle under a screen-space pointer, if any.
+///
+/// `space` and `rect` are the annotation's page space and bounds; the rect is
+/// projected to the screen and each handle tested with a small grab radius so
+/// the handles are comfortable to hit.
+fn handle_hit(space: &PageSpace, rect: PdfSpaceRect, screen_pos: Pos2) -> Option<ResizeHandle> {
+    const GRAB: f32 = 6.0;
+    let screen = space.to_screen(rect);
+    let outline = Rect::from_min_size(
+        pos2(screen.x, screen.y),
+        vec2(screen.w.max(1.0), screen.h.max(1.0)),
+    );
+    let handles = [
+        (ResizeHandle::NorthWest, 0),
+        (ResizeHandle::North, 1),
+        (ResizeHandle::NorthEast, 2),
+        (ResizeHandle::East, 3),
+        (ResizeHandle::SouthEast, 4),
+        (ResizeHandle::South, 5),
+        (ResizeHandle::SouthWest, 6),
+        (ResizeHandle::West, 7),
+    ];
+    handles.iter().find_map(|(handle, index)| {
+        let point = handle_points(outline)[*index];
+        Rect::from_center_size(point, vec2(GRAB * 2.0, GRAB * 2.0))
+            .contains(screen_pos)
+            .then_some(*handle)
+    })
+}
+
+/// Resize `rect` by dragging `handle` to the PDF-space point `to`.
+///
+/// The handle's opposite corner or edge stays fixed; the dragged edges follow
+/// the pointer, clamped so the annotation can never be collapsed below
+/// [`MIN_ANN_SIZE`] — a drag past the opposite edge flips nothing and simply
+/// stops at the minimum.
+fn resize_rect(rect: PdfSpaceRect, handle: ResizeHandle, to: (f32, f32)) -> PdfSpaceRect {
+    let (mut min_x, mut max_x) = (rect.min_x, rect.max_x);
+    let (mut min_y, mut max_y) = (rect.min_y, rect.max_y);
+    match handle {
+        ResizeHandle::NorthWest | ResizeHandle::West | ResizeHandle::SouthWest => {
+            min_x = to.0.min(max_x - MIN_ANN_SIZE);
+        }
+        ResizeHandle::NorthEast | ResizeHandle::East | ResizeHandle::SouthEast => {
+            max_x = to.0.max(min_x + MIN_ANN_SIZE);
+        }
+        ResizeHandle::North | ResizeHandle::South => {}
+    }
+    match handle {
+        ResizeHandle::NorthWest | ResizeHandle::North | ResizeHandle::NorthEast => {
+            max_y = to.1.max(min_y + MIN_ANN_SIZE);
+        }
+        ResizeHandle::SouthWest | ResizeHandle::South | ResizeHandle::SouthEast => {
+            min_y = to.1.min(max_y - MIN_ANN_SIZE);
+        }
+        ResizeHandle::East | ResizeHandle::West => {}
+    }
+    PdfSpaceRect {
+        min_x,
+        min_y,
+        max_x,
+        max_y,
+    }
+}
+
 /// Create the annotation for a placed note and echo it until its page
 /// re-renders.
 ///
@@ -2030,6 +2635,86 @@ fn draw_squiggle(painter: &egui::Painter, rect: Rect, ink: Color32) {
             points,
             Stroke::new(PREVIEW_STROKE_PT, ink),
         ));
+    }
+}
+
+/// Paint a miniature of a drawing tool beside the pointer.
+///
+/// The OS cursor set has no shapes for these tools, and winit's Windows
+/// backend quietly falls back to a plain arrow for any icon it does not know,
+/// so this badge — not the cursor icon — is what tells the user which tool is
+/// armed, in each tool's conventional markup colour.
+///
+/// The badge *is* the cursor, so its hotspot is the pointer position exactly:
+/// the top-left corner sits on the pointer, which is the same point a drag
+/// starts from and the same point the tool acts on. Every tool therefore
+/// starts from the badge's own corner point — no floating offset between the
+/// logo and where the mark lands.
+fn draw_tool_badge(painter: &egui::Painter, tool: Tool, pos: Pos2) {
+    let tip = pos;
+    match tool {
+        // Highlighter: the yellow band, translucent like the real markup.
+        Tool::Highlight => {
+            let band = Rect::from_min_size(tip, vec2(20.0, 10.0));
+            painter.rect_filled(band, 2.0, Color32::from_rgba_unmultiplied(255, 214, 0, 110));
+        }
+        // Underline: a text band with the rule along its bottom edge.
+        Tool::Underline => {
+            let band = Rect::from_min_size(tip, vec2(20.0, 10.0));
+            painter.rect_filled(band, 2.0, Color32::from_rgba_unmultiplied(150, 150, 150, 40));
+            painter.line_segment(
+                [pos2(tip.x, tip.y + 9.5), pos2(tip.x + 20.0, tip.y + 9.5)],
+                Stroke::new(2.0, Color32::from_rgb(46, 125, 50)),
+            );
+        }
+        // Strikeout: a text band with the rule through its middle.
+        Tool::StrikeOut => {
+            let band = Rect::from_min_size(tip, vec2(20.0, 10.0));
+            painter.rect_filled(band, 2.0, Color32::from_rgba_unmultiplied(150, 150, 150, 40));
+            painter.line_segment(
+                [pos2(tip.x, tip.y + 5.0), pos2(tip.x + 20.0, tip.y + 5.0)],
+                Stroke::new(2.0, Color32::from_rgb(198, 40, 40)),
+            );
+        }
+        // Squiggly: a text band with the zig-zag along its bottom edge.
+        Tool::Squiggly => {
+            let band = Rect::from_min_size(tip, vec2(20.0, 10.0));
+            painter.rect_filled(band, 2.0, Color32::from_rgba_unmultiplied(150, 150, 150, 40));
+            draw_squiggle(painter, band, Color32::from_rgb(123, 31, 162));
+        }
+        // Rectangle: just the outline.
+        Tool::Square => {
+            let band = Rect::from_min_size(tip, vec2(20.0, 12.0));
+            painter.rect_stroke(
+                band,
+                1.5,
+                Stroke::new(2.0, Color32::from_rgb(21, 101, 192)),
+                StrokeKind::Inside,
+            );
+        }
+        // Sticky note: the folded-corner square, drawn with three shapes.
+        Tool::StickyNote => {
+            let body = Rect::from_min_size(tip, vec2(16.0, 16.0));
+            let fold = 5.0;
+            painter.rect_filled(body, 1.0, Color32::from_rgb(255, 241, 118));
+            let corner = [
+                pos2(body.max.x - fold, body.max.y),
+                body.max,
+                pos2(body.max.x, body.max.y - fold),
+            ];
+            painter.add(egui::Shape::convex_polygon(
+                corner.to_vec(),
+                Color32::from_rgb(240, 215, 90),
+                Stroke::NONE,
+            ));
+            painter.rect_stroke(
+                body,
+                1.0,
+                Stroke::new(1.0, Color32::from_rgb(160, 140, 40)),
+                StrokeKind::Inside,
+            );
+        }
+        _ => {}
     }
 }
 
@@ -2481,6 +3166,57 @@ fn drag_pans(
     middle_down || (primary_down && !drawing && (pan_tool || press_on_background))
 }
 
+/// The pointer shape each tool asks for, so the cursor says what the next
+/// press will do before it lands.
+///
+/// The core crate owns `Tool` and knows nothing about egui, so the mapping
+/// lives here next to the rest of the canvas input handling.
+///
+/// * `Select` shows the text beam — its drag picks text, like every viewer.
+/// * The markup and rectangle tools draw a rectangle, so they all use the
+///   crosshair for pixel-precise corners. Each also paints its own miniature
+///   beside the pointer (see [`draw_tool_badge`]), because the OS cursor set
+///   has no per-tool shapes.
+///
+/// Deliberately absent: `CursorIcon::Copy`. winit's Windows backend maps only
+/// a fixed set of icons and silently falls back to a plain arrow for the rest
+/// (`_ => IDC_ARROW`), so Copy never showed as anything but an arrow — which
+/// is exactly the "sometimes the cursor does not change" report. Every icon
+/// used here is one winit actually maps on Windows: Text, Crosshair, Move,
+/// PointingHand.
+fn tool_cursor(tool: Tool) -> egui::CursorIcon {
+    match tool {
+        Tool::Select => egui::CursorIcon::Text,
+        Tool::Highlight
+        | Tool::Underline
+        | Tool::StrikeOut
+        | Tool::Squiggly
+        | Tool::Square
+        | Tool::StickyNote
+        | Tool::Eraser => egui::CursorIcon::Crosshair,
+    }
+}
+
+/// Whether `tool` paints its own cursor badge on the canvas.
+///
+/// While a badge shows, the OS cursor hides (`CursorIcon::None`), so exactly
+/// one pointer is on screen: the badge itself. The badge is painted on the
+/// canvas layer, so over a popup or window — which renders above the canvas —
+/// the caller keeps the OS cursor instead, or there would be no visible
+/// pointer at all.
+fn tool_uses_pointer_badge(tool: Tool) -> bool {
+    matches!(
+        tool,
+        Tool::Highlight
+            | Tool::Underline
+            | Tool::StrikeOut
+            | Tool::Squiggly
+            | Tool::Square
+            | Tool::StickyNote
+            | Tool::Eraser
+    )
+}
+
 /// Distance the view should move this frame because a drag has reached an edge.
 ///
 /// A drag that runs to the edge of the viewport has to keep the view moving, or
@@ -2658,6 +3394,8 @@ mod tests {
             PageGeometry {
                 width_pt: 200.0,
                 height_pt: 100.0,
+                origin_x: 0.0,
+                origin_y: 0.0,
             },
             Rotation::None,
             1.0,
@@ -2671,6 +3409,162 @@ mod tests {
         cache.insert(DocumentId::from_raw(1), 0, page);
         cache
     }
+
+    /// Regression test: `erase_hit` expects **content-local** layout coordinates —
+    /// the same space `page_spaces` and `to_page` use. Passing the global point
+    /// (with `content_origin` re-added) is the bug that once made the eraser
+    /// delete nothing, because `hit_page` compares against content-local page
+    /// boxes and a global point falls outside every one of them.
+    #[test]
+    fn erase_hit_resolves_annotation_in_content_local_space() {
+        use pdfreader_core::{AnnotationId, AnnotationInfo, AnnotationKind};
+
+        // One page laid out at content-local (100, 50), 200×300 pt, 1:1 zoom.
+        let page = PageSpace::new(
+            PageBox::new(0, 100.0, 50.0, 200.0, 300.0),
+            PageGeometry {
+                width_pt: 200.0,
+                height_pt: 300.0,
+                origin_x: 0.0,
+                origin_y: 0.0,
+            },
+            Rotation::None,
+            1.0,
+        );
+        let page_spaces = vec![page];
+
+        // Annotation occupying PDF-space rect (20,250)-(60,280). In y-up PDF
+        // space that is near the TOP of the page, which (as `to_page` maps it)
+        // corresponds to the top of the displayed page.
+        let annotations = vec![AnnotationInfo {
+            id: AnnotationId::new(0, 0),
+            kind: AnnotationKind::Highlight,
+            rect: PdfSpaceRect::from_xywh(20.0, 250.0, 40.0, 30.0),
+            contents: None,
+                color: None,
+}];
+
+        // Click at content-local (140, 85) → PDF (40, 265), inside the rect.
+        assert_eq!(
+            erase_hit(&page_spaces, &annotations, pos2(140.0, 85.0)),
+            Some(AnnotationId::new(0, 0))
+        );
+        // A click outside the rect misses.
+        assert_eq!(
+            erase_hit(&page_spaces, &annotations, pos2(190.0, 85.0)),
+            None
+        );
+    }
+
+    /// Every tool asks for the cursor shape that matches what a press does,
+    /// so the pointer telegraphs the tool before it clicks.
+    ///
+    /// Only icons winit's Windows backend actually maps are allowed here:
+    /// anything else silently falls back to a plain arrow, which is the
+    /// "sometimes the cursor does not change" bug. Copy, Grab and Grabbing
+    /// are all unmapped and must not be used.
+    #[test]
+    fn each_tool_moves_the_cursor_to_its_own_shape() {
+        use egui::CursorIcon;
+
+        // Select picks text, like every viewer's default tool.
+        assert_eq!(tool_cursor(Tool::Select), CursorIcon::Text);
+        // The markup, note, rectangle and eraser tools all act on a precise
+        // spot; their per-tool identity comes from the painted badge.
+        for tool in [
+            Tool::Highlight,
+            Tool::Underline,
+            Tool::StrikeOut,
+            Tool::Squiggly,
+            Tool::Square,
+            Tool::StickyNote,
+            Tool::Eraser,
+        ] {
+            assert_eq!(tool_cursor(tool), CursorIcon::Crosshair, "{tool:?}");
+        }
+        // The badge set is exactly the drawing tools plus the eraser — every
+        // tool that paints a pointer badge also hides the OS cursor, so this
+        // invariant must keep holding or two pointers will show at once.
+        for tool in Tool::ALL {
+            let expected = tool.annotation_kind().is_some() || tool == Tool::Eraser;
+            assert_eq!(tool_uses_pointer_badge(tool), expected, "{tool:?}");
+        }
+    }
+    /// Resizing keeps the opposite corner fixed and never collapses below
+    /// the minimum, even when the drag sweeps past the opposite edge.
+    #[test]
+    fn resize_rect_drags_one_edge_and_clamps_at_the_minimum() {
+        use ResizeHandle::*;
+        let rect = PdfSpaceRect::from_xywh(100.0, 100.0, 80.0, 40.0);
+
+        // East edge follows the pointer; the west edge stays.
+        let out = resize_rect(rect, East, (200.0, 0.0));
+        assert_eq!(
+            out,
+            PdfSpaceRect::from_xywh(100.0, 100.0, 100.0, 40.0),
+            "the east drag widens from the fixed west edge"
+        );
+
+        // Dragging the east edge past the west edge clamps at the minimum
+        // instead of flipping the rectangle.
+        let out = resize_rect(rect, East, (50.0, 0.0));
+        assert_eq!(out.width(), MIN_ANN_SIZE);
+        assert_eq!(out.min_x, 100.0);
+
+        // A north-west corner drag moves both the top and the left edge.
+        let out = resize_rect(rect, NorthWest, (80.0, 160.0));
+        assert_eq!(out.min_x, 80.0);
+        assert_eq!(out.max_y, 160.0);
+        assert_eq!(out.max_x, 180.0);
+        assert_eq!(out.min_y, 100.0);
+    }
+
+    /// Eight handles surround the selection, and only annotations the user
+    /// can edit are pickable by the Select tool.
+    #[test]
+    fn selection_hits_are_editable_kinds_and_handles_number_eight() {
+        use pdfreader_core::{AnnotationId, AnnotationKind};
+
+        // One page at content-local (0, 0), 400×400 pt, 1:1 zoom.
+        let page = PageSpace::new(
+            PageBox::new(0, 0.0, 0.0, 400.0, 400.0),
+            PageGeometry {
+                width_pt: 400.0,
+                height_pt: 400.0,
+                origin_x: 0.0,
+                origin_y: 0.0,
+            },
+            Rotation::None,
+            1.0,
+        );
+        let page_spaces = vec![page];
+        let annotations = vec![
+            AnnotationInfo {
+                id: AnnotationId::new(0, 0),
+                kind: AnnotationKind::Highlight,
+                rect: PdfSpaceRect::from_xywh(20.0, 20.0, 40.0, 10.0),
+                contents: None,
+                color: None,
+            },
+            AnnotationInfo {
+                id: AnnotationId::new(0, 1),
+                kind: AnnotationKind::Link,
+                rect: PdfSpaceRect::from_xywh(20.0, 20.0, 40.0, 10.0),
+                contents: None,
+                color: None,
+            },
+        ];
+        // Both occupy the same spot at PDF (30, 25) — content-local y 375,
+        // because to_page flips the y axis. The Select tool must pick the
+        // editable kind, never the link.
+        assert_eq!(
+            select_hit(&page_spaces, &annotations, pos2(30.0, 375.0)),
+            Some(AnnotationId::new(0, 0))
+        );
+        // Outside everything: nothing is selected.
+        assert_eq!(select_hit(&page_spaces, &annotations, pos2(300.0, 300.0)), None);
+    }
+
 
     /// The layout-space point over the first glyph: PDF (14, 55) at 1:1.
     const ON_HELLO: (f32, f32) = (14.0, 45.0);
@@ -4082,6 +4976,8 @@ mod tests {
         let geom = PageGeometry {
             width_pt: 200.0,
             height_pt: 100.0,
+            origin_x: 0.0,
+            origin_y: 0.0,
         };
         for rotation in [
             Rotation::None,
@@ -4149,7 +5045,8 @@ mod tests {
             kind: AnnotationKind::StickyNote,
             rect: PdfSpaceRect::from_xywh(100.0, 100.0, 20.0, 20.0),
             contents: Some("Reviewed later".into()),
-        }];
+                color: None,
+}];
 
         let raw = egui::RawInput {
             screen_rect: Some(screen),
@@ -4248,6 +5145,8 @@ mod tests {
             PageGeometry {
                 width_pt: 200.0,
                 height_pt: 100.0,
+                origin_x: 0.0,
+                origin_y: 0.0,
             },
             Rotation::None,
             1.0,

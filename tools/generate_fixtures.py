@@ -125,13 +125,26 @@ def page_content(page_index: int, lines_per_page: int) -> bytes:
     return "\n".join(out).encode("latin-1")
 
 
-def build_pdf(page_count: int, lines_per_page: int, encrypt: dict | None = None) -> bytes:
+def build_pdf(
+    page_count: int,
+    lines_per_page: int,
+    encrypt: dict | None = None,
+    mediabox: tuple[float, float, float, float] | None = None,
+) -> bytes:
     """Assemble a complete PDF document with `page_count` pages.
 
     When `encrypt` is provided it must contain `o`, `u`, `p` and `key`; the
     page content streams are then RC4-encrypted and an /Encrypt dictionary is
     added and referenced from the trailer.
+
+    When `mediabox` is provided it overrides the default `[0 0 PAGE_WIDTH
+    PAGE_HEIGHT]`. This is how the offset-origin fixture is produced: many
+    scanned / image PDFs report a non-(0,0) page origin, and the annotation
+    transform must account for it.
     """
+    if mediabox is None:
+        mediabox = (0.0, 0.0, PAGE_WIDTH, PAGE_HEIGHT)
+    mb = " ".join(f"{v:g}" for v in mediabox)
     objects: list[bytes] = []
 
     font_obj = 3
@@ -155,7 +168,7 @@ def build_pdf(page_count: int, lines_per_page: int, encrypt: dict | None = None)
     for i in range(page_count):
         objects.append(
             (
-                f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {PAGE_WIDTH} {PAGE_HEIGHT}] "
+                f"<< /Type /Page /Parent 2 0 R /MediaBox [{mb}] "
                 f"/Resources << /Font << /F1 {font_obj} 0 R >> >> "
                 f"/Contents {content_obj_ids[i]} 0 R >>"
             ).encode("latin-1")
@@ -209,6 +222,56 @@ def build_pdf(page_count: int, lines_per_page: int, encrypt: dict | None = None)
     ).encode("latin-1")
 
     return bytes(out)
+
+
+def build_offset_pdf() -> bytes:
+    """A one-page PDF whose MediaBox origin is (40, 40), not (0, 0).
+
+    Scanned / image PDFs frequently carry a non-zero page origin, which used to
+    push committed annotations off where the cursor drew them. The geometry the
+    engine reports now carries that origin so the UI transform can subtract it.
+    This fixture reproduces the situation deterministically for the regression
+    test `offset_mediabox_annotation_lands_where_to_page_predicts`.
+    """
+    return build_pdf(1, 10, mediabox=(40.0, 40.0, 540.0, 880.0))
+
+
+def build_link_pdf() -> bytes:
+    """A one-page PDF whose annotations have NO colour entries.
+
+    `FPDFAnnot_GetColor` returns false for these — the exact situation the
+    vendored pdfium-render patch guards against. Upstream would cast the
+    annotation handle to a page object here and crash the process; the patched
+    vendored copy returns an error, so listing this file is safe. One Link
+    (never carries a colour) and one Highlight deliberately written without
+    /C — the worst case, a managed kind lacking a colour.
+    """
+    objects: list[bytes] = []
+    objects.append(b"<< /Type /Catalog /Pages 2 0 R >>")
+    objects.append(b"<< /Type /Pages /Kids [4 0 R] /Count 1 >>")
+    objects.append(
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"
+    )
+    objects.append(
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595.28 841.89] "
+        b"/Resources << /Font << /F1 3 0 R >> >> /Contents 5 0 R "
+        b"/Annots [6 0 R 7 0 R] >>"
+    )
+    contents = b"BT /F1 11 Tf 1 0 0 1 56 780 Tm (Link fixture) Tj ET"
+    objects.append(
+        f"<< /Length {len(contents)} >>\nstream\n".encode("latin-1")
+        + contents
+        + b"\nendstream"
+    )
+    objects.append(
+        b"<< /Type /Annot /Subtype /Link /Rect [100 700 300 720] /Border [0 0 0] "
+        b"/A << /S /URI /URI (https://example.com) >> >>"
+    )
+    objects.append(
+        b"<< /Type /Annot /Subtype /Highlight /Rect [100 600 300 620] "
+        b"/QuadPoints [100 620 300 620 100 600 300 600] /F 4 >>"
+    )
+    return serialise(objects, {}, trailer_extra="")
 
 
 def build_form_pdf() -> bytes:
@@ -419,10 +482,14 @@ def main() -> int:
     large = args.outdir / "large-500p.pdf"
     encrypted = args.outdir / "encrypted.pdf"
     forms = args.outdir / "forms.pdf"
+    offset = args.outdir / "offset-box.pdf"
+    links = args.outdir / "link-annot.pdf"
 
     small.write_bytes(build_pdf(3, 40))
     large.write_bytes(build_pdf(args.large_pages, 40))
     forms.write_bytes(build_form_pdf())
+    offset.write_bytes(build_offset_pdf())
+    links.write_bytes(build_link_pdf())
 
     o = compute_o(args.encrypted_password, "", PERMISSIONS)
     u = compute_u(args.encrypted_password, PERMISSIONS, o)
@@ -434,6 +501,8 @@ def main() -> int:
     print(f"wrote {small} ({small.stat().st_size} bytes)")
     print(f"wrote {large} ({large.stat().st_size} bytes)")
     print(f"wrote {forms} ({forms.stat().st_size} bytes)")
+    print(f"wrote {offset} ({offset.stat().st_size} bytes)")
+    print(f"wrote {links} ({links.stat().st_size} bytes)")
     print(f"wrote {encrypted} ({encrypted.stat().st_size} bytes, password={args.encrypted_password!r})")
     return 0
 

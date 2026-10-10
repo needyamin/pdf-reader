@@ -105,6 +105,15 @@ pub struct PageGeometry {
     pub width_pt: f32,
     /// Unrotated height in points.
     pub height_pt: f32,
+    /// X of the page's coordinate origin in PDF points. Almost always 0, but
+    /// scanned/image PDFs frequently carry a non-zero MediaBox origin, and the
+    /// UI transform must account for it or annotations land offset from the
+    /// cursor.
+    #[serde(default)]
+    pub origin_x: f32,
+    /// Y of the page's coordinate origin in PDF points.
+    #[serde(default)]
+    pub origin_y: f32,
 }
 
 impl PageGeometry {
@@ -112,18 +121,23 @@ impl PageGeometry {
     pub const LETTER: Self = Self {
         width_pt: 612.0,
         height_pt: 792.0,
+        origin_x: 0.0,
+        origin_y: 0.0,
     };
 
     /// A4, 210 x 297 mm.
     pub const A4: Self = Self {
         width_pt: 595.28,
         height_pt: 841.89,
+        origin_x: 0.0,
+        origin_y: 0.0,
     };
 
     /// Width and height after applying a rotation.
     ///
     /// Returns `(width, height)` in points, swapping the pair when the rotation
-    /// is a quarter or three-quarter turn.
+    /// is a quarter or three-quarter turn. The origin is unaffected: it is a
+    /// fixed point in unrotated PDF space.
     pub fn oriented(self, rotation: Rotation) -> (f32, f32) {
         if rotation.is_transposed() {
             (self.height_pt, self.width_pt)
