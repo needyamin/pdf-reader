@@ -15,8 +15,31 @@ use anyhow::{Context, Result, bail};
 
 use crate::{binary_name, cargo, fetch_pdfium, host_triple, staged_dir};
 
-/// Product name shared by every package format.
+/// Product name shared by the local package formats (NSIS, Inno, portable zip).
+///
+/// This is the name on the installer, in the uninstall entry and on the Start
+/// menu shortcut — the name for the copy on the user's own machine.
 const PRODUCT: &str = "AnsNew PDF Reader";
+
+/// Store display name, which is **not** free text.
+///
+/// Partner Center rejects a package whose `Package/Properties/DisplayName` is not
+/// one of the app names reserved on the account, with "uses a display name that
+/// you have not reserved". The reserved name is whatever Partner Center shows as
+/// the product name on the app's *Product identity* page — here
+/// `AnsNew Tech. PDF Reader`, which is not the same string as [`PRODUCT`]: it
+/// carries the publisher prefix and its full stop.
+///
+/// Character-for-character is the requirement. Two earlier attempts failed on
+/// exactly that — `AnsNew PDF Reader` (the local product name) and
+/// `AnsNewTech PDF Reader` (the prefix without its space and full stop) — so
+/// copy the value from Partner Center rather than reconstructing it.
+///
+/// Both places the manifest names the app — `Properties/DisplayName` and the
+/// application's `uap:VisualElements` — use this, so the Store listing and the
+/// app tile cannot disagree. `dist:msix --display-name` overrides it for a build
+/// without a code change.
+const MSIX_DISPLAY_NAME: &str = "AnsNew Tech. PDF Reader";
 /// Publisher shared by every package format (Store `PublisherDisplayName`).
 const PUBLISHER: &str = "ANSNEW TECH.";
 /// MSIX identity `Name` — the Store-assigned Package/Identity/Name from Partner
@@ -191,7 +214,8 @@ pub fn inno() -> Result<PathBuf> {
 /// is selected by thumbprint — see [`signing_certificate`]. Windows only installs the
 /// package after that certificate is trusted, so the task prints the
 /// `certutil` command for it. `--no-sign` skips signing entirely.
-pub fn msix(no_sign: bool) -> Result<PathBuf> {
+pub fn msix(no_sign: bool, display_name: Option<&str>) -> Result<PathBuf> {
+    let display_name = display_name.unwrap_or(MSIX_DISPLAY_NAME);
     let stage = stage()?;
     let root = std::path::absolute(dist_root())?;
 
@@ -213,6 +237,7 @@ pub fn msix(no_sign: bool) -> Result<PathBuf> {
             ("MSIX_IDENTITY", MSIX_IDENTITY.to_string()),
             ("MSIX_PUBLISHER", MSIX_PUBLISHER.to_string()),
             ("MSIX_VERSION", msix_version(&stage.version)),
+            ("MSIX_DISPLAY_NAME", display_name.to_string()),
         ],
     );
     fs::write(&manifest, text).with_context(|| format!("writing {}", manifest.display()))?;
@@ -781,7 +806,7 @@ const MSIX_MANIFEST: &str = r#"<?xml version="1.0" encoding="utf-8"?>
             ProcessorArchitecture="x64" />
 
   <Properties>
-    <DisplayName>@PRODUCT@</DisplayName>
+    <DisplayName>@MSIX_DISPLAY_NAME@</DisplayName>
     <PublisherDisplayName>@PUBLISHER@</PublisherDisplayName>
     <Logo>Assets\StoreLogo.png</Logo>
   </Properties>
@@ -799,7 +824,7 @@ const MSIX_MANIFEST: &str = r#"<?xml version="1.0" encoding="utf-8"?>
                  Executable="pdf-reader.exe"
                  EntryPoint="Windows.FullTrustApplication">
       <uap:VisualElements
-          DisplayName="@PRODUCT@"
+          DisplayName="@MSIX_DISPLAY_NAME@"
           Description="A fast, native PDF reader."
           BackgroundColor="transparent"
           Square150x150Logo="Assets\Square150x150Logo.png"

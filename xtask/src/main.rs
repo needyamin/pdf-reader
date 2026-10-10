@@ -108,6 +108,13 @@ enum Cmd {
         /// Skip signing with the self-signed certificate.
         #[arg(long)]
         no_sign: bool,
+        /// Store display name to write into the manifest.
+        ///
+        /// Must be an app name reserved on the Partner Center account, spelled
+        /// exactly as Partner Center shows it — validation compares the string
+        /// character for character. Defaults to the recorded value.
+        #[arg(long)]
+        display_name: Option<String>,
     },
 }
 
@@ -173,8 +180,11 @@ fn main() -> Result<()> {
         Cmd::DistInno => {
             dist::inno()?;
         }
-        Cmd::DistMsix { no_sign } => {
-            dist::msix(no_sign)?;
+        Cmd::DistMsix {
+            no_sign,
+            display_name,
+        } => {
+            dist::msix(no_sign, display_name.as_deref())?;
         }
     }
 
