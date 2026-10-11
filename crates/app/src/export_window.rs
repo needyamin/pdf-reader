@@ -33,7 +33,11 @@ use pdfreader_ui::{
 const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg"];
 
 /// Width of the whole window, in points.
-const WINDOW_WIDTH: f32 = 980.0;
+///
+/// Enlarged past the default Shortcuts window (880) so the export pane has room
+/// for the task strip, the settings and the page preview side by side without
+/// feeling cramped.
+const WINDOW_WIDTH: f32 = 1140.0;
 
 /// Minimum height of the task-strip / settings row.
 ///
@@ -41,7 +45,7 @@ const WINDOW_WIDTH: f32 = 980.0;
 /// is two sections) used to produce a squat window next to a tall one (Merge
 /// PDFs, with the file list). Pinning the row's height keeps every task the
 /// same shape and gives the whole window real height.
-const BODY_HEIGHT: f32 = 380.0;
+const BODY_HEIGHT: f32 = 600.0;
 
 /// Width of the task strip on the left.
 const STRIP_WIDTH: f32 = 210.0;

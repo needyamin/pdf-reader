@@ -161,6 +161,119 @@ use crate::bindgen::{
             }
         }
 
+        /// Replaces this annotation's normal appearance stream (`/AP /N`) with
+        /// one built from `content`, a PDF content-stream fragment.
+        ///
+        /// Pdfium builds the stream's `/BBox` from the annotation's `/Rect` and
+        /// maps that box onto the same rect when drawing, so `content` must be
+        /// written in **absolute page coordinates** covering that rect — the
+        /// rect's bounds have to be set *before* this call.
+        ///
+        /// This is the only way to control how Pdfium draws an underline,
+        /// strikeout or squiggly mark: its built-in appearance generator emits a
+        /// hard-coded 1pt line and ignores both `/BS /W` and `/Border`, so the
+        /// dictionary cannot express a thicker line. Supplying `/AP /N`
+        /// ourselves makes Pdfium stop generating and use ours instead (see
+        /// `CPDF_Annot::ShouldGenerateAP`).
+        fn set_normal_appearance_stream(&mut self, content: &str) -> Result<(), PdfiumError> {
+            // `FPDF_WIDESTRING` is a NUL-terminated UTF-16 buffer; Pdfium
+            // encodes it back to bytes to build the stream data.
+            let mut wide: Vec<FPDF_WCHAR> = content.encode_utf16().collect();
+            wide.push(0);
+            let set = unsafe {
+                self.bindings().FPDFAnnot_SetAP(
+                    self.handle(),
+                    PdfAppearanceMode::Normal.as_pdfium(),
+                    wide.as_ptr(),
+                )
+            };
+            if self.bindings().is_true(set) {
+                Ok(())
+            } else {
+                Err(PdfiumError::PdfiumLibraryInternalError(
+                    PdfiumInternalError::Unknown,
+                ))
+            }
+        }
+
+        /// Returns the content stream of this annotation's normal appearance
+        /// (`/AP /N`), or `None` when it has none.
+        ///
+        /// Reading this is the only way to inspect an annotation's appearance:
+        /// Pdfium's colour accessors refuse to work at all while an appearance
+        /// stream is present, so a caller that supplies its own appearance and
+        /// needs to remember something about it has to read it back from here.
+        fn normal_appearance_stream(&self) -> Option<String> {
+            let mode = PdfAppearanceMode::Normal.as_pdfium();
+            let handle = self.handle();
+            let bindings = self.bindings();
+
+            // Pdfium reports the buffer size it needs, in bytes, including the
+            // terminating NUL.
+            let required = unsafe { bindings.FPDFAnnot_GetAP(handle, mode, std::ptr::null_mut(), 0) };
+            if required == 0 {
+                return None;
+            }
+
+            let mut buffer: Vec<FPDF_WCHAR> = vec![0; (required as usize + 1) / 2];
+            let written =
+                unsafe { bindings.FPDFAnnot_GetAP(handle, mode, buffer.as_mut_ptr(), required) };
+            if written == 0 {
+                return None;
+            }
+
+            while buffer.last() == Some(&0) {
+                buffer.pop();
+            }
+
+            String::from_utf16(&buffer).ok()
+        }
+
+        /// Sets this annotation's border width — the `/Border` entry — in
+        /// default user space units.
+        ///
+        /// Pdfium also *removes* the annotation's appearance stream when this is
+        /// called, because a stale stream would win over the new border. Callers
+        /// that supply their own stream must therefore set the border first and
+        /// the stream afterwards.
+        fn set_border_width(&mut self, width: f32) -> Result<(), PdfiumError> {
+            let set = unsafe {
+                self.bindings()
+                    .FPDFAnnot_SetBorder(self.handle(), 0.0, 0.0, width)
+            };
+            if self.bindings().is_true(set) {
+                Ok(())
+            } else {
+                Err(PdfiumError::PdfiumLibraryInternalError(
+                    PdfiumInternalError::Unknown,
+                ))
+            }
+        }
+
+        /// Returns this annotation's border width — the third element of the
+        /// `/Border` array — or `None` when it has no border entry.
+        ///
+        /// Pdfium does not use this value when it renders an underline,
+        /// strikeout or squiggly mark (their built-in appearance is a
+        /// hard-coded 1pt line), so it is free to carry the thickness this
+        /// reader draws the mark with.
+        fn border_width(&self) -> Option<f32> {
+            let mut horizontal_radius: f32 = 0.0;
+            let mut vertical_radius: f32 = 0.0;
+            let mut border_width: f32 = 0.0;
+            let found = unsafe {
+                self.bindings().FPDFAnnot_GetBorder(
+                    self.handle(),
+                    &mut horizontal_radius,
+                    &mut vertical_radius,
+                    &mut border_width,
+                )
+            };
+            self.bindings()
+                .is_true(found)
+                .then_some(border_width)
+        }
+
         /// Returns the ownership hierarchy for this [PdfPageAnnotation].
         fn ownership(&self) -> &PdfPageObjectOwnership;
 

@@ -1909,6 +1909,24 @@ impl App {
                     commands.push(Command::SetTool(Tool::Select));
                 }
             }
+            // Delete/Backspace removes the selected annotation — the expected
+            // "select an annotation, then Delete" path while an annotation tool
+            // is active. Gated on `free_focus` so it never fires while typing in
+            // a note or form field, and on there actually being a selection.
+            if free_focus {
+                if let Some(id) = self
+                    .store
+                    .state()
+                    .active()
+                    .and_then(|tab| tab.view.selected_annotation)
+                {
+                    if input.key_pressed(egui::Key::Delete)
+                        || input.key_pressed(egui::Key::Backspace)
+                    {
+                        commands.push(Command::DeleteAnnotation(id));
+                    }
+                }
+            }
             // Single-key tool shortcuts, in the convention mainstream PDF
             // editors use (V select, H highlight, R rectangle, …). Gated on
             // `free_focus` so typing in a note or form field never arms a tool,

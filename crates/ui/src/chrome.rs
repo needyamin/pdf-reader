@@ -9,15 +9,14 @@ use std::sync::Arc;
 use egui::{
     Align2, Color32, FontId, Galley, Id, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, Ui, Vec2,
     ViewportCommand, containers::menu::SubMenuButton,
-};
-use pdfreader_core::{
+};use pdfreader_core::{
     AnnotationId, AnnotationInfo, AnnotationKind, AppState, Command, DocumentId, ExportTask,
     FieldId, FieldValue, FormFieldInfo, FormFieldType, FormInfo, Outline, OutlineNode, SidebarTab,
     Tab, ThemeId, Tool, ViewMode, ZoomMode,
 };
 
 use crate::theme::Palette;
-use crate::window::dialog_window;
+use crate::window::{floating_window, primary_button as window_primary_button};
 
 /// Height of the compact application menu.
 pub const MENUBAR_HEIGHT: f32 = 28.0;
@@ -371,6 +370,8 @@ pub fn menu_bar(ui: &mut Ui, state: &AppState, palette: &Palette) -> Vec<Command
                     .size(12.5),
             );
             ui.add_space(8.0);
+            // Even, comfortable gaps between the top-level menus.
+            ui.spacing_mut().item_spacing.x = 14.0;
             menu_button(ui, palette, "File", |ui| {
                 commands.extend(file_menu(ui, state));
             });
@@ -496,6 +497,12 @@ pub fn menu_bar(ui: &mut Ui, state: &AppState, palette: &Palette) -> Vec<Command
             // full Settings window.
             if menu_action(ui, palette, "Settings").clicked() {
                 commands.push(Command::ShowSettings);
+            }
+            // Tools opens the Export window (Page/Images to image, to PDF, and
+            // Merge PDF) — the "PDF & Image Tools" the user wants on the menu
+            // bar next to Settings.
+            if menu_action(ui, palette, "Tools").clicked() {
+                commands.push(Command::ShowExportWindow(ExportTask::default()));
             }
             menu_button(ui, palette, "Help", |ui| {
                 if menu_item(ui, "Keyboard Shortcuts", "").clicked() {
@@ -2692,8 +2699,9 @@ fn draw_icon(painter: &egui::Painter, center: Pos2, icon: Icon, color: Color32) 
 #[cfg(test)]
 mod tests {
     use super::{
-        Palette, SEARCH_FIELD_HEIGHT, SearchFieldOutput, TOOLBAR_HEIGHT, TOOLBAR_PAD_Y,
-        annotation_properties_window, comments_panel, search_field, status_bar, toolbar,
+        ANNOTATION_SWATCHES, PROPERTIES_PANEL_WIDTH, Palette, SEARCH_FIELD_HEIGHT,
+        SearchFieldOutput, TOOLBAR_HEIGHT, TOOLBAR_PAD_Y, annotation_properties_window,
+        comments_panel, properties_panel_origin, search_field, status_bar, toolbar,
     };
     use crate::theme::Theme;
     use egui::{Context, RawInput, Rect};
@@ -2765,6 +2773,7 @@ mod tests {
                 egui::pos2(0.0, 0.0),
                 egui::vec2(800.0, 600.0),
             )),
+            time: Some(next_frame_time(ctx)),
             ..Default::default()
         };
         let mut commands = Vec::new();
@@ -2773,6 +2782,17 @@ mod tests {
         });
         out.textures_delta.clear();
         commands
+    }
+
+    /// The next frame's timestamp, always later than the last one.
+    ///
+    /// egui's `History` panics outright if a frame reports an earlier time than
+    /// the frame before it, and a `RawInput` with no `time` at all is stamped
+    /// with whatever the context decides — which is not necessarily later than
+    /// a time another helper pinned by hand. Threading one clock through every
+    /// helper is what keeps a mixed press-drag-release sweep legal.
+    fn next_frame_time(ctx: &egui::Context) -> f64 {
+        ctx.input(|i| i.time) + 0.001
     }
 
     /// Draw the properties window with the pointer pressed (`pressed = true`)
@@ -2790,6 +2810,7 @@ mod tests {
                 egui::pos2(0.0, 0.0),
                 egui::vec2(800.0, 600.0),
             )),
+            time: Some(next_frame_time(ctx)),
             ..Default::default()
         };
         raw.events.push(egui::Event::PointerMoved(pos));
@@ -2805,6 +2826,68 @@ mod tests {
         });
         out.textures_delta.clear();
         commands
+    }
+
+    /// Sweep a rectangle of the 800×600 screen with press+release clicks and
+    /// return the first point at which the properties panel emitted a command
+    /// `wanted`. Controls are far bigger than the 6px step, so a sweep cannot
+    /// straddle one.
+    fn find_properties_control<F>(
+        ctx: &egui::Context,
+        palette: &Palette,
+        annotations: &[pdfreader_core::AnnotationInfo],
+        selected: Option<pdfreader_core::AnnotationId>,
+        ys: std::ops::RangeInclusive<i32>,
+        xs: std::ops::RangeInclusive<i32>,
+        step: usize,
+        wanted: F,
+    ) -> Option<egui::Pos2>
+    where
+        F: Fn(&Command) -> bool,
+    {
+        for y in ys.step_by(step) {
+            for x in xs.clone().step_by(step) {
+                let p = egui::pos2(x as f32, y as f32);
+                draw_properties_window_pointer(ctx, palette, annotations, selected, p, true);
+                let commands =
+                    draw_properties_window_pointer(ctx, palette, annotations, selected, p, false);
+                if commands.iter().any(|c| wanted(c)) {
+                    return Some(p);
+                }
+            }
+        }
+        None
+    }
+
+    /// Where the panel's Apply button is.
+    ///
+    /// Apply stays disabled until something is staged, so its position is
+    /// measured in a throwaway context: sweep the panel to stage anything at
+    /// all, then the first click that emits a colour can only be Apply.
+    fn find_apply_button(
+        palette: &Palette,
+        annotations: &[pdfreader_core::AnnotationInfo],
+        id: pdfreader_core::AnnotationId,
+    ) -> egui::Pos2 {
+        let probe = Context::default();
+        for y in (120..=420).step_by(10) {
+            for x in (330..=780).step_by(10) {
+                let p = egui::pos2(x as f32, y as f32);
+                draw_properties_window_pointer(&probe, palette, annotations, Some(id), p, true);
+                draw_properties_window_pointer(&probe, palette, annotations, Some(id), p, false);
+            }
+        }
+        find_properties_control(
+            &probe,
+            palette,
+            annotations,
+            Some(id),
+            120..=420,
+            330..=780,
+            4,
+            |c| matches!(c, Command::SetAnnotationColor { .. }),
+        )
+        .expect("Apply must be reachable once a value is staged")
     }
 
     /// The properties window must never emit edits for an annotation the user
@@ -2833,12 +2916,80 @@ mod tests {
         );
     }
 
-    /// Headless stand-in for "click the red swatch, the annotation turns red":
-    /// sweep the window's swatch row with press+release clicks until one lands
-    /// on a swatch and the panel returns a `SetAnnotationColor`. Covers the
-    /// properties-panel field commit the manual click-through could not verify.
+    /// Staging a swatch and clicking Apply must write exactly that swatch,
+    /// keeping the alpha the annotation already had.
+    ///
+    /// Regression: the panel used to commit the moment a swatch was clicked,
+    /// which raced the engine — the colour sometimes stuck and sometimes did
+    /// not. Now every control only stages, and Apply is the single writer.
     #[test]
-    fn properties_window_swatch_click_emits_set_annotation_color() {
+    fn properties_window_apply_writes_the_staged_swatch() {
+        let palette = Theme::from_id(ThemeId::default()).palette;
+        let id = pdfreader_core::AnnotationId::new(0, 0);
+        let start = [255, 0, 0, 200];
+        let annotations = [pdfreader_core::AnnotationInfo {
+            id,
+            kind: pdfreader_core::AnnotationKind::Square,
+            rect: pdfreader_core::Rect::from_xywh(10.0, 20.0, 40.0, 10.0),
+            contents: None,
+            color: Some(start),
+        }];
+
+        // Apply is disabled until something is staged, so its position is
+        // measured in a throwaway context.
+        let apply = find_apply_button(&palette, &annotations, id);
+
+        // A fresh context starts from the engine's colour, so the alpha the
+        // staged swatch keeps is the annotation's own and nothing else's.
+        let ctx = Context::default();
+        for _ in 0..4 {
+            draw_properties_window(&ctx, &palette, &annotations, Some(id));
+        }
+
+        let mut committed = None;
+        'staging: for y in (120..=(apply.y as i32 - 14)).step_by(6) {
+            for x in (330..=780).step_by(6) {
+                let stage = egui::pos2(x as f32, y as f32);
+                draw_properties_window_pointer(&ctx, &palette, &annotations, Some(id), stage, true);
+                let on_click =
+                    draw_properties_window_pointer(&ctx, &palette, &annotations, Some(id), stage, false);
+                assert!(
+                    !on_click
+                        .iter()
+                        .any(|c| matches!(c, Command::SetAnnotationColor { .. })),
+                    "clicking {stage:?} must only stage a value, never write it: {on_click:?}"
+                );
+                draw_properties_window_pointer(&ctx, &palette, &annotations, Some(id), apply, true);
+                let commands =
+                    draw_properties_window_pointer(&ctx, &palette, &annotations, Some(id), apply, false);
+                let Some(cmd) = commands
+                    .into_iter()
+                    .find(|c| matches!(c, Command::SetAnnotationColor { .. }))
+                else {
+                    continue;
+                };
+                if let Command::SetAnnotationColor { color, .. } = cmd {
+                    let is_swatch = ANNOTATION_SWATCHES
+                        .iter()
+                        .any(|swatch| swatch[0..3] == color[0..3]);
+                    if is_swatch {
+                        committed = Some(color);
+                        break 'staging;
+                    }
+                }
+            }
+        }
+        let color = committed.expect("a staged swatch plus Apply must emit SetAnnotationColor");
+        assert_eq!(
+            color[3], start[3],
+            "Apply must keep the alpha the annotation already had"
+        );
+    }
+
+    /// The panel's Delete button removes the annotation the panel is showing —
+    /// the last control whose wiring nothing exercised.
+    #[test]
+    fn properties_window_delete_button_removes_the_annotation() {
         let ctx = Context::default();
         let palette = Theme::from_id(ThemeId::default()).palette;
         let id = pdfreader_core::AnnotationId::new(0, 0);
@@ -2850,19 +3001,18 @@ mod tests {
             color: Some([255, 0, 0, 200]),
         }];
 
-        // The window anchors RIGHT_CENTER at (-24, 0) on an 800×600 screen, so
-        // it occupies the right-hand strip. Sweep that strip with press+release
-        // clicks until one lands on a swatch.
+        // The Delete button sits below the geometry grid, near the window's
+        // left edge, so sweep the whole window rather than guessing its row.
         let mut hit = None;
-        'outer: for y in (200..=400).step_by(8) {
-            for x in (510..=770).step_by(10) {
+        'outer: for y in (150..=470).step_by(6) {
+            for x in (330..=780).step_by(6) {
                 let p = egui::pos2(x as f32, y as f32);
                 draw_properties_window_pointer(&ctx, &palette, &annotations, Some(id), p, true);
                 let released =
                     draw_properties_window_pointer(&ctx, &palette, &annotations, Some(id), p, false);
                 if let Some(cmd) = released
                     .into_iter()
-                    .find(|c| matches!(c, Command::SetAnnotationColor { .. }))
+                    .find(|c| matches!(c, Command::DeleteAnnotation(_)))
                 {
                     hit = Some(cmd);
                     break 'outer;
@@ -2870,11 +3020,253 @@ mod tests {
             }
         }
         assert!(
-            hit.is_some_and(|c| match c {
-                Command::SetAnnotationColor { id: ref cid, .. } => *cid == id,
-                _ => false,
-            }),
-            "clicking a swatch must emit SetAnnotationColor for the selected annotation"
+            hit.is_some_and(|c| matches!(c, Command::DeleteAnnotation(rid) if rid == id)),
+            "the panel's Delete button must emit DeleteAnnotation for the shown annotation"
+        );
+    }
+
+    /// The properties window must be draggable, and must stay where it is put.
+    ///
+    /// It used to be anchored to the right edge of the canvas. egui re-pins an
+    /// anchored window on every frame, so the title bar did nothing at all: the
+    /// panel sat exactly where it was told to, over whatever the user wanted to
+    /// read, for the whole session. Now it opens in that same strip as a
+    /// *position*, and a drag on the title bar moves the whole panel — Delete
+    /// included — and keeps it there frame after frame.
+    #[test]
+    fn properties_window_can_be_dragged_by_its_title_bar() {
+        let palette = Theme::from_id(ThemeId::default()).palette;
+        let id = pdfreader_core::AnnotationId::new(0, 0);
+        let annotations = [pdfreader_core::AnnotationInfo {
+            id,
+            kind: pdfreader_core::AnnotationKind::Square,
+            rect: pdfreader_core::Rect::from_xywh(10.0, 20.0, 40.0, 10.0),
+            contents: None,
+            color: Some([255, 0, 0, 200]),
+        }];
+        let screen = Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+        let origin = properties_panel_origin(screen);
+        let delete = |c: &Command| matches!(c, Command::DeleteAnnotation(_));
+
+        // It opens over the right-hand half of the canvas, below its own title
+        // bar — where the old anchor pinned it — but as a position, so nothing
+        // puts it back.
+        let opened = find_apply_button(&palette, &annotations, id);
+        assert!(
+            opened.x > screen.center().x && opened.y >= origin.y,
+            "the panel must open over the right-hand strip: {opened:?} vs {origin:?}"
+        );
+
+        let ctx = Context::default();
+        for _ in 0..4 {
+            draw_properties_window(&ctx, &palette, &annotations, Some(id));
+        }
+        let start = find_properties_control(
+            &ctx,
+            &palette,
+            &annotations,
+            Some(id),
+            120..=520,
+            330..=790,
+            6,
+            delete,
+        )
+        .expect("the panel's Delete button must be findable");
+
+        // Only the title bar is a grip, and it is the strip along the top of
+        // the window — a handful of candidate rows inside it, not the whole
+        // panel. Delete is the probe: it is always enabled, so its position is
+        // the panel's position without staging anything first. The drag goes
+        // inwards: egui keeps a window fully on screen, so a drag towards an
+        // edge would be clamped and the expectation would be a fiction.
+        let delta = egui::vec2(-70.0, 50.0);
+        let mut dragged = None;
+        for dy in (8..=34).step_by(4) {
+            let grip = origin + egui::vec2(PROPERTIES_PANEL_WIDTH / 2.0, dy as f32);
+            draw_properties_window_gesture(
+                &ctx,
+                &palette,
+                &annotations,
+                Some(id),
+                grip,
+                grip + delta,
+            );
+            if let Some(p) = find_properties_control(
+                &ctx,
+                &palette,
+                &annotations,
+                Some(id),
+                120..=520,
+                330..=790,
+                6,
+                delete,
+            ) {
+                // The sweep lands on a 6px grid, so each axis of the recovered
+                // position can be half a cell out; the drag itself is exact.
+                let miss = (p - start - delta).abs();
+                if miss.max_elem() <= 6.5 {
+                    dragged = Some(p);
+                    break;
+                }
+            }
+        }
+        let dragged = dragged.expect("dragging the title bar must move the whole panel");
+
+        // And it stays there: an anchored window would snap straight back.
+        for _ in 0..3 {
+            draw_properties_window(&ctx, &palette, &annotations, Some(id));
+        }
+        let settled = find_properties_control(
+            &ctx,
+            &palette,
+            &annotations,
+            Some(id),
+            120..=520,
+            330..=790,
+            6,
+            delete,
+        )
+        .expect("the panel must still be on screen");
+        assert!(
+            (settled - dragged).length() < 4.0,
+            "the panel must keep the place it was dragged to: {settled:?} vs {dragged:?}"
+        );
+    }
+
+    /// Drive a full press → move → release gesture at `from`/`to` through the
+    /// properties window, one egui frame per step, and collect every command
+    /// the panel emitted along the way. A `Slider` commit happens on release,
+    /// so a single-frame probe cannot see it, and a window only moves while
+    /// the drag is in progress. Two settle frames precede the press so the
+    /// window has laid itself out before the pointer lands on a widget.
+    ///
+    /// The clock is the context's own (see [`next_frame_time`]): the harness is
+    /// called after frames that carry no explicit time, and egui refuses a
+    /// frame stamped earlier than the one before it.
+    fn draw_properties_window_gesture(
+        ctx: &egui::Context,
+        palette: &Palette,
+        annotations: &[pdfreader_core::AnnotationInfo],
+        selected: Option<pdfreader_core::AnnotationId>,
+        from: egui::Pos2,
+        to: egui::Pos2,
+    ) -> Vec<Command> {
+        let mut commands = Vec::new();
+        let frame = |pos: egui::Pos2, button: Option<bool>, t: f64, commands: &mut Vec<Command>| {
+            let mut raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(800.0, 600.0),
+                )),
+                time: Some(t),
+                ..Default::default()
+            };
+            raw.events.push(egui::Event::PointerMoved(pos));
+            if let Some(pressed) = button {
+                raw.events.push(egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::default(),
+                });
+            }
+            let mut out = ctx.run_ui(raw, |ui| {
+                commands.extend(annotation_properties_window(
+                    ui.ctx(),
+                    palette,
+                    annotations,
+                    selected,
+                ));
+            });
+            out.textures_delta.clear();
+        };
+        let t0 = next_frame_time(ctx);
+        frame(from, None, t0, &mut commands);
+        frame(from, None, t0 + 0.05, &mut commands);
+        frame(from, Some(true), t0 + 0.10, &mut commands);
+        frame(to, None, t0 + 0.15, &mut commands);
+        frame(to, None, t0 + 0.20, &mut commands);
+        frame(to, Some(false), t0 + 0.25, &mut commands);
+        commands
+    }
+
+    /// Dragging the opacity slider and clicking Apply must write the dragged
+    /// alpha, not the value the panel opened with.
+    ///
+    /// The slider is the control that looks most alive and does least: it
+    /// tracks the pointer frame by frame, so a draft that gets thrown away on
+    /// release still *feels* like it moved while nothing was ever written.
+    /// Only Apply writes, and it must write what the drag left behind.
+    #[test]
+    fn properties_window_apply_writes_the_dragged_opacity() {
+        let palette = Theme::from_id(ThemeId::default()).palette;
+        let id = pdfreader_core::AnnotationId::new(0, 0);
+        let start = [255, 0, 0, 200];
+        let annotations = [pdfreader_core::AnnotationInfo {
+            id,
+            kind: pdfreader_core::AnnotationKind::Square,
+            rect: pdfreader_core::Rect::from_xywh(10.0, 20.0, 40.0, 10.0),
+            contents: None,
+            color: Some(start),
+        }];
+        let apply = find_apply_button(&palette, &annotations, id);
+
+        // A fresh context, so the draft starts from the engine's colour and the
+        // only thing that can move it is the drag below.
+        let ctx = Context::default();
+        for _ in 0..4 {
+            draw_properties_window(&ctx, &palette, &annotations, Some(id));
+        }
+
+        let mut committed = None;
+        'dragging: for y in (120..=(apply.y as i32 - 14)).step_by(6) {
+            for x in (330..=780).step_by(6) {
+                let from = egui::pos2(x as f32, y as f32);
+                let to = egui::pos2((x as f32 + 80.0).min(790.0), y as f32);
+                let gestures = draw_properties_window_gesture(
+                    &ctx,
+                    &palette,
+                    &annotations,
+                    Some(id),
+                    from,
+                    to,
+                );
+                assert!(
+                    !gestures
+                        .iter()
+                        .any(|c| matches!(c, Command::SetAnnotationColor { .. })),
+                    "dragging a control must only stage a value, never write it: {gestures:?}"
+                );
+                draw_properties_window_pointer(&ctx, &palette, &annotations, Some(id), apply, true);
+                let commands = draw_properties_window_pointer(
+                    &ctx,
+                    &palette,
+                    &annotations,
+                    Some(id),
+                    apply,
+                    false,
+                );
+                let Some(cmd) = commands
+                    .into_iter()
+                    .find(|c| matches!(c, Command::SetAnnotationColor { .. }))
+                else {
+                    continue;
+                };
+                if let Command::SetAnnotationColor { color, .. } = cmd {
+                    // Only the slider can move the alpha while leaving the
+                    // colour alone; a swatch would have changed it too.
+                    if color[0..3] == start[0..3] && color[3] != start[3] {
+                        committed = Some(color);
+                        break 'dragging;
+                    }
+                }
+            }
+        }
+        let color = committed.expect("a dragged opacity plus Apply must emit SetAnnotationColor");
+        assert!(
+            (26..=255).contains(&color[3]),
+            "the committed alpha must stay inside the slider's range: {}",
+            color[3]
         );
     }
 
@@ -3197,10 +3589,45 @@ mod tests {
 
 // --- Annotation properties -------------------------------------------------
 //
-// The panel edits the annotation that is selected on the canvas: colour
-// swatches, an opacity slider, and the rectangle as four numeric fields. Every
-// control emits a domain command; the reducer owns the state, the engine owns
-// the pixels, and undo records every change.
+// The panel edits the colour and opacity of the annotation that is selected on
+// the canvas. Both are staged in a draft and committed by the Apply button, so
+// a change is never half-applied while the user is still exploring the
+// swatches. Geometry is deliberately absent: dragging the mark on the canvas is
+// the honest way to move or resize it, and the four PDF-point fields that used
+// to sit here were both confusing and broken at the same time.
+//
+// The window itself is a plain floating panel: it opens over the right-hand
+// strip of the page and can be dragged anywhere from then on, so it never has
+// to sit on top of whatever the user wants to read.
+
+/// Width the properties panel asks for. The content decides the real one — the
+/// swatch grid and the opacity row between them come out wider than this — and
+/// egui keeps a window fully on screen whatever the two disagree about, so this
+/// is where the first open aims rather than a promise about the frame.
+const PROPERTIES_PANEL_WIDTH: f32 = 270.0;
+
+/// Gap between the properties window and the right edge of the canvas.
+const PROPERTIES_PANEL_MARGIN: f32 = 24.0;
+
+/// Rough height the panel opens with, used to centre it vertically.
+///
+/// The real height is whatever the swatch grid and the two rows need; this is
+/// only the first-open placement, before the user drags the window anywhere.
+const PROPERTIES_PANEL_HEIGHT: f32 = 240.0;
+
+/// Where the properties window opens before the user drags it: the right-hand
+/// strip it used to be anchored to, expressed as a *position* instead of a pin.
+///
+/// An anchored window is re-pinned to the same corner on every frame, which
+/// makes it immovable however hard the user drags the title bar. Handing egui a
+/// position (and a stable id, so the dragged one is remembered) is what makes
+/// the panel behave like the floating tool window it is.
+fn properties_panel_origin(screen: Rect) -> Pos2 {
+    Pos2::new(
+        (screen.right() - PROPERTIES_PANEL_WIDTH - PROPERTIES_PANEL_MARGIN).max(8.0),
+        (screen.center().y - PROPERTIES_PANEL_HEIGHT / 2.0).max(8.0),
+    )
+}
 
 /// Colour presets the properties panel offers, as RGBA bytes. The alpha byte
 /// is the annotation's rendered opacity, so these swatches are fully opaque.
@@ -3217,35 +3644,37 @@ const ANNOTATION_SWATCHES: [[u8; 4]; 8] = [
 
 /// Draft state for the properties window.
 ///
-/// The engine is asynchronous: after a control is released, the PDFium list
-/// may still contain the old values for a few frames. Keeping the draft in
-/// egui's temporary memory prevents the slider and numeric fields from snapping
-/// back to those old values while the request is in flight.
+/// The engine is asynchronous: after the slider is released the PDFium list may
+/// still contain the old colour for a few frames, so the widget's value has to
+/// live somewhere stable rather than being rebuilt from the list every frame.
+/// `dirty` marks an edit the user has not applied yet — while it is set the
+/// draft is the truth, and only Apply clears it.
 #[derive(Clone, PartialEq)]
 struct AnnotationPropertiesDraft {
     color: [u8; 4],
-    rect: pdfreader_core::Rect,
-    pending_color: bool,
-    pending_rect: bool,
+    dirty: bool,
 }
 
 impl AnnotationPropertiesDraft {
     fn from_annotation(annotation: &AnnotationInfo) -> Self {
         Self {
             color: annotation.color.unwrap_or([0, 0, 0, 255]),
-            rect: annotation.rect,
-            pending_color: false,
-            pending_rect: false,
+            dirty: false,
         }
     }
 }
 
 /// The floating properties window for the selected annotation.
 ///
-/// Every control keeps its value in an annotation-specific draft and commits
-/// once per completed gesture. This is deliberately not a local `let mut`
-/// value: local widget values are recreated from the stale PDFium list every
-/// frame, which made opacity and geometry appear not to apply.
+/// Colour swatches and the opacity slider only stage a value; the Apply button
+/// is what writes it. This is deliberately not a local `let mut` value: local
+/// widget values are recreated from the stale PDFium list every frame, which is
+/// what made opacity appear not to apply.
+///
+/// There is no position/size section: an annotation is dragged and resized on
+/// the page itself, where the user can see what they are doing, and four
+/// number fields that had to be typed into blind were both confusing and the
+/// way the last round of "the panel does nothing" bugs got in.
 pub fn annotation_properties_window(
     ctx: &egui::Context,
     palette: &Palette,
@@ -3266,30 +3695,28 @@ pub fn annotation_properties_window(
     let state_id = Id::new(("annotation-properties", annotation.id));
     let mut draft = ctx.data(|data| data.get_temp::<AnnotationPropertiesDraft>(state_id))
         .unwrap_or_else(|| AnnotationPropertiesDraft::from_annotation(annotation));
-    let authoritative_color = annotation.color.unwrap_or(draft.color);
-
-    // A successful optimistic reducer update confirms the in-flight value.
-    // Do not overwrite an unfinished draft with an older engine response.
-    if draft.pending_color && authoritative_color == draft.color {
-        draft.pending_color = false;
-    }
-    if !draft.pending_color {
-        draft.color = authoritative_color;
-    }
-    if draft.pending_rect && annotation.rect == draft.rect {
-        draft.pending_rect = false;
-    }
-    if !draft.pending_rect {
-        draft.rect = annotation.rect;
+    // The engine's colour, which is `None` for a mark that carries no `/C`.
+    let engine_color = annotation.color;
+    // An unapplied edit survives any stale engine response; once the edit has
+    // been applied — or was never made — the draft follows the engine, so
+    // re-selecting, undoing or reloading shows the real state.
+    if !draft.dirty {
+        if let Some(color) = engine_color {
+            draft.color = color;
+        }
     }
 
     let title = format!("{} · page {}", annotation.kind.label(), annotation.id.page + 1);
-    dialog_window(&title, palette)
-        .anchor(Align2::RIGHT_CENTER, Vec2::new(-24.0, 0.0))
-        .default_width(270.0)
+    // A fixed id rather than the title: the title changes with every
+    // annotation, and egui files a window's remembered position under its id —
+    // a per-annotation id would drop the panel back into its corner every time
+    // the selection moved.
+    floating_window(&title, palette)
+        .id(Id::new("annotation-properties-window"))
+        .default_pos(properties_panel_origin(ctx.viewport_rect()))
+        .default_width(PROPERTIES_PANEL_WIDTH)
         .show(ctx, |ui| {
             ui.spacing_mut().item_spacing.y = 8.0;
-            ui.label(RichText::new("Changes apply automatically").size(11.0).color(palette.text_dim));
 
             ui.label(RichText::new("Colour").size(11.0).color(palette.text_dim));
             egui::Grid::new(state_id.with("swatches"))
@@ -3311,12 +3738,9 @@ pub fn annotation_properties_window(
                             StrokeKind::Inside,
                         );
                         if response.clicked() {
+                            // Staged only: Apply writes it.
                             draft.color = [swatch[0], swatch[1], swatch[2], draft.color[3]];
-                            draft.pending_color = true;
-                            commands.push(Command::SetAnnotationColor {
-                                id: annotation.id,
-                                color: draft.color,
-                            });
+                            draft.dirty = true;
                         }
                     }
                     ui.end_row();
@@ -3332,69 +3756,34 @@ pub fn annotation_properties_window(
                 );
                 if response.changed() {
                     draft.color[3] = (percent / 100.0 * 255.0).round().clamp(26.0, 255.0) as u8;
+                    draft.dirty = true;
                 }
-                if response.drag_stopped() || (response.changed() && !ui.input(|i| i.pointer.primary_down())) {
-                    draft.pending_color = true;
+            });
+
+            ui.separator();
+            // Apply commits the staged colour; it is off until there is
+            // something new to write, so it never lies about a click doing
+            // something. Delete sits opposite it in the same row: the two
+            // actions a panel like this has, one to keep the edit and one to
+            // throw the mark away, and burying the destructive one under the
+            // constructive one wasted a whole row of a 270px window.
+            let pending = draft.dirty && Some(draft.color) != engine_color;
+            ui.horizontal(|ui| {
+                let response = ui
+                    .add_enabled(pending, window_primary_button(palette, "Apply"))
+                    .on_hover_text("Apply the staged colour and opacity (Ctrl+Z undoes it)");
+                if response.clicked() && pending {
+                    draft.dirty = false;
                     commands.push(Command::SetAnnotationColor {
                         id: annotation.id,
                         color: draft.color,
                     });
                 }
-            });
-
-            ui.label(RichText::new("Position and size (PDF points)").size(11.0).color(palette.text_dim));
-            let enter_pressed = ui.input(|i| i.key_pressed(egui::Key::Enter));
-            let mut commit_rect = false;
-            egui::Grid::new(state_id.with("geometry"))
-                .num_columns(4)
-                .spacing([8.0, 4.0])
-                .show(ui, |ui| {
-                    let values = [
-                        ("X", draft.rect.min_x, -1_000_000.0),
-                        ("Y", draft.rect.min_y, -1_000_000.0),
-                        ("W", draft.rect.width(), 1.0),
-                        ("H", draft.rect.height(), 1.0),
-                    ];
-                    for (label, value, min) in values {
-                        ui.label(RichText::new(label).size(11.0).color(palette.text_dim));
-                        let mut edited = value;
-                        let response = ui.add(
-                            egui::DragValue::new(&mut edited)
-                                .speed(0.5)
-                                .range(min..=1_000_000.0),
-                        );
-                        if response.changed() {
-                            draft.rect = match label {
-                                "X" => pdf_rect_moved_x(draft.rect, edited),
-                                "Y" => pdf_rect_moved_y(draft.rect, edited),
-                                "W" => pdf_rect_with_width(draft.rect, edited),
-                                _ => pdf_rect_with_height(draft.rect, edited),
-                            };
-                        }
-                        // Commit on mouse release, Enter, or blur. The draft
-                        // may have changed one frame earlier while typing, so
-                        // do not require `lost_focus && changed` on the same
-                        // frame.
-                        commit_rect |= response.drag_stopped()
-                            || response.lost_focus()
-                            || enter_pressed;
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Delete").clicked() {
+                        commands.push(Command::DeleteAnnotation(annotation.id));
                     }
-                    ui.end_row();
                 });
-            if commit_rect && draft.rect != annotation.rect {
-                draft.pending_rect = true;
-                commands.push(Command::UpdateAnnotationBounds {
-                    id: annotation.id,
-                    rect: draft.rect,
-                });
-            }
-
-            ui.separator();
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("Changes are undoable with Ctrl+Z").size(10.0).color(palette.text_dim));
-                if ui.button("Delete").clicked() {
-                    commands.push(Command::DeleteAnnotation(annotation.id));
-                }
             });
         });
 
@@ -3404,34 +3793,4 @@ pub fn annotation_properties_window(
         *data.get_temp_mut_or_insert_with(state_id, || initial) = saved;
     });
     commands
-}
-
-/// The rectangle with `min_x` moved to `x`, size preserved.
-fn pdf_rect_moved_x(rect: pdfreader_core::Rect, x: f32) -> pdfreader_core::Rect {
-    pdfreader_core::Rect::from_xywh(
-        x,
-        rect.min_y,
-        rect.width(),
-        rect.height(),
-    )
-}
-
-/// The rectangle with `min_y` moved to `y`, size preserved.
-fn pdf_rect_moved_y(rect: pdfreader_core::Rect, y: f32) -> pdfreader_core::Rect {
-    pdfreader_core::Rect::from_xywh(
-        rect.min_x,
-        y,
-        rect.width(),
-        rect.height(),
-    )
-}
-
-/// The rectangle with its width set to `w`, corner fixed.
-fn pdf_rect_with_width(rect: pdfreader_core::Rect, w: f32) -> pdfreader_core::Rect {
-    pdfreader_core::Rect::from_xywh(rect.min_x, rect.min_y, w.max(1.0), rect.height())
-}
-
-/// The rectangle with its height set to `h`, corner fixed.
-fn pdf_rect_with_height(rect: pdfreader_core::Rect, h: f32) -> pdfreader_core::Rect {
-    pdfreader_core::Rect::from_xywh(rect.min_x, rect.min_y, rect.width(), h.max(1.0))
 }

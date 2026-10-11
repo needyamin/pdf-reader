@@ -86,6 +86,19 @@ impl AnnotationKind {
         )
     }
 
+    /// Whether the reader draws this kind as a *line* rather than a filled
+    /// shape.
+    ///
+    /// Underline, strikeout and squiggly are the three markup subtypes whose
+    /// vertical extent is a stroke *weight* rather than a box: Pdfium's own
+    /// appearance generator draws all three as a hard-coded 1pt line. They
+    /// therefore take the weight floor as their resize minimum instead of
+    /// `MIN_ANN_SIZE`, which is what lets the stroke be dragged down to a
+    /// hairline rather than locking at the smallest box.
+    pub const fn is_line_markup(self) -> bool {
+        matches!(self, Self::Underline | Self::StrikeOut | Self::Squiggly)
+    }
+
     /// Short label for tool buttons and the Comments panel.
     pub const fn label(self) -> &'static str {
         match self {

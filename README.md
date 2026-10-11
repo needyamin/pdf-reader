@@ -5,7 +5,7 @@ A fast native PDF reader for people who actually work in a document: read, mark 
 ![License](https://img.shields.io/github/license/needyamin/pdf-reader)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-blue)
 ![Rust](https://img.shields.io/badge/rust-1.98.1-orange)
-![Version](https://img.shields.io/badge/version-5.0.0-green)
+![Version](https://img.shields.io/badge/version-5.0.1-green)
 
 Built in **Rust**. Drawn with **egui** and **wgpu**. Pages come from **PDFium**, the same engine Chrome uses, on a tile renderer made for large files.
 

@@ -2,6 +2,7 @@
 //! user annotation of type [PdfPageAnnotationType::Square].
 
 use crate::bindgen::{FPDF_ANNOTATION, FPDF_DOCUMENT, FPDF_PAGE};
+use crate::error::PdfiumError;
 use crate::pdf::document::page::annotation::attachment_points::PdfPageAnnotationAttachmentPoints;
 use crate::pdf::document::page::annotation::objects::PdfPageAnnotationObjects;
 use crate::pdf::document::page::annotation::private::internal::PdfPageAnnotationPrivate;
@@ -40,6 +41,18 @@ impl<'a> PdfPageSquareAnnotation<'a> {
             attachment_points: PdfPageAnnotationAttachmentPoints::from_pdfium(annotation_handle),
             lifetime: PhantomData,
         }
+    }
+
+    /// Sets this annotation's border width, in default user space units.
+    ///
+    /// Writes `/Border`, which Pdfium honours for a `Square`'s outline — unlike
+    /// the underline, strikeout and squiggly subtypes, whose appearance
+    /// generator ignores it. Note that Pdfium *removes* any appearance stream
+    /// as a side effect, so callers that supply their own must set the border
+    /// first and the stream afterwards.
+    #[inline]
+    pub fn set_border_width(&mut self, width: f32) -> Result<(), PdfiumError> {
+        PdfPageAnnotationPrivate::set_border_width(self, width)
     }
 }
 

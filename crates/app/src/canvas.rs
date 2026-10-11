@@ -23,6 +23,7 @@ use pdfreader_core::{
     ViewMode, ViewState,
 };
 use pdfreader_pdf::CharRange;
+use pdfreader_pdf::annot::{MIN_MARKUP_THICKNESS, SQUIGGLY_RISE_PT, SQUIGGLY_STEP_PT};
 use pdfreader_pdf::engine::{TilePixels, TileRequest};
 use pdfreader_render::{
     PageBox, PageSpace, TILE_SIZE, TileKey, hit_page, level_scale, tile_grid, tile_pixel_rect,
@@ -362,9 +363,14 @@ enum AnnDrag {
     },
     /// One resize handle is being dragged; `rect` is the annotation's bounds
     /// at press, and the handle's opposite corner or edge stays fixed.
+    ///
+    /// `kind` is carried so the drag can pick the right vertical floor: a line
+    /// markup's vertical axis is its stroke weight, so it may be dragged far
+    /// below [`MIN_ANN_SIZE`] (see [`resize_rect_with`]).
     Resize {
         id: AnnotationId,
         page: u32,
+        kind: AnnotationKind,
         handle: ResizeHandle,
         rect: PdfSpaceRect,
     },
@@ -1025,6 +1031,20 @@ impl Canvas {
                 }
             }
 
+            // A press that lands on a floating panel — the annotation
+            // properties window, a note popup, a menu — belongs to that panel,
+            // not to the page underneath it. `page_area.clicked()` is
+            // layer-aware and already refuses those clicks, but the raw-pointer
+            // paths below are not: without this guard, clicking a swatch in the
+            // properties window also started a stroke on the page behind it,
+            // which then stole the selection and left the panel showing the
+            // brand-new mark instead of the one being edited.
+            let over_float = ui.input(|i| i.pointer.latest_pos()).is_some_and(|pos| {
+                ui.ctx()
+                    .layer_id_at(pos)
+                    .is_some_and(|top| top != ui.layer_id())
+            });
+
             // Annotation tools: the shape appears on the very first frame of
             // the press and follows the pointer live; releasing commits it.
             // Raw pointer state rather than the page area's drag flags — with
@@ -1042,6 +1062,7 @@ impl Canvas {
                 // toolbar or menu clicks must not start strokes.
                 if pointer.primary_pressed()
                     && in_view
+                    && !over_float
                     && self.draw_start.is_none()
                     && !handle_press
                 {
@@ -1216,12 +1237,15 @@ impl Canvas {
             // with the Select tool, so an armed drawing tool still draws over
             // a selected mark. Both own the whole gesture: the text selection
             // below must not also react to it.
+            //
+            // `!over_float` keeps a click inside the properties window from
+            // grabbing whatever mark happens to sit behind the window.
             if !self.pan_tool {
                 let pointer = ui.input(|i| i.pointer.clone());
                 let in_view = pointer
                     .latest_pos()
                     .is_some_and(|pos| ui.clip_rect().contains(pos));
-                let press = pointer.primary_pressed() && in_view;
+                let press = pointer.primary_pressed() && in_view && !over_float;
                 if press {
                     if let Some(pos) = pointer.interact_pos().or(pointer.latest_pos()) {
                         let local = (pos.x - content_origin.x, pos.y - content_origin.y);
@@ -1252,6 +1276,7 @@ impl Canvas {
                                             self.ann_drag = Some(AnnDrag::Resize {
                                                 id: info.id,
                                                 page: info.id.page,
+                                                kind: info.kind,
                                                 handle,
                                                 rect: info.rect,
                                             });
@@ -1294,6 +1319,20 @@ impl Canvas {
                             // The click must not ALSO clear the selection or
                             // re-select a note card on release.
                             self.clicked_at = None;
+                        }
+
+                        // A press on bare paper — not on a handle, not on a
+                        // mark — is the canvas's own "I am done here". The
+                        // properties window is a floating panel now, one the
+                        // user can drag anywhere over the page, so it needs the
+                        // gesture every floating panel has: a click anywhere
+                        // else puts it away. Presses that land on the panel
+                        // never get this far (`over_float` above), and only the
+                        // panel's Apply writes a staged edit, so a stray click
+                        // cannot lose one.
+                        if !started && view.properties_panel_open {
+                            self.edits
+                                .push(Command::SetPropertiesPanel { open: false });
                         }
                     }
                 }
@@ -1636,7 +1675,10 @@ impl Canvas {
                             pos2(start.0.min(end.0), start.1.min(end.1)),
                             pos2(start.0.max(end.0), start.1.max(end.1)),
                         );
-                        draw_shape_preview(&painter, kind, rect, content_origin);
+                        // The page being drawn on decides the scale: the preview
+                        // must be the size the engine will draw the mark.
+                        let zoom = hit_page(&page_spaces, start).map_or(1.0, |space| space.zoom);
+                        draw_shape_preview(&painter, kind, rect, content_origin, zoom);
                     }
                 }
             }
@@ -1663,8 +1705,21 @@ impl Canvas {
                                 rect.height(),
                             )
                         }
-                        AnnDrag::Resize { handle, rect, .. } => {
-                            resize_rect(rect, handle, start_pdf)
+                        AnnDrag::Resize {
+                            handle, rect, kind, ..
+                        } => {
+                            if kind.is_line_markup() {
+                                // The vertical axis is the stroke weight, so
+                                // the height may go well below MIN_ANN_SIZE.
+                                resize_rect_with(
+                                    rect,
+                                    handle,
+                                    start_pdf,
+                                    line_markup_min_height(rect),
+                                )
+                            } else {
+                                resize_rect(rect, handle, start_pdf)
+                            }
                         }
                     };
                     self.ann_drag_rect = Some(new);
@@ -1935,13 +1990,7 @@ impl Canvas {
                 // highlight nor delete: those live on a layer above the
                 // canvas, so the mark under the pointer there is not what the
                 // user actually sees.
-                let blocked = self.panning
-                    || self.pan_tool
-                    || pointer.latest_pos().is_some_and(|pos| {
-                        ui.ctx()
-                            .layer_id_at(pos)
-                            .map_or(false, |top| top != ui.layer_id())
-                    });
+                let blocked = self.panning || self.pan_tool || over_float;
                 let in_view = !blocked
                     && pointer
                         .latest_pos()
@@ -2570,12 +2619,24 @@ fn draw_size_readout(painter: &egui::Painter, anchor: Pos2, text: &str, accent: 
 /// projected to the screen and each handle tested with a small grab radius so
 /// the handles are comfortable to hit.
 fn handle_hit(space: &PageSpace, rect: PdfSpaceRect, screen_pos: Pos2) -> Option<ResizeHandle> {
-    const GRAB: f32 = 6.0;
     let screen = space.to_screen(rect);
     let outline = Rect::from_min_size(
         pos2(screen.x, screen.y),
         vec2(screen.w.max(1.0), screen.h.max(1.0)),
     );
+    nearest_handle(outline, screen_pos)
+}
+
+/// The resize handle nearest `screen_pos`, within a small grab radius.
+///
+/// Picks the CLOSEST handle, not merely the first one inside the radius. On a
+/// thin mark (an underline is only a few points tall) the corner and edge
+/// handles overlap; "first match" picked a corner, so a drag the user meant as
+/// vertical resized *both* axes — which reads as "vertical resize only changes
+/// the width". Closest-wins makes the top edge grab the North handle and the
+/// bottom edge the South handle, so a vertical drag stays vertical.
+fn nearest_handle(outline: Rect, screen_pos: Pos2) -> Option<ResizeHandle> {
+    const GRAB: f32 = 6.0;
     let handles = [
         (ResizeHandle::NorthWest, 0),
         (ResizeHandle::North, 1),
@@ -2586,12 +2647,15 @@ fn handle_hit(space: &PageSpace, rect: PdfSpaceRect, screen_pos: Pos2) -> Option
         (ResizeHandle::SouthWest, 6),
         (ResizeHandle::West, 7),
     ];
-    handles.iter().find_map(|(handle, index)| {
-        let point = handle_points(outline)[*index];
-        Rect::from_center_size(point, vec2(GRAB * 2.0, GRAB * 2.0))
-            .contains(screen_pos)
-            .then_some(*handle)
-    })
+    let points = handle_points(outline);
+    handles
+        .iter()
+        .filter_map(|(handle, index)| {
+            let distance = (points[*index] - screen_pos).length();
+            (distance <= GRAB).then_some((*handle, distance))
+        })
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(handle, _)| handle)
 }
 
 /// Resize `rect` by dragging `handle` to the PDF-space point `to`.
@@ -2601,6 +2665,37 @@ fn handle_hit(space: &PageSpace, rect: PdfSpaceRect, screen_pos: Pos2) -> Option
 /// [`MIN_ANN_SIZE`] — a drag past the opposite edge flips nothing and simply
 /// stops at the minimum.
 fn resize_rect(rect: PdfSpaceRect, handle: ResizeHandle, to: (f32, f32)) -> PdfSpaceRect {
+    resize_rect_with(rect, handle, to, MIN_ANN_SIZE)
+}
+
+/// The vertical floor a line markup is dragged against.
+///
+/// A line markup's vertical axis is its stroke *weight*, not a box edge, and
+/// the weight can legitimately go down to a hairline
+/// ([`MIN_MARKUP_THICKNESS`]). Clamping its height at [`MIN_ANN_SIZE`] like any
+/// other annotation would stop the stroke dead once the box bottomed out — the
+/// other half of the "it locks suddenly" report.
+///
+/// Half the height the mark started at (never more than [`MIN_ANN_SIZE`]) is
+/// enough for the weight to reach its floor for every band a user can drag,
+/// because the weight falls by the same distance the box does: from a band of
+/// `h` the weight can drop by `h - h/2 = h/2`, far more than the 1.2pt between
+/// the default weight and the floor. It also keeps the box from collapsing to
+/// something that could no longer be grabbed.
+fn line_markup_min_height(rect: PdfSpaceRect) -> f32 {
+    (rect.height() / 2.0)
+        .min(MIN_ANN_SIZE)
+        .max(MIN_MARKUP_THICKNESS)
+}
+
+/// [`resize_rect`] with an explicit vertical floor, for the kinds whose height
+/// means something other than a box edge.
+fn resize_rect_with(
+    rect: PdfSpaceRect,
+    handle: ResizeHandle,
+    to: (f32, f32),
+    min_height: f32,
+) -> PdfSpaceRect {
     let (mut min_x, mut max_x) = (rect.min_x, rect.max_x);
     let (mut min_y, mut max_y) = (rect.min_y, rect.max_y);
     match handle {
@@ -2614,10 +2709,10 @@ fn resize_rect(rect: PdfSpaceRect, handle: ResizeHandle, to: (f32, f32)) -> PdfS
     }
     match handle {
         ResizeHandle::NorthWest | ResizeHandle::North | ResizeHandle::NorthEast => {
-            max_y = to.1.max(min_y + MIN_ANN_SIZE);
+            max_y = to.1.max(min_y + min_height);
         }
         ResizeHandle::SouthWest | ResizeHandle::South | ResizeHandle::SouthEast => {
-            min_y = to.1.min(max_y - MIN_ANN_SIZE);
+            min_y = to.1.min(max_y - min_height);
         }
         ResizeHandle::East | ResizeHandle::West => {}
     }
@@ -2691,15 +2786,21 @@ fn truncate_chars(text: &str, max: usize) -> String {
 }
 
 /// The rectangle kinds' on-screen stand-in.
+/// Draw `kind`'s mark inside `rect`, as the pointer drags it or as an echo
+/// while the real pixels are still being rendered.
+///
+/// `zoom` is the page's CSS pixels per PDF point, so the mark is previewed at
+/// the size the engine will actually draw it — see [`preview_stroke`].
 fn draw_shape_preview(
     painter: &egui::Painter,
     kind: AnnotationKind,
     rect: Rect,
     content_origin: egui::Pos2,
+    zoom: f32,
 ) {
     let rect = rect.translate(content_origin.to_vec2());
     let (fill, ink) = annotation_colors(kind);
-    let line = Stroke::new(PREVIEW_STROKE_PT, ink);
+    let line = Stroke::new(preview_stroke(zoom), ink);
 
     // Each tool previews the mark it will actually leave. A generic box drawn
     // for every kind meant an underline looked like a rectangle while the mouse
@@ -2709,7 +2810,7 @@ fn draw_shape_preview(
         Mark::Line(from, to) => {
             painter.line_segment([from, to], line);
         }
-        Mark::Squiggle(rect) => draw_squiggle(painter, rect, ink),
+        Mark::Squiggle(rect) => draw_squiggle(painter, rect, ink, zoom),
         Mark::Fill(rect) => {
             painter.rect_filled(rect, 1.0, fill);
         }
@@ -2768,25 +2869,26 @@ fn mark_for(kind: AnnotationKind, rect: Rect) -> Mark {
 /// PDFium's squiggly appearance is a small wave; a zig-zag is the same mark at
 /// the size a preview is judged at, and costs a handful of points rather than a
 /// sampled sine.
-fn draw_squiggle(painter: &egui::Painter, rect: Rect, ink: Color32) {
-    /// Horizontal distance between the tips of the zig-zag.
-    const STEP: f32 = 4.0;
-    /// How far the zig-zag rises above the baseline.
-    const RISE: f32 = 2.5;
-
+///
+/// The wave's height and spacing come from `pdfreader-pdf` — the same constants
+/// the applied appearance stream is built from — so the preview cannot show a
+/// wave the engine will not draw. They are document distances, so like the
+/// stroke they are scaled by `zoom`.
+fn draw_squiggle(painter: &egui::Painter, rect: Rect, ink: Color32, zoom: f32) {
+    let (step, rise) = (SQUIGGLY_STEP_PT * zoom, SQUIGGLY_RISE_PT * zoom);
     let baseline = rect.bottom() - 1.0;
     let mut points = Vec::new();
     let mut x = rect.left();
     let mut up = true;
     while x <= rect.right() {
-        points.push(pos2(x, if up { baseline - RISE } else { baseline }));
+        points.push(pos2(x, if up { baseline - rise } else { baseline }));
         up = !up;
-        x += STEP;
+        x += step;
     }
     if points.len() >= 2 {
         painter.add(egui::Shape::line(
             points,
-            Stroke::new(PREVIEW_STROKE_PT, ink),
+            Stroke::new(preview_stroke(zoom), ink),
         ));
     }
 }
@@ -2839,7 +2941,9 @@ fn draw_tool_badge(painter: &egui::Painter, tool: Tool, pos: Pos2) {
         Tool::Squiggly => {
             let band = Rect::from_min_size(tip, vec2(20.0, 10.0));
             painter.rect_filled(band, 2.0, Color32::from_rgba_unmultiplied(150, 150, 150, 40));
-            draw_squiggle(painter, band, Color32::from_rgb(46, 125, 50));
+            // The badge is a fixed-size icon, not a document preview, so it is
+            // drawn at 1:1 whatever the page zoom is.
+            draw_squiggle(painter, band, Color32::from_rgb(46, 125, 50), 1.0);
         }
         // Rectangle: just the (red) outline, matching the created stroke.
         Tool::Square => {
@@ -3019,38 +3123,47 @@ fn draw_pending_echoes(
     let painter = painter.with_clip_rect(painter.clip_rect());
 
     for shape in pending.iter().filter(|s| s.doc == doc) {
-        if !page_spaces.iter().any(|sp| sp.index == shape.page) {
+        let Some(space) = page_spaces.iter().find(|sp| sp.index == shape.page) else {
             continue;
-        }
+        };
 
         match shape.point {
             // A sticky note echoes as its icon.
             Some(point) => draw_note_tag(&painter, point, content_origin),
-            // Everything else echoes as its rectangle.
+            // Everything else echoes as the mark it will become, at the weight
+            // the page will draw it.
             None => {
                 let Some(rect) = shape.rect else { continue };
-                draw_shape_preview(&painter, shape.kind, rect, content_origin);
+                draw_shape_preview(&painter, shape.kind, rect, content_origin, space.zoom);
             }
         }
     }
 }
 
-/// Place an editor over the selected field, if its type has one.
+/// Stroke width of a drawn annotation's mark, in PDF points.
 ///
-/// The editor is an egui `Area` pinned to the field's on-screen rectangle, so
-/// it follows the page exactly like the outlines drawn next to it. It sits
-/// above the page area in egui's hit-test order, so clicking inside it does not
-/// also register as a page click (which would deselect the field).
+/// A hairline. The engine gives a newly applied underline, strikeout, squiggly
+/// or rectangle the same weight (`DEFAULT_MARKUP_THICKNESS` in `pdfreader-pdf`),
+/// so the shape does not change weight the moment the page re-renders around it.
+/// `the_preview_weight_matches_the_engine_default` asserts the two are equal, so
+/// this cannot drift.
 ///
-/// Text commits on Enter or blur and is buffered in egui memory meanwhile;
-/// every keystroke would otherwise round-trip through the engine thread and
-/// re-rasterize the page. Dropdowns commit on selection, which is discrete.
-/// Stroke width of a drawn annotation's mark, in points.
+/// This is a *document* width, so it must be scaled by the page zoom before it
+/// is drawn — see [`preview_stroke`].
+const PREVIEW_STROKE_PT: f32 = 0.45;
+
+/// [`PREVIEW_STROKE_PT`] in screen pixels, for a page at `zoom` CSS pixels per
+/// PDF point.
 ///
-/// PDFium draws a created annotation's border at roughly a point when its
-/// border style is left alone, so this is the width the preview uses too — the
-/// shape does not change weight when the page re-renders around it.
-const PREVIEW_STROKE_PT: f32 = 1.4;
+/// The preview is drawn in screen space, but the mark it stands for is drawn by
+/// the engine in *points*. Leaving the preview at a fixed pixel width made the
+/// mark appear to jump the instant the mouse was released whenever the page was
+/// zoomed in — which it is by default, since the default zoom is fit-width: a
+/// 0.25pt mark on a page at 200% is 0.5px on screen, twice the width the preview
+/// showed.
+fn preview_stroke(zoom: f32) -> f32 {
+    PREVIEW_STROKE_PT * zoom
+}
 
 /// How far a press may land from a glyph and still count as hitting it, in
 /// points. Wide enough for the gap beside a word, narrow enough that a click in
@@ -3591,8 +3704,19 @@ fn bgra_to_color_image(width: u32, height: u32, data: &[u8]) -> ColorImage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The next frame's timestamp for the canvas harnesses.
+    ///
+    /// egui's `History` panics outright when a frame reports an earlier time
+    /// than the one before it, and a `RawInput` with no `time` is stamped by
+    /// egui itself — which is not necessarily later than a time another frame
+    /// pinned by hand. One clock for every frame keeps a mixed sweep legal.
+    fn next_frame_time(ctx: &egui::Context) -> f64 {
+        ctx.input(|i| i.time) + 0.001
+    }
     use pdfreader_core::{Outline, PageGeometry};
     use pdfreader_pdf::TextPage;
+    use pdfreader_pdf::annot::DEFAULT_MARKUP_THICKNESS;
 
     /// One line of text laid out on a 200×100 point page, plus the page space
     /// that maps it to layout coordinates at 1:1 zoom with no rotation.
@@ -3850,6 +3974,115 @@ mod tests {
         assert_eq!(out.min_y, 100.0);
     }
 
+    /// The weight the canvas previews while drawing must be the weight the
+    /// engine gives the applied mark, or the mark changes size the instant the
+    /// page re-renders around it.
+    #[test]
+    fn the_preview_weight_matches_the_engine_default() {
+        assert_eq!(
+            PREVIEW_STROKE_PT, DEFAULT_MARKUP_THICKNESS,
+            "the drawn preview and the applied mark must share a weight"
+        );
+    }
+
+    /// ... and it must be previewed in *screen* pixels for a mark drawn in
+    /// *points*, so the two agree on a zoomed page too.
+    ///
+    /// The engine renders the mark at `DEFAULT_MARKUP_THICKNESS × zoom` screen
+    /// pixels (see `the_rendered_stroke_weight_scales_with_the_render_scale` in
+    /// `pdfreader-pdf`). A preview pinned to a fixed pixel width therefore
+    /// disagreed with it everywhere except 100%, and the default zoom is
+    /// fit-width — which is the "when I stop drawing it suddenly goes bigger"
+    /// report.
+    #[test]
+    fn the_preview_weight_scales_with_the_page_zoom() {
+        assert_eq!(preview_stroke(1.0), PREVIEW_STROKE_PT);
+        for zoom in [0.5_f32, 1.0, 1.5, 2.0, 4.0] {
+            assert_eq!(
+                preview_stroke(zoom),
+                DEFAULT_MARKUP_THICKNESS * zoom,
+                "the preview must be drawn at the weight the engine will use at {zoom}x"
+            );
+        }
+        // The case the report was filed against: fit-width on an A4 page in a
+        // typical window is well past 100%, where a fixed-pixel preview was
+        // noticeably thinner than the mark it stood for.
+        assert!(
+            preview_stroke(1.9) > PREVIEW_STROKE_PT * 1.8,
+            "a zoomed page must thicken the preview, not just the mark"
+        );
+    }
+
+    /// A line markup's height is its stroke weight, so its floor must let the
+    /// weight fall all the way to the hairline.
+    ///
+    /// The weight drops by exactly the distance the box does, so from a band of
+    /// `h` the weight a drag to `floor` asks for is `DEFAULT + (floor - h)`;
+    /// once that is at or below [`MIN_MARKUP_THICKNESS`] the stroke reaches the
+    /// floor. Any band that misses it locks at whatever the box floor leaves —
+    /// the "it locks suddenly" report.
+    #[test]
+    fn a_line_markups_height_floor_stays_out_of_the_strokes_way() {
+        let reachable = |band: f32, floor: f32| {
+            (DEFAULT_MARKUP_THICKNESS + (floor - band)).max(MIN_MARKUP_THICKNESS)
+        };
+        for band in [4.0_f32, 6.0, 8.0, 9.0, 12.0, 14.0, 18.0, 40.0, 200.0] {
+            let rect = PdfSpaceRect::from_xywh(0.0, 0.0, 100.0, band);
+            let floor = line_markup_min_height(rect);
+            assert!(
+                (MIN_MARKUP_THICKNESS..=MIN_ANN_SIZE).contains(&floor),
+                "a {band}pt band's floor must be within the weight range, got {floor}"
+            );
+            assert_eq!(
+                reachable(band, floor),
+                MIN_MARKUP_THICKNESS,
+                "a {band}pt band must be thinnable to the weight floor, \
+                 but its box floor leaves the stroke thicker"
+            );
+        }
+    }
+
+    /// Dragging the top handle down on a line markup must thin the stroke, not
+    /// stop at [`MIN_ANN_SIZE`] — the box floor the other kinds use.
+    ///
+    /// A band smaller than [`MIN_ANN_SIZE`] is used, because that is where the
+    /// two floors differ; on a tall band the weight bottoms out before the box
+    /// floor is reached either way.
+    #[test]
+    fn a_line_markups_vertical_floor_lets_the_box_follow_the_weight_down() {
+        use ResizeHandle::North;
+        let band = 8.0;
+        let rect = PdfSpaceRect::from_xywh(100.0, 100.0, 200.0, band);
+        let reachable = |floor: f32| {
+            (DEFAULT_MARKUP_THICKNESS + (floor - band)).max(MIN_MARKUP_THICKNESS)
+        };
+        // Far past the opposite edge: it is the floor, not the pointer, that
+        // stops the drag.
+        let to = (150.0, 101.0);
+
+        // The ordinary floor holds the box at MIN_ANN_SIZE, which pins the
+        // weight at the weight it was drawn with — the reported lock.
+        let locked = resize_rect(rect, North, to);
+        assert_eq!(locked.height(), MIN_ANN_SIZE);
+        assert_eq!(
+            reachable(locked.height()),
+            DEFAULT_MARKUP_THICKNESS,
+            "the box floor pins the stroke at the drawn weight"
+        );
+
+        // The line-markup floor lets the box follow the weight down.
+        let thinned = resize_rect_with(rect, North, to, line_markup_min_height(rect));
+        assert_eq!(thinned.height(), band / 2.0);
+        assert_eq!(
+            reachable(thinned.height()),
+            MIN_MARKUP_THICKNESS,
+            "the stroke must be able to reach the hairline floor"
+        );
+
+        // The width floor is untouched: a vertical drag must not narrow it.
+        assert_eq!(thinned.width(), rect.width());
+    }
+
     /// Every handle must both grow and shrink its edge — the reported bug was
     /// that a mark could only get smaller, never bigger.
     #[test]
@@ -3895,6 +4128,32 @@ mod tests {
             (150.0, 150.0, 200.0, 200.0),
             "south-west shrink"
         );
+    }
+
+    /// The resize picker must choose the *closest* handle. On a small mark all
+    /// eight handles sit within the grab radius of the pointer, so "first match"
+    /// picked a corner and a vertical drag became a two-axis resize — the
+    /// "vertical resize only changes the width" report.
+    #[test]
+    fn nearest_handle_prefers_the_closest_edge_not_a_corner() {
+        use ResizeHandle::*;
+
+        // A wide, thin box like an underline.
+        let thin = Rect::from_min_size(pos2(0.0, 0.0), vec2(200.0, 8.0));
+        assert_eq!(nearest_handle(thin, pos2(100.0, 0.0)), Some(North));
+        assert_eq!(nearest_handle(thin, pos2(100.0, 8.0)), Some(South));
+        assert_eq!(nearest_handle(thin, pos2(0.0, 4.0)), Some(West));
+        assert_eq!(nearest_handle(thin, pos2(200.0, 4.0)), Some(East));
+        assert_eq!(nearest_handle(thin, pos2(100.0, 40.0)), None);
+
+        // A small box: every handle is within the grab radius, so closest-wins
+        // is what decides. The top-centre must be North, NOT the north-west
+        // corner (which "first match" used to return).
+        let small = Rect::from_min_size(pos2(0.0, 0.0), vec2(10.0, 8.0));
+        assert_eq!(nearest_handle(small, pos2(5.0, 1.0)), Some(North));
+        assert_eq!(nearest_handle(small, pos2(5.0, 7.0)), Some(South));
+        assert_eq!(nearest_handle(small, pos2(1.0, 4.0)), Some(West));
+        assert_eq!(nearest_handle(small, pos2(9.0, 4.0)), Some(East));
     }
 
     /// Eight handles surround the selection, and only annotations the user
@@ -5978,6 +6237,118 @@ mod tests {
         );
     }
 
+    /// Dragging the North (top) handle up must change the HEIGHT only: the top
+    /// edge follows the pointer and the width is untouched. This is the vertical
+    /// half of the resize contract — a drag that changed width instead (or moved
+    /// the whole box) is the "vertical resize only changes horizontal" report.
+    #[test]
+    fn selected_annotation_north_handle_drag_changes_height_not_width() {
+        use pdfreader_core::{AnnotationId, AnnotationInfo, AnnotationKind, Command};
+
+        let ctx = egui::Context::default();
+        let mut canvas = Canvas::new();
+        let doc = doc(1);
+        let view = ViewState::default();
+        let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(900.0, 700.0));
+        let offset = egui::vec2(37.0, 53.0);
+
+        let ann = AnnotationInfo {
+            id: AnnotationId::new(0, 0),
+            kind: AnnotationKind::Square,
+            rect: PdfSpaceRect::from_xywh(80.0, 700.0, 140.0, 80.0),
+            contents: None,
+            color: Some([255, 0, 0, 200]),
+        };
+        let annotations = vec![ann.clone()];
+        let id = AnnotationId::new(0, 0);
+
+        let frame = |canvas: &mut Canvas,
+                     pos: egui::Pos2,
+                     press: Option<bool>,
+                     selected: Option<AnnotationId>|
+         -> Vec<Command> {
+            let mut raw = egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            };
+            raw.events.push(egui::Event::PointerMoved(pos));
+            if let Some(p) = press {
+                raw.events.push(egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: p,
+                    modifiers: egui::Modifiers::default(),
+                });
+            }
+            let mut out = ctx.run_ui(raw, |ui| {
+                ui.scope_builder(
+                    egui::UiBuilder::new().max_rect(egui::Rect::from_min_size(
+                        egui::pos2(offset.x, offset.y),
+                        screen.size(),
+                    )),
+                    |ui| {
+                        canvas.draw(
+                            ui,
+                            &doc,
+                            &view,
+                            1.0,
+                            1.0,
+                            egui::Color32::BLACK,
+                            egui::Color32::BLACK,
+                            None,
+                            None,
+                            None,
+                            egui::Color32::TRANSPARENT,
+                            Tool::Select,
+                            &PageTextCache::new(),
+                            &annotations,
+                            selected,
+                        );
+                    },
+                );
+            });
+            out.textures_delta.clear();
+            canvas.take_edits()
+        };
+
+        let _ = frame(&mut canvas, egui::pos2(5.0, 5.0), None, Some(id));
+        let space = canvas.page_spaces()[0];
+        let sr = space.to_screen(ann.rect);
+        // The North handle as the user sees it: content-local + canvas origin.
+        let north = egui::pos2(sr.x + sr.w / 2.0 + offset.x, sr.y + offset.y);
+
+        let mut edits = Vec::new();
+        edits.extend(frame(&mut canvas, north, Some(true), Some(id)));
+        edits.extend(frame(
+            &mut canvas,
+            egui::pos2(north.x, north.y - 50.0),
+            None,
+            Some(id),
+        ));
+        edits.extend(frame(
+            &mut canvas,
+            egui::pos2(north.x, north.y - 50.0),
+            Some(false),
+            Some(id),
+        ));
+
+        let resized = edits.iter().find_map(|c| match c {
+            Command::UpdateAnnotationBounds { id, rect } if *id == AnnotationId::new(0, 0) => {
+                Some(*rect)
+            }
+            _ => None,
+        });
+        assert!(
+            resized.is_some_and(|r| {
+                (r.height() - (ann.rect.height() + 50.0)).abs() < 2.0
+                    && (r.width() - ann.rect.width()).abs() < 1.0
+                    && (r.min_y - ann.rect.min_y).abs() < 1.0
+            }),
+            "dragging the North handle up must grow the HEIGHT by ~50px with the width and \
+             bottom edge fixed: {resized:?}"
+        );
+    }
+
     /// With an annotation tool still armed, grabbing the selected mark's resize
     /// handle must resize it — not draw a new mark — so a freshly drawn
     /// annotation can be adjusted without switching back to Select first.
@@ -6070,6 +6441,281 @@ mod tests {
         assert!(
             !edits.iter().any(|c| matches!(c, Command::AddAnnotation { .. })),
             "grabbing a handle must not also draw a new mark: {edits:?}"
+        );
+    }
+
+    /// A press that lands on a floating window must never reach the page.
+    ///
+    /// Regression: the canvas's raw-pointer paths only checked the canvas clip
+    /// rect, not which layer owned the pointer. With a drawing tool still armed
+    /// — the normal state right after drawing a mark — clicking a colour swatch
+    /// in the properties window also started a stroke on the page behind it.
+    /// That stroke then became the selection, so the panel jumped to the
+    /// brand-new mark instead of editing the one that was open.
+    #[test]
+    fn a_press_on_a_floating_window_never_reaches_the_page() {
+        use pdfreader_core::{AnnotationId, AnnotationInfo, AnnotationKind, Command};
+
+        let ctx = egui::Context::default();
+        let mut canvas = Canvas::new();
+        let doc = doc(1);
+        let view = ViewState::default();
+        let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+
+        // Something selected and on screen, so the Select arm has a target too.
+        let ann = AnnotationInfo {
+            id: AnnotationId::new(0, 0),
+            kind: AnnotationKind::Square,
+            rect: PdfSpaceRect::from_xywh(80.0, 700.0, 140.0, 80.0),
+            contents: None,
+            color: Some([255, 0, 0, 200]),
+        };
+        let annotations = vec![ann.clone()];
+
+        // `float` draws an opaque panel over the whole screen on a higher
+        // layer, exactly as the properties window does.
+        let frame = |canvas: &mut Canvas,
+                     pos: egui::Pos2,
+                     press: Option<bool>,
+                     tool: Tool,
+                     selected: Option<AnnotationId>,
+                     float: bool|
+         -> Vec<Command> {
+            let mut raw = egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            };
+            raw.events.push(egui::Event::PointerMoved(pos));
+            if let Some(p) = press {
+                raw.events.push(egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: p,
+                    modifiers: egui::Modifiers::default(),
+                });
+            }
+            let mut out = ctx.run_ui(raw, |ui| {
+                canvas.draw(
+                    ui,
+                    &doc,
+                    &view,
+                    1.0,
+                    1.0,
+                    egui::Color32::BLACK,
+                    egui::Color32::BLACK,
+                    None,
+                    None,
+                    None,
+                    egui::Color32::TRANSPARENT,
+                    tool,
+                    &PageTextCache::new(),
+                    &annotations,
+                    selected,
+                );
+                if float {
+                    egui::Area::new(egui::Id::new("floating-properties"))
+                        .fixed_pos(egui::pos2(0.0, 0.0))
+                        .show(ui.ctx(), |ui| {
+                            ui.set_min_size(screen.size());
+                            ui.allocate_space(screen.size());
+                        });
+                }
+            });
+            out.textures_delta.clear();
+            canvas.take_edits()
+        };
+
+        // Learn the layout, then pick a point inside the page.
+        let _ = frame(&mut canvas, egui::pos2(5.0, 5.0), None, Tool::Select, None, false);
+        let space = canvas.page_spaces()[0];
+        let sr = space.to_screen(ann.rect);
+        let on_page = egui::pos2(sr.x + sr.w / 2.0, sr.y + sr.h / 2.0);
+        let dragged_to = egui::pos2(on_page.x + 60.0, on_page.y + 20.0);
+        assert!(screen.contains(on_page), "the page point must be on screen");
+
+        // Run one draw gesture (press · move · release) on a fresh canvas. The
+        // panel needs a couple of frames to enter egui's layer order — it is
+        // present for far longer than that before a real click — so the
+        // gesture settles the layout first.
+        let draw_gesture = |float: bool| -> Vec<Command> {
+            let mut c = Canvas::new();
+            for _ in 0..3 {
+                let _ = frame(&mut c, egui::pos2(5.0, 5.0), None, Tool::Select, None, float);
+            }
+            let mut edits = Vec::new();
+            edits.extend(frame(&mut c, on_page, Some(true), Tool::Underline, None, float));
+            edits.extend(frame(&mut c, dragged_to, None, Tool::Underline, None, float));
+            edits.extend(frame(&mut c, dragged_to, Some(false), Tool::Underline, None, float));
+            edits
+        };
+        let press_select = |float: bool| -> Vec<Command> {
+            let mut c = Canvas::new();
+            for _ in 0..3 {
+                let _ = frame(&mut c, egui::pos2(5.0, 5.0), None, Tool::Select, None, float);
+            }
+            let mut edits = Vec::new();
+            edits.extend(frame(&mut c, on_page, Some(true), Tool::Select, None, float));
+            edits.extend(frame(&mut c, on_page, Some(false), Tool::Select, None, float));
+            edits
+        };
+
+        // Control: with nothing floating, the gesture draws and the press selects.
+        let control = draw_gesture(false);
+        assert!(
+            control
+                .iter()
+                .any(|c| matches!(c, Command::AddAnnotation { .. })),
+            "control: a drag on the bare page must draw: {control:?}"
+        );
+        let control_select = press_select(false);
+        assert!(
+            control_select
+                .iter()
+                .any(|c| matches!(c, Command::SelectAnnotationInPlace(Some(_)))),
+            "control: a press on the bare page must select the mark: {control_select:?}"
+        );
+
+        // With the panel over the page, the same gestures must be inert.
+        let blocked = draw_gesture(true);
+        assert!(
+            !blocked
+                .iter()
+                .any(|c| matches!(c, Command::AddAnnotation { .. })),
+            "a press on the floating window must not draw on the page: {blocked:?}"
+        );
+        let blocked_select = press_select(true);
+        assert!(
+            blocked_select.is_empty(),
+            "a press on the floating window must not move or re-select the mark behind it: {blocked_select:?}"
+        );
+    }
+
+    /// A press on bare paper dismisses the properties window.
+    ///
+    /// The panel is a floating tool window now — draggable anywhere over the
+    /// page — so it needs the one gesture every floating panel has. Without it
+    /// the window sat over the page until the selection changed, which on a
+    /// long document meant choosing between reading the page and keeping the
+    /// panel.
+    #[test]
+    fn a_press_on_bare_paper_dismisses_the_properties_panel() {
+        use pdfreader_core::{AnnotationId, AnnotationInfo, AnnotationKind, Command};
+
+        let ctx = egui::Context::default();
+        let doc = doc(1);
+        let mut view = ViewState::default();
+        view.properties_panel_open = true;
+        let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+
+        let ann = AnnotationInfo {
+            id: AnnotationId::new(0, 0),
+            kind: AnnotationKind::Square,
+            rect: PdfSpaceRect::from_xywh(80.0, 700.0, 140.0, 80.0),
+            contents: None,
+            color: Some([255, 0, 0, 200]),
+        };
+        let annotations = vec![ann.clone()];
+        let selected = Some(AnnotationId::new(0, 0));
+
+        let frame = |canvas: &mut Canvas,
+                     pos: egui::Pos2,
+                     press: Option<bool>,
+                     tool: Tool|
+         -> Vec<Command> {
+            let mut raw = egui::RawInput {
+                screen_rect: Some(screen),
+                time: Some(next_frame_time(&ctx)),
+                ..Default::default()
+            };
+            raw.events.push(egui::Event::PointerMoved(pos));
+            if let Some(p) = press {
+                raw.events.push(egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: p,
+                    modifiers: egui::Modifiers::default(),
+                });
+            }
+            let mut out = ctx.run_ui(raw, |ui| {
+                canvas.draw(
+                    ui,
+                    &doc,
+                    &view,
+                    1.0,
+                    1.0,
+                    egui::Color32::BLACK,
+                    egui::Color32::BLACK,
+                    None,
+                    None,
+                    None,
+                    egui::Color32::TRANSPARENT,
+                    tool,
+                    &PageTextCache::new(),
+                    &annotations,
+                    selected,
+                );
+            });
+            out.textures_delta.clear();
+            canvas.take_edits()
+        };
+
+        // Learn the layout, then take a point on the page that is well clear of
+        // the mark — "elsewhere on the canvas" has to mean somewhere else.
+        let mut probe = Canvas::new();
+        let _ = frame(&mut probe, egui::pos2(5.0, 5.0), None, Tool::Select);
+        let space = probe.page_spaces()[0];
+        let mark = space.to_screen(ann.rect);
+        let bare = egui::pos2(space.origin.0 + space.size.0 / 2.0, mark.y - 40.0);
+        assert!(
+            screen.contains(bare) && !mark.contains(bare.x, bare.y),
+            "the bare-paper point must be on the page and off the mark: {bare:?} vs {mark:?}"
+        );
+
+        // Select tool, press and release on empty paper.
+        let mut canvas = Canvas::new();
+        for _ in 0..3 {
+            let _ = frame(&mut canvas, egui::pos2(5.0, 5.0), None, Tool::Select);
+        }
+        let mut edits = Vec::new();
+        edits.extend(frame(&mut canvas, bare, Some(true), Tool::Select));
+        edits.extend(frame(&mut canvas, bare, Some(false), Tool::Select));
+        assert!(
+            edits
+                .iter()
+                .any(|c| matches!(c, Command::SetPropertiesPanel { open: false })),
+            "a press on bare paper must dismiss the properties window: {edits:?}"
+        );
+
+        // The same press on the mark itself keeps the panel open: that is how
+        // the panel moves from one annotation to the next.
+        let mut canvas = Canvas::new();
+        for _ in 0..3 {
+            let _ = frame(&mut canvas, egui::pos2(5.0, 5.0), None, Tool::Select);
+        }
+        let on_mark = egui::pos2(mark.x + mark.w / 2.0, mark.y + mark.h / 2.0);
+        let mut edits = Vec::new();
+        edits.extend(frame(&mut canvas, on_mark, Some(true), Tool::Select));
+        edits.extend(frame(&mut canvas, on_mark, Some(false), Tool::Select));
+        assert!(
+            !edits
+                .iter()
+                .any(|c| matches!(c, Command::SetPropertiesPanel { open: false })),
+            "a press on the mark must not dismiss the panel it is showing: {edits:?}"
+        );
+
+        // An armed drawing tool pressing bare paper still dismisses it: the
+        // click is the user saying "elsewhere", not "keep editing this".
+        let mut canvas = Canvas::new();
+        for _ in 0..3 {
+            let _ = frame(&mut canvas, egui::pos2(5.0, 5.0), None, Tool::Highlight);
+        }
+        let mut edits = Vec::new();
+        edits.extend(frame(&mut canvas, bare, Some(true), Tool::Highlight));
+        assert!(
+            edits
+                .iter()
+                .any(|c| matches!(c, Command::SetPropertiesPanel { open: false })),
+            "a press on bare paper must dismiss the panel with a tool armed too: {edits:?}"
         );
     }
 }

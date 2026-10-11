@@ -136,12 +136,23 @@ pub fn toast_frame(palette: &Palette, accent: Color32) -> Frame {
 /// every window here is a response to a menu command — it has no natural
 /// position, and one that appeared wherever it happened to fit would look like
 /// a different app each time. Callers add their own sizing and `.open(..)`.
+///
+/// Use [`floating_window`] instead for anything the user is meant to drag:
+/// anchoring re-pins a window to the same spot on every frame, which makes it
+/// immovable however hard the title bar is pulled.
 pub fn dialog_window(title: &str, palette: &Palette) -> egui::Window<'static> {
+    floating_window(title, palette).anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+}
+
+/// [`dialog_window`] without the centre anchor: the same frame, title bar and
+/// non-collapsible behaviour, but a window the user can put wherever it is out
+/// of the way. The caller supplies a `default_pos` (and, to make the placement
+/// stick, a stable id — see [`egui::Window::id`]).
+pub fn floating_window(title: &str, palette: &Palette) -> egui::Window<'static> {
     egui::Window::new(RichText::new(title).strong().size(13.0).color(palette.text))
         .frame(window_frame(palette))
         .title_frame(title_frame(palette))
         .collapsible(false)
-        .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
 }
 
 /// The committed action of a window: Export, Save and close, Unlock.

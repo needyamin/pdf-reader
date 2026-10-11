@@ -8,14 +8,15 @@
 //! the app's own state, which is why it lives beside the shell rather than in
 //! the `ui` crate.
 
-use egui::{Align, Context, Layout, RichText};
+use egui::{Align, Context, Frame, Layout, Margin, RichText, Sense, Stroke, Ui, Vec2};
 use pdfreader_core::{Command, ThemeId, ViewMode, ZoomMode};
 use pdfreader_ui::{
-    Palette, card_frame, chip_frame, divider, heading, hint, image_frame, primary_button,
-    secondary_button, section,
+    Palette, card_frame, chip_frame, chip_radius, divider, heading, hint, image_frame,
+    primary_button, secondary_button, section,
 };
 
 use crate::App;
+use std::sync::OnceLock;
 
 /// One page of the Settings window.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -726,42 +727,169 @@ impl App {
         pdfreader_ui::dialog_window("Keyboard Shortcuts", palette)
             .open(&mut open)
             .resizable(true)
-            .default_size([470.0, 580.0])
-            .min_size([380.0, 360.0])
+            .default_size([880.0, 700.0])
+            .min_size([640.0, 480.0])
             .show(ctx, |ui| {
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        ui.label(hint(
-                            palette,
-                            "Every shortcut the reader answers, grouped the way the menu bar is.",
-                        ));
-                        ui.add_space(10.0);
-                        for (group, rows) in SHORTCUTS {
-                            section(ui, palette, group);
-                            egui::Grid::new(*group)
-                                .num_columns(2)
-                                .spacing([18.0, 7.0])
-                                .show(ui, |ui| {
-                                    for (keys, action) in *rows {
-                                        ui.label(
-                                            RichText::new(*keys)
-                                                .monospace()
-                                                .size(11.5)
-                                                .color(palette.accent),
-                                        );
-                                        ui.label(
-                                            RichText::new(*action).size(12.0).color(palette.text),
-                                        );
-                                        ui.end_row();
-                                    }
-                                });
-                        }
-                    });
+                draw_shortcuts_content(ui, palette);
             });
         self.shortcuts_open = open;
     }
+}
+
+/// The body of the Keyboard Shortcuts window, also exercised by tests.
+///
+/// The five shortcut groups are laid out as a uniform 3×2 tile grid: every card
+/// is the same width (equal `ui.columns`) and the same height (forced to the
+/// tallest card), so the reference reads as a clean, evenly sized grid that
+/// fills the window width edge to edge — no mismatched widths, no ragged edges.
+pub(crate) fn draw_shortcuts_content(ui: &mut Ui, palette: &Palette) {
+    ui.label(hint(
+        palette,
+        "Every shortcut the reader answers, grouped the way the menu bar is.",
+    ));
+    ui.add_space(12.0);
+
+    // Fixed 3-column grid: the user picked a 3×2 layout, so the cards are a
+    // comfortable width and the grid is perfectly even.
+    const COLUMNS: usize = 3;
+
+    // Force every card to the same height so the row of tiles is level.
+    let card_h = uniform_card_height(palette);
+
+    for chunk in SHORTCUTS.chunks(COLUMNS) {
+        ui.columns(COLUMNS, |cols| {
+            for (j, (group, rows)) in chunk.iter().enumerate() {
+                cols[j].vertical(|ui| {
+                    card_frame(palette).show(ui, |ui| {
+                        // Pin the inner height so each card is exactly the same
+                        // size; shorter groups just get a little empty space at
+                        // the bottom rather than a shorter card.
+                        ui.set_min_height(card_h);
+                        render_shortcut_card(ui, palette, *group, *rows);
+                    });
+                });
+            }
+        });
+    }
+}
+
+/// Draw a single shortcut group as a card body: a branded header (accent rule
+/// + group name) followed by one row per shortcut. Extracted from the window
+/// layout so the uniform-height measurement reuses exactly the same drawing
+/// code the window uses — there is only one source of truth for a card's size.
+fn render_shortcut_card(ui: &mut Ui, palette: &Palette, group: &str, rows: &[(&str, &str)]) {
+    ui.horizontal(|ui| {
+        let (bar, _) = ui.allocate_exact_size(Vec2::new(3.0, 13.0), Sense::hover());
+        ui.painter().rect_filled(bar, 1.5, palette.accent);
+        ui.add_space(7.0);
+        ui.label(
+            RichText::new(group)
+                .strong()
+                .size(13.0)
+                .color(palette.text),
+        );
+    });
+    ui.add_space(2.0);
+    divider(ui, palette);
+    ui.add_space(6.0);
+
+    for (keys, action) in rows {
+        ui.horizontal(|ui| {
+            draw_keycombo(ui, palette, keys);
+            ui.add(
+                egui::Label::new(RichText::new(*action).size(12.0).color(palette.text)).wrap(),
+            );
+        });
+        ui.add_space(3.0);
+    }
+}
+
+/// The height every shortcut card is forced to, so the grid is perfectly level.
+///
+/// It is the tallest group's natural content height, measured once with the
+/// same `render_shortcut_card` the window draws. The height depends only on the
+/// (static) shortcut list and the fixed font sizes, not on the theme, so the
+/// result is cached. A small buffer absorbs a description that wraps to two
+/// lines at a given width, so no card ever overflows its uniform height.
+fn uniform_card_height(palette: &Palette) -> f32 {
+    static CACHE: OnceLock<f32> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        let ctx = Context::default();
+        let mut tallest = 0.0_f32;
+        for (group, rows) in SHORTCUTS {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(300.0, 4000.0),
+                )),
+                ..Default::default()
+            };
+            let mut measured = 0.0_f32;
+            let mut out = ctx.run_ui(raw, |ui| {
+                measured = ui
+                    .allocate_ui(egui::vec2(300.0, 4000.0), |ui| {
+                        render_shortcut_card(ui, palette, *group, *rows);
+                        ui.min_rect().height()
+                    })
+                    .inner;
+            });
+            // Egui hands back texture deltas the caller must consume.
+            out.textures_delta.clear();
+            tallest = tallest.max(measured);
+        }
+        tallest + 14.0
+    })
+}
+
+/// One key on a keycap: a small rounded chip. Modifier keys (Ctrl, Shift, Alt…)
+/// take the soft accent fill so a combination reads as "modifiers + key", the
+/// way professional shortcut tables do.
+fn keycap(ui: &mut Ui, palette: &Palette, label: &str) {
+    let modifier = matches!(
+        label,
+        "Ctrl" | "Shift" | "Alt" | "Win" | "Cmd" | "Meta" | "Opt" | "Super"
+    );
+    let fill = if modifier {
+        palette.accent_soft
+    } else {
+        palette.panel_bg
+    };
+    Frame::new()
+        .fill(fill)
+        .stroke(Stroke::new(1.0, palette.border))
+        .corner_radius(chip_radius(palette))
+        .inner_margin(Margin::symmetric(4, 1))
+        .show(ui, |ui| {
+            ui.label(
+                RichText::new(label)
+                    .monospace()
+                    .size(10.5)
+                    .color(palette.text),
+            );
+        });
+}
+
+/// Render a shortcut string such as `"Ctrl+Shift+S"` or
+/// `"Ctrl+Shift+Z  /  Ctrl+Y"` as a row of keycap chips, with faint `+` between
+/// the keys of one combination and a faint `/` between alternatives.
+fn draw_keycombo(ui: &mut Ui, palette: &Palette, combo: &str) {
+    let alternatives: Vec<&str> = combo.split("  /  ").collect();
+    ui.horizontal(|ui| {
+        for (ai, alt) in alternatives.iter().enumerate() {
+            if ai > 0 {
+                ui.label(RichText::new("/").weak().size(11.0).color(palette.text_dim));
+                ui.add_space(4.0);
+            }
+            let keys: Vec<&str> = alt.split('+').map(str::trim).collect();
+            for (ki, key) in keys.iter().enumerate() {
+                if ki > 0 {
+                    ui.label(RichText::new("+").weak().size(11.0).color(palette.text_dim));
+                    ui.add_space(1.0);
+                }
+                keycap(ui, palette, key);
+            }
+        }
+    });
 }
 
 /// A full-width selectable row in the category rail. Returns whether it was
@@ -982,5 +1110,58 @@ impl App {
         if !open || close {
             self.about_open = false;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use egui::{Pos2, RawInput, Rect};
+
+    /// The shortcuts reference must fit inside the default window in one view —
+    /// no scrolling, no overflow. The real content is laid out inside a generous
+    /// area and the space it actually uses is read back from `min_rect`.
+    #[test]
+    fn shortcuts_reference_fits_default_window() {
+        let ctx = Context::default();
+        let palette = pdfreader_ui::Theme::from_id(ThemeId::AnsNew).palette;
+
+        // Default window is 880x700; the content area is that minus the 18px
+        // frame margin on every side and the ~30px title bar.
+        let content_w = 880.0 - 36.0;
+        let content_h = 700.0 - 36.0 - 30.0;
+
+        let raw = RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(1000.0, 3000.0))),
+            ..Default::default()
+        };
+        let mut measured: (f32, f32) = (0.0, 0.0);
+        let mut out = ctx.run_ui(raw, |ui| {
+            measured = ui
+                .allocate_ui(egui::vec2(content_w, 3000.0), |ui| {
+                    draw_shortcuts_content(ui, &palette);
+                    (ui.min_rect().width(), ui.min_rect().height())
+                })
+                .inner;
+        });
+        // Egui hands back texture deltas that the test harness must consume.
+        out.textures_delta.clear();
+        let (used_w, used_h) = measured;
+
+        assert!(
+            used_w <= content_w + 1.0,
+            "shortcuts overflow width: used {used_w:.0} > {content_w:.0}"
+        );
+        // The grid must also fill the width edge to edge — "fully cover the GUI"
+        // means no side margin gap. Equal `ui.columns` should span the whole
+        // content area, so the used width must be essentially the full width.
+        assert!(
+            used_w >= content_w - 2.0,
+            "shortcuts leave a side gap: used {used_w:.0} < {content_w:.0}"
+        );
+        assert!(
+            used_h <= content_h + 1.0,
+            "shortcuts overflow height: used {used_h:.0} > {content_h:.0}"
+        );
     }
 }

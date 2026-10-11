@@ -21,6 +21,6 @@ pub use theme::{Palette, Theme, apply as apply_theme};
 pub use window::{
     BUTTON_HEIGHT, CARD_MARGIN, DIALOG_MIN_WIDTH, FOOTER_GAP, WINDOW_MARGIN, card_frame,
     card_radius, chip_frame, chip_radius, dialog_window, disabled_button, divider, field_frame,
-    heading, hint, image_frame, primary_button, secondary_button, section, toast_frame,
-    window_frame, window_radius,
+    floating_window, heading, hint, image_frame, primary_button, secondary_button, section,
+    toast_frame, window_frame, window_radius,
 };

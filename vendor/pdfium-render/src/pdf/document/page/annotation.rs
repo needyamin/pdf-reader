@@ -447,6 +447,49 @@ impl<'a> PdfPageAnnotation<'a> {
         PdfPageAnnotationPrivate::remove_normal_appearance_stream(self)
     }
 
+    /// Replaces this annotation's normal appearance stream (`/AP /N`) with one
+    /// built from `content`, a PDF content-stream fragment written in absolute
+    /// page coordinates covering the annotation's current `/Rect`.
+    ///
+    /// Pdfium's own appearance generator draws an underline, strikeout or
+    /// squiggly mark as a hard-coded 1pt line and ignores both `/BS /W` and
+    /// `/Border`, so a thicker mark cannot be requested through the annotation
+    /// dictionary at all. Supplying the appearance stream directly is the only
+    /// way to control the line's thickness.
+    #[inline]
+    pub fn set_normal_appearance_stream(&mut self, content: &str) -> Result<(), PdfiumError> {
+        PdfPageAnnotationPrivate::set_normal_appearance_stream(self, content)
+    }
+
+    /// Returns the content stream of this annotation's normal appearance
+    /// (`/AP /N`), or `None` when it has none.
+    ///
+    /// Pdfium's colour accessors refuse to work while an appearance stream is
+    /// present, so this is the only way to inspect the appearance of an
+    /// annotation that supplies its own.
+    #[inline]
+    pub fn normal_appearance_stream(&self) -> Option<String> {
+        PdfPageAnnotationPrivate::normal_appearance_stream(self)
+    }
+
+    /// Sets this annotation's border width (the `/Border` entry), in default
+    /// user space units.
+    ///
+    /// Pdfium removes the annotation's appearance stream as a side effect, since
+    /// a stale stream would win over the new border. Callers that supply their
+    /// own stream must set the border first and the stream afterwards.
+    #[inline]
+    pub fn set_border_width(&mut self, width: f32) -> Result<(), PdfiumError> {
+        PdfPageAnnotationPrivate::set_border_width(self, width)
+    }
+
+    /// Returns this annotation's border width, or `None` when it has no
+    /// `/Border` entry.
+    #[inline]
+    pub fn border_width(&self) -> Option<f32> {
+        PdfPageAnnotationPrivate::border_width(self)
+    }
+
     /// Returns `true` if Pdfium supports creating, editing, and rendering this type of
     /// [PdfPageAnnotation].
     ///
