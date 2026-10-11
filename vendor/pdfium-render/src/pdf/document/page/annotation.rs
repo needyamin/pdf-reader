@@ -435,6 +435,18 @@ impl<'a> PdfPageAnnotation<'a> {
         }
     }
 
+    /// Removes this annotation's normal appearance stream (`/AP /N`), so Pdfium
+    /// rebuilds it from the annotation's current geometry on the next render.
+    ///
+    /// Call this after changing a markup annotation's quad points: Pdfium caches
+    /// the appearance it generated on the first render, and without clearing it
+    /// the annotation keeps rendering at its old size no matter what the
+    /// annotation dictionary says.
+    #[inline]
+    pub fn remove_appearance_stream(&mut self) -> Result<(), PdfiumError> {
+        PdfPageAnnotationPrivate::remove_normal_appearance_stream(self)
+    }
+
     /// Returns `true` if Pdfium supports creating, editing, and rendering this type of
     /// [PdfPageAnnotation].
     ///

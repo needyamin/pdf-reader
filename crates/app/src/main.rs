@@ -1909,6 +1909,19 @@ impl App {
                     commands.push(Command::SetTool(Tool::Select));
                 }
             }
+            // Single-key tool shortcuts, in the convention mainstream PDF
+            // editors use (V select, H highlight, R rectangle, …). Gated on
+            // `free_focus` so typing in a note or form field never arms a tool,
+            // and on `!ctrl` so they never shadow Ctrl+S / Ctrl+E / Ctrl+Y.
+            if free_focus && !ctrl {
+                for tool in Tool::ALL {
+                    if let Some(key) = egui::Key::from_name(tool.shortcut()) {
+                        if input.key_pressed(key) {
+                            commands.push(Command::SetTool(tool));
+                        }
+                    }
+                }
+            }
             if ctrl && input.key_pressed(egui::Key::S) {
                 if self
                     .store
@@ -2819,15 +2832,18 @@ impl eframe::App for App {
                                 tiles.extend(pending);
 
                                 // The properties window for whichever
-                                // annotation is selected on the canvas. Drawn
-                                // in the same frame as the canvas so a fresh
-                                // selection opens the panel immediately.
-                                commands.extend(annotation_properties_window(
-                                    ui.ctx(),
-                                    &palette,
-                                    tab.annotations.as_deref().unwrap_or(&[]),
-                                    tab.view.selected_annotation,
-                                ));
+                                // annotation is selected on the canvas. It is
+                                // OFF by default so selecting an annotation only
+                                // shows its move/resize handles; the toolbar
+                                // "Properties" toggle opens it on demand.
+                                if tab.view.properties_panel_open {
+                                    commands.extend(annotation_properties_window(
+                                        ui.ctx(),
+                                        &palette,
+                                        tab.annotations.as_deref().unwrap_or(&[]),
+                                        tab.view.selected_annotation,
+                                    ));
+                                }
 
                                 // Text for every page on screen, so a click can
                                 // be hit-tested to a character. Extraction is
@@ -4002,5 +4018,22 @@ mod tests {
         assert_eq!(zoom_mode_from_name(Some("100")), ZoomMode::Fixed(1.0));
         assert_eq!(zoom_mode_from_name(None), ZoomMode::FitWidth);
         assert_eq!(zoom_mode_from_name(Some("nonsense")), ZoomMode::FitWidth);
+    }
+
+    /// The tool shortcuts the key handler arms must each resolve to a real key
+    /// and stay distinct — `Tool::shortcut()` is the single source of truth for
+    /// both the tooltip and the binding.
+    #[test]
+    fn every_tool_shortcut_resolves_to_a_distinct_key() {
+        let mut keys = Vec::new();
+        for tool in Tool::ALL {
+            let key = egui::Key::from_name(tool.shortcut())
+                .unwrap_or_else(|| panic!("{tool:?} shortcut {:?} is not a key", tool.shortcut()));
+            keys.push(key);
+        }
+        let count = keys.len();
+        keys.sort_unstable_by_key(|k| k.name());
+        keys.dedup();
+        assert_eq!(keys.len(), count, "tool shortcuts must map to distinct keys");
     }
 }

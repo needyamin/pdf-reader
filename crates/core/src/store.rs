@@ -64,8 +64,10 @@ pub enum UndoAction {
     Color {
         /// Which annotation.
         id: crate::annotation::AnnotationId,
-        /// The colour before the edit; undo restores this.
-        previous: [u8; 4],
+        /// The colour before the edit; `None` means the annotation had no
+        /// colour entry (links, imported marks) and undo clears it. Undo of a
+        /// colour set on a colourless annotation restores `None`.
+        previous: Option<[u8; 4]>,
         /// The colour after the edit; redo restores this.
         next: [u8; 4],
     },
@@ -340,9 +342,10 @@ impl Store {
                         .view
                         .selected_annotation
                         .is_none_or(|sel| annotations.iter().any(|a| a.id == sel));
-                    if !still_there {
-                        tab.view.selected_annotation = None;
-                    }
+                if !still_there {
+                    tab.view.selected_annotation = None;
+                    tab.view.properties_panel_open = false;
+                }
                     // Resolve the history entry for the annotation the engine
                     // just reported as created. Even with several adds in
                     // flight, each fresh list carries exactly the id it
@@ -351,6 +354,13 @@ impl Store {
                     if let Some(created_id) = created {
                         resolve_created(&mut tab.undo_stack, created_id);
                         resolve_created(&mut tab.redo_stack, created_id);
+                        // Select the mark that was just created so its resize
+                        // handles appear at once: the user can adjust it
+                        // straight away instead of hunting for it, and the
+                        // armed tool keeps drawing when they click empty paper.
+                        if annotations.iter().any(|a| a.id == created_id) {
+                            tab.view.selected_annotation = Some(created_id);
+                        }
                     }
                     // Any add whose id is known can now also record its shape,
                     // which is what makes it re-creatable on redo.
@@ -383,6 +393,7 @@ impl Store {
                 };
                 let Some(annotation_id) = id else {
                     tab.view.selected_annotation = None;
+                    tab.view.properties_panel_open = false;
                     return Vec::new();
                 };
                 // Ids are positional and shift after a delete: a selection of
@@ -459,6 +470,7 @@ impl Store {
                 if let Some(tab) = self.state.active_mut() {
                     tab.dirty = true;
                     tab.view.selected_annotation = None;
+                    tab.view.properties_panel_open = false;
                     if let Some(list) = tab.annotations.as_mut() {
                         if let Some(info) = list.iter().find(|a| a.id == id) {
                             push_history(
@@ -565,10 +577,11 @@ impl Store {
                 else {
                     return Vec::new();
                 };
-                let Some(previous) = a.color else {
-                    return Vec::new();
-                };
-                if previous == color {
+                // No early bail when the annotation had no colour: a colourless
+                // link or imported mark must still be recolourable. `previous`
+                // is `None` in that case and undo restores the colourless state.
+                let previous = a.color;
+                if previous == Some(color) {
                     return Vec::new();
                 }
                 a.color = Some(color);
@@ -588,6 +601,14 @@ impl Store {
                 ]
             }
 
+            Command::SetPropertiesPanel { open } => {
+                let Some(tab) = self.state.active_mut() else {
+                    return Vec::new();
+                };
+                tab.view.properties_panel_open = open;
+                Vec::new()
+            }
+
             Command::SelectAnnotationInPlace(id) => {
                 let Some(tab) = self.state.active_mut() else {
                     return Vec::new();
@@ -599,6 +620,9 @@ impl Store {
                 });
                 if resolves {
                     tab.view.selected_annotation = id;
+                }
+                if id.is_none() {
+                    tab.view.properties_panel_open = false;
                 }
                 Vec::new()
             }
@@ -1221,7 +1245,7 @@ impl Store {
             UndoAction::Color { id, previous, next } => {
                 let target = match direction {
                     HistoryDirection::Back => *previous,
-                    HistoryDirection::Forward => *next,
+                    HistoryDirection::Forward => Some(*next),
                 };
                 let tab = self.state.active_mut()?;
                 let found = tab
@@ -1229,19 +1253,22 @@ impl Store {
                     .as_mut()
                     .and_then(|list| list.iter_mut().find(|a| a.id == *id));
                 let annotation = found?;
-                annotation.color = Some(target);
+                annotation.color = target;
                 tab.dirty = true;
-                Some((
-                    cons(
+                // Restoring "no colour" (an annotation that had none) only
+                // updates the model; there is no engine call to clear a colour.
+                let effects = match target {
+                    Some(color) => cons(
                         Effect::SetAnnotationColor {
                             doc,
                             id: *id,
-                            color: target,
+                            color,
                         },
                         invalidate,
                     ),
-                    entry.clone(),
-                ))
+                    None => invalidate,
+                };
+                Some((effects, entry.clone()))
             }
         }
     }
@@ -2034,6 +2061,44 @@ mod tests {
         );
     }
 
+    /// The annotation just created is selected, so its resize handles appear
+    /// immediately — the user can adjust it without hunting for it, and the
+    /// armed tool keeps drawing when they click empty paper.
+    #[test]
+    fn the_created_annotation_is_selected() {
+        let (mut s, tab) = opened_store(1);
+        let doc = s.state().tab(tab).unwrap().document.as_ref().unwrap().id;
+        s.state.tabs[0].annotations = Some(Vec::new());
+
+        s.dispatch(Command::AddAnnotation {
+            page: 0,
+            new: crate::annotation::NewAnnotation::Highlight(Rect::from_xywh(0.0, 0.0, 10.0, 10.0)),
+        });
+        assert_eq!(
+            s.state.tab(tab).unwrap().view.selected_annotation,
+            None,
+            "nothing is selected until the engine reports the new id"
+        );
+
+        let id = crate::annotation::AnnotationId::new(0, 0);
+        s.dispatch(Command::AnnotationsLoaded {
+            doc,
+            annotations: vec![crate::annotation::AnnotationInfo {
+                id,
+                kind: crate::annotation::AnnotationKind::Highlight,
+                rect: Rect::from_xywh(0.0, 0.0, 10.0, 10.0),
+                contents: None,
+                color: None,
+            }],
+            created: Some(id),
+        });
+        assert_eq!(
+            s.state.tab(tab).unwrap().view.selected_annotation,
+            Some(id),
+            "the freshly created annotation must be selected so its handles show"
+        );
+    }
+
     /// Redo of an add draws the annotation again, from the shape recorded when
     /// the engine reported it.
     #[test]
@@ -2570,6 +2635,75 @@ mod tests {
         assert_eq!(s.state.active().unwrap().undo_stack.len(), before);
     }
 
+    /// Regression: a colourless annotation (no `/C` entry — links, imported
+    /// marks) must still be recolourable. The old handler bailed out when
+    /// `a.color` was `None`, so clicking a swatch did nothing and the edit
+    /// appeared broken. The colour must now reach the engine and undo must
+    /// restore the colourless state.
+    #[test]
+    fn recolouring_a_colourless_annotation_emits_and_undoes_to_none() {
+        let (mut s, _tab) = opened_store(1);
+        let id = crate::annotation::AnnotationId::new(0, 0);
+        s.state.tabs[0].annotations = Some(vec![crate::annotation::AnnotationInfo {
+            id,
+            kind: crate::annotation::AnnotationKind::Link,
+            rect: Rect::from_xywh(0.0, 0.0, 40.0, 40.0),
+            contents: None,
+            color: None,
+        }]);
+
+        let effects = s.dispatch(Command::SetAnnotationColor {
+            id,
+            color: [76, 175, 80, 255],
+        });
+        let list = s.state.active().unwrap().annotations.clone().unwrap();
+        assert_eq!(list[0].color, Some([76, 175, 80, 255]));
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::SetAnnotationColor { color, .. } if *color == [76, 175, 80, 255])),
+            "a colourless annotation's recolour must reach the engine"
+        );
+
+        s.dispatch(Command::Undo);
+        let list = s.state.active().unwrap().annotations.clone().unwrap();
+        assert_eq!(list[0].color, None, "undo restores the colourless state");
+
+        s.dispatch(Command::Redo);
+        let list = s.state.active().unwrap().annotations.clone().unwrap();
+        assert_eq!(list[0].color, Some([76, 175, 80, 255]));
+    }
+
+    /// The properties window stays closed unless the user opens it: selecting
+    /// an annotation must show only the move/resize handles, not pop the panel.
+    /// The toolbar "Properties" toggle opens it, and clearing the selection
+    /// closes it again.
+    #[test]
+    fn properties_panel_opens_on_command_and_closes_on_deselect() {
+        let (mut s, _tab) = opened_store(1);
+        let id = crate::annotation::AnnotationId::new(0, 0);
+        s.state.tabs[0].annotations = Some(vec![crate::annotation::AnnotationInfo {
+            id,
+            kind: crate::annotation::AnnotationKind::Square,
+            rect: Rect::from_xywh(0.0, 0.0, 40.0, 40.0),
+            contents: None,
+            color: Some([255, 0, 0, 255]),
+        }]);
+
+        // Off by default — selecting an annotation does not open it.
+        assert!(!s.state.active().unwrap().view.properties_panel_open);
+        s.dispatch(Command::SelectAnnotationInPlace(Some(id)));
+        assert!(!s.state.active().unwrap().view.properties_panel_open);
+
+        // The toolbar toggle opens it.
+        s.dispatch(Command::SetPropertiesPanel { open: true });
+        assert!(s.state.active().unwrap().view.properties_panel_open);
+
+        // Clearing the selection closes it again.
+        s.dispatch(Command::SelectAnnotation(None));
+        assert!(!s.state.active().unwrap().view.properties_panel_open);
+    }
+
     /// A drag that ends where it began is a click, not an edit: no effects
     /// and no undo entry, so undo never replays a phantom move.
     #[test]
@@ -2591,5 +2725,78 @@ mod tests {
         assert!(effects.is_empty());
         assert!(s.state.active().unwrap().undo_stack.is_empty());
         assert!(!s.state.active().unwrap().dirty);
+    }
+
+    /// Headless stand-in for the keyboard undo path (Ctrl+Z / Ctrl+Shift+Z in
+    /// `main.rs`): move an annotation, recolour it, then undo twice and redo
+    /// twice, asserting the listed annotation round-trips through exactly the
+    /// geometry and colour it started with — the edit path the manual
+    /// click-through could not exercise from a headless run.
+    #[test]
+    fn keyboard_undo_reverts_colour_then_geometry_and_redo_restores_both() {
+        let (mut s, tab) = opened_store(1);
+        let id = crate::annotation::AnnotationId::new(0, 0);
+        s.state.tabs[0].annotations = Some(vec![crate::annotation::AnnotationInfo {
+            id,
+            kind: crate::annotation::AnnotationKind::Square,
+            rect: Rect::from_xywh(10.0, 20.0, 40.0, 10.0),
+            contents: None,
+            color: Some([255, 0, 0, 200]),
+        }]);
+
+        s.dispatch(Command::UpdateAnnotationBounds {
+            id,
+            rect: Rect::from_xywh(30.0, 25.0, 80.0, 12.0),
+        });
+        s.dispatch(Command::SetAnnotationColor {
+            id,
+            color: [33, 150, 243, 128],
+        });
+
+        let edited = s.state.tab(tab).unwrap().annotations.as_ref().unwrap();
+        assert_eq!(edited[0].rect, Rect::from_xywh(30.0, 25.0, 80.0, 12.0));
+        assert_eq!(edited[0].color, Some([33, 150, 243, 128]));
+
+        // Ctrl+Z — revert the most recent op (colour).
+        s.dispatch(Command::Undo);
+        let after_first = s.state.tab(tab).unwrap().annotations.as_ref().unwrap();
+        assert_eq!(
+            after_first[0].color,
+            Some([255, 0, 0, 200]),
+            "first undo reverts colour"
+        );
+        assert_eq!(
+            after_first[0].rect,
+            Rect::from_xywh(30.0, 25.0, 80.0, 12.0),
+            "geometry unchanged after first undo"
+        );
+
+        // Ctrl+Z again — revert the move.
+        s.dispatch(Command::Undo);
+        let after_second = s.state.tab(tab).unwrap().annotations.as_ref().unwrap();
+        assert_eq!(
+            after_second[0].rect,
+            Rect::from_xywh(10.0, 20.0, 40.0, 10.0),
+            "second undo reverts geometry"
+        );
+        assert_eq!(after_second[0].color, Some([255, 0, 0, 200]));
+
+        // Ctrl+Shift+Z — redo the move.
+        s.dispatch(Command::Redo);
+        let redo_first = s.state.tab(tab).unwrap().annotations.as_ref().unwrap();
+        assert_eq!(
+            redo_first[0].rect,
+            Rect::from_xywh(30.0, 25.0, 80.0, 12.0),
+            "redo restores geometry"
+        );
+
+        // Ctrl+Shift+Z again — redo the colour.
+        s.dispatch(Command::Redo);
+        let redo_second = s.state.tab(tab).unwrap().annotations.as_ref().unwrap();
+        assert_eq!(
+            redo_second[0].color,
+            Some([33, 150, 243, 128]),
+            "redo restores colour"
+        );
     }
 }

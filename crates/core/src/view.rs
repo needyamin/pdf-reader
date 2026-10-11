@@ -68,6 +68,13 @@ pub struct ViewState {
     pub selected_field: Option<FieldId>,
     /// The annotation the user last selected, if any.
     pub selected_annotation: Option<crate::annotation::AnnotationId>,
+    /// Whether the floating properties window (colour, opacity, geometry) is
+    /// open for the selected annotation. Off by default: selecting an
+    /// annotation shows only the move/resize handles, and the window is opened
+    /// on demand (the toolbar "Properties" toggle) rather than popping up for
+    /// every annotation.
+    #[serde(default)]
+    pub properties_panel_open: bool,
 }
 
 impl Default for ViewState {
@@ -82,6 +89,7 @@ impl Default for ViewState {
             current_page: 0,
             selected_field: None,
             selected_annotation: None,
+            properties_panel_open: false,
         }
     }
 }

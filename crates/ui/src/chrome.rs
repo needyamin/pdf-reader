@@ -206,6 +206,17 @@ pub enum Icon {
     Redo,
     /// A sticky-note / comment glyph, used to headline the annotate toolbar.
     Annotation,
+    /// The annotation-tool glyphs, one per [`pdfreader_core::Tool`]. Each is a
+    /// miniature of the mark the tool makes — the same shape the canvas paints
+    /// beside the pointer — so the toolbar button and the cursor agree.
+    SelectTool,
+    HighlightTool,
+    UnderlineTool,
+    StrikeoutTool,
+    SquigglyTool,
+    RectangleTool,
+    NoteTool,
+    EraserTool,
 }
 
 /// The Edit menu: the annotation history, enabled only when there is history.
@@ -1153,23 +1164,19 @@ pub fn annotation_bar(
                             .strong(),
                     );
                 });
+                // The tools as compact icon buttons, split into groups by
+                // function (select · markup · shape · note · eraser) so the row
+                // scans the way a professional editor's does. Each carries a
+                // tooltip with its name and single-key shortcut.
+                let mut previous: Option<Tool> = None;
                 for tool in Tool::ALL {
-                    let active = state.tool == tool;
-                    let label = RichText::new(tool.label()).size(11.5).color(if active {
-                        palette.accent
-                    } else {
-                        palette.text
-                    });
-                    let button = egui::Button::new(label)
-                        .fill(if active {
-                            palette.accent_soft
-                        } else {
-                            Color32::TRANSPARENT
-                        })
-                        .corner_radius(4.0);
-                    if ui.add(button).clicked() {
+                    if previous.is_some_and(|prev| tool_group(prev) != tool_group(tool)) {
+                        ui.separator();
+                    }
+                    if tool_button(ui, palette, tool, state.tool == tool).clicked() {
                         commands.push(Command::SetTool(tool));
                     }
+                    previous = Some(tool);
                 }
                 // Quick controls for the text being typed, sitting right after
                 // the text tools. Shown only while a field is open, so the row
@@ -1213,9 +1220,77 @@ pub fn annotation_bar(
                         },
                     );
                 }
+                // "Properties" toggles the floating colour/opacity/geometry
+                // window for the selected annotation. Off by default, so the
+                // panel never pops up on its own — selecting an annotation only
+                // shows its move/resize handles. This is the on-demand open.
+                {
+                    let selected = state.active().and_then(|tab| tab.view.selected_annotation);
+                    let open = state.active().is_some_and(|tab| tab.view.properties_panel_open);
+                    let label = RichText::new("Properties")
+                        .size(11.5)
+                        .color(if open { palette.accent } else { palette.text });
+                    let button = egui::Button::new(label)
+                        .fill(if open { palette.accent_soft } else { Color32::TRANSPARENT })
+                        .corner_radius(4.0);
+                    let response = ui.add_enabled(selected.is_some(), button);
+                    if response.clicked() && selected.is_some() {
+                        commands.push(Command::SetPropertiesPanel { open: !open });
+                    }
+                }
             });
         });
     commands
+}
+
+/// The icon for one annotation tool.
+fn tool_icon(tool: Tool) -> Icon {
+    match tool {
+        Tool::Select => Icon::SelectTool,
+        Tool::Highlight => Icon::HighlightTool,
+        Tool::Underline => Icon::UnderlineTool,
+        Tool::StrikeOut => Icon::StrikeoutTool,
+        Tool::Squiggly => Icon::SquigglyTool,
+        Tool::Square => Icon::RectangleTool,
+        Tool::StickyNote => Icon::NoteTool,
+        Tool::Eraser => Icon::EraserTool,
+    }
+}
+
+/// Which visual group a tool belongs to in the bar; a change of group draws a
+/// divider, so the row reads as select · markup · shape · note · eraser.
+fn tool_group(tool: Tool) -> u8 {
+    match tool {
+        Tool::Select => 0,
+        Tool::Highlight | Tool::Underline | Tool::StrikeOut | Tool::Squiggly => 1,
+        Tool::Square => 2,
+        Tool::StickyNote => 3,
+        Tool::Eraser => 4,
+    }
+}
+
+/// A compact square icon button for one annotation tool.
+///
+/// The icon is the mark the tool makes (matching the cursor badge), filled in
+/// `accent` while armed and `text` otherwise, with a hover fill and a tooltip
+/// carrying the tool name and its shortcut.
+fn tool_button(ui: &mut Ui, palette: &Palette, tool: Tool, active: bool) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(28.0, 22.0), Sense::click());
+    let fill = if active {
+        palette.accent_soft
+    } else if response.hovered() {
+        palette.surface_hover
+    } else {
+        Color32::TRANSPARENT
+    };
+    if fill != Color32::TRANSPARENT {
+        ui.painter().rect_filled(rect, 4.0, fill);
+    }
+    let color = if active { palette.accent } else { palette.text };
+    draw_icon(ui.painter(), rect.center(), tool_icon(tool), color);
+    response
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text(format!("{} ({})", tool.label(), tool.shortcut()))
 }
 
 /// Whether a text field is open for typing.
@@ -1330,7 +1405,16 @@ pub fn comments_panel(
 ) -> Vec<Command> {
     let mut commands = Vec::new();
 
-    if annotations.is_empty() {
+    // The panel is for comments the user can read and edit. Hyperlinks are
+    // annotations in the file but not comments — and this reader does not open
+    // them — so one row per link just buries the real comments. Drop them here;
+    // the engine still returns them for anything that needs the full list.
+    let comments: Vec<&AnnotationInfo> = annotations
+        .iter()
+        .filter(|a| a.kind != AnnotationKind::Link)
+        .collect();
+
+    if comments.is_empty() {
         empty_sidebar(
             ui,
             palette,
@@ -1344,10 +1428,10 @@ pub fn comments_panel(
     egui::Frame::new()
         .inner_margin(sidebar_margin())
         .show(ui, |ui| {
-            let label = if annotations.len() == 1 {
+            let label = if comments.len() == 1 {
                 "1 annotation".to_string()
             } else {
-                format!("{} annotations", annotations.len())
+                format!("{} annotations", comments.len())
             };
             ui.label(RichText::new(label).color(palette.text_dim).size(11.0));
         });
@@ -1360,7 +1444,7 @@ pub fn comments_panel(
                 .inner_margin(sidebar_list_margin())
                 .show(ui, |ui| {
                     ui.spacing_mut().item_spacing.y = SIDEBAR_GAP;
-                    for annotation in annotations {
+                    for annotation in comments.iter().copied() {
                         let is_selected = selected == Some(annotation.id);
                         let response = show_comment_row(ui, palette, annotation, is_selected);
                         if response.clicked() && ui.input(|i| i.modifiers.shift) {
@@ -2489,14 +2573,127 @@ fn draw_icon(painter: &egui::Painter, center: Pos2, icon: Icon, color: Color32) 
                 stroke,
             );
         }
+        // ---- Annotation tools: a miniature of the mark each one makes ----
+        Icon::SelectTool => {
+            // The classic pointer arrow: a triangular head plus a tail. Both
+            // are convex so they can be filled (egui only fills convex paths).
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    c + Vec2::new(-4.5, -7.0),
+                    c + Vec2::new(-4.5, 5.0),
+                    c + Vec2::new(4.5, -0.5),
+                ],
+                color,
+                Stroke::NONE,
+            ));
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    c + Vec2::new(0.5, -0.5),
+                    c + Vec2::new(3.5, 0.8),
+                    c + Vec2::new(1.0, 5.5),
+                    c + Vec2::new(-1.5, 3.0),
+                ],
+                color,
+                Stroke::NONE,
+            ));
+        }
+        Icon::HighlightTool => {
+            // A solid band — the highlight covers the text it marks.
+            painter.rect_filled(
+                Rect::from_center_size(c, Vec2::new(13.0, 7.0)),
+                2.5,
+                color,
+            );
+        }
+        Icon::UnderlineTool => {
+            // A line of text with the rule drawn beneath it.
+            painter.rect_stroke(
+                Rect::from_center_size(c + Vec2::new(0.0, -3.0), Vec2::new(12.0, 6.0)),
+                1.0,
+                stroke,
+                StrokeKind::Inside,
+            );
+            painter.line_segment(
+                [c + Vec2::new(-6.0, 5.0), c + Vec2::new(6.0, 5.0)],
+                Stroke::new(2.0, color),
+            );
+        }
+        Icon::StrikeoutTool => {
+            // A line of text with the rule struck through the middle.
+            painter.rect_stroke(
+                Rect::from_center_size(c, Vec2::new(12.0, 7.0)),
+                1.0,
+                stroke,
+                StrokeKind::Inside,
+            );
+            painter.line_segment(
+                [c + Vec2::new(-6.5, 0.0), c + Vec2::new(6.5, 0.0)],
+                Stroke::new(2.0, color),
+            );
+        }
+        Icon::SquigglyTool => {
+            // A line of text with the zig-zag rule beneath it.
+            painter.rect_stroke(
+                Rect::from_center_size(c + Vec2::new(0.0, -3.5), Vec2::new(12.0, 6.0)),
+                1.0,
+                stroke,
+                StrokeKind::Inside,
+            );
+            let zig: Vec<Pos2> = (0..=6)
+                .map(|i| {
+                    let x = -6.0 + i as f32 * 2.0;
+                    let y = if i % 2 == 0 { 4.0 } else { 6.5 };
+                    c + Vec2::new(x, y)
+                })
+                .collect();
+            painter.line(zig, Stroke::new(1.6, color));
+        }
+        Icon::RectangleTool => {
+            painter.rect_stroke(
+                Rect::from_center_size(c, Vec2::new(13.0, 9.0)),
+                1.5,
+                stroke,
+                StrokeKind::Inside,
+            );
+        }
+        Icon::NoteTool => {
+            // The folded-corner sticky note.
+            let r = Rect::from_center_size(c, Vec2::new(12.0, 12.0));
+            painter.rect_stroke(r, 1.5, stroke, StrokeKind::Inside);
+            painter.line(
+                vec![
+                    r.right_top() + Vec2::new(-4.5, 0.0),
+                    r.right_top() + Vec2::new(0.0, 4.5),
+                    r.right_top() + Vec2::new(-4.5, 4.5),
+                ],
+                stroke,
+            );
+        }
+        Icon::EraserTool => {
+            // A slanted eraser block lifted off the surface line.
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    c + Vec2::new(-5.0, 0.0),
+                    c + Vec2::new(-0.5, -6.5),
+                    c + Vec2::new(5.5, -1.0),
+                    c + Vec2::new(1.0, 5.0),
+                ],
+                color,
+                Stroke::NONE,
+            ));
+            painter.line_segment(
+                [c + Vec2::new(-6.5, 6.0), c + Vec2::new(6.5, 6.0)],
+                Stroke::new(1.6, color),
+            );
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        SEARCH_FIELD_HEIGHT, SearchFieldOutput, TOOLBAR_HEIGHT, TOOLBAR_PAD_Y, search_field,
-        status_bar, toolbar,
+        Palette, SEARCH_FIELD_HEIGHT, SearchFieldOutput, TOOLBAR_HEIGHT, TOOLBAR_PAD_Y,
+        annotation_properties_window, comments_panel, search_field, status_bar, toolbar,
     };
     use crate::theme::Theme;
     use egui::{Context, RawInput, Rect};
@@ -2552,6 +2749,217 @@ mod tests {
         assert!(
             detail_bottom <= height - ROW_PAD_Y + 1e-3,
             "the second line must end inside the row's padding"
+        );
+    }
+
+    /// Draw the floating annotation properties window for one frame and
+    /// return the commands it produced.
+    fn draw_properties_window(
+        ctx: &egui::Context,
+        palette: &Palette,
+        annotations: &[pdfreader_core::AnnotationInfo],
+        selected: Option<pdfreader_core::AnnotationId>,
+    ) -> Vec<Command> {
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(800.0, 600.0),
+            )),
+            ..Default::default()
+        };
+        let mut commands = Vec::new();
+        let mut out = ctx.run_ui(raw, |ui| {
+            commands = annotation_properties_window(ui.ctx(), palette, annotations, selected);
+        });
+        out.textures_delta.clear();
+        commands
+    }
+
+    /// Draw the properties window with the pointer pressed (`pressed = true`)
+    /// or released (`pressed = false`) at `pos`, returning the commands.
+    fn draw_properties_window_pointer(
+        ctx: &egui::Context,
+        palette: &Palette,
+        annotations: &[pdfreader_core::AnnotationInfo],
+        selected: Option<pdfreader_core::AnnotationId>,
+        pos: egui::Pos2,
+        pressed: bool,
+    ) -> Vec<Command> {
+        let mut raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(800.0, 600.0),
+            )),
+            ..Default::default()
+        };
+        raw.events.push(egui::Event::PointerMoved(pos));
+        raw.events.push(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        });
+        let mut commands = Vec::new();
+        let mut out = ctx.run_ui(raw, |ui| {
+            commands = annotation_properties_window(ui.ctx(), palette, annotations, selected);
+        });
+        out.textures_delta.clear();
+        commands
+    }
+
+    /// The properties window must never emit edits for an annotation the user
+    /// cannot edit (links, stamps, …): opening it on one yields an empty command
+    /// list instead of a colour or bounds write.
+    #[test]
+    fn properties_window_emits_nothing_for_a_non_creatable_annotation() {
+        let ctx = Context::default();
+        let palette = Theme::from_id(ThemeId::default()).palette;
+        let annotations = [pdfreader_core::AnnotationInfo {
+            id: pdfreader_core::AnnotationId::new(0, 0),
+            kind: pdfreader_core::AnnotationKind::Link,
+            rect: pdfreader_core::Rect::from_xywh(0.0, 0.0, 10.0, 10.0),
+            contents: None,
+            color: None,
+        }];
+        let commands = draw_properties_window(
+            &ctx,
+            &palette,
+            &annotations,
+            Some(pdfreader_core::AnnotationId::new(0, 0)),
+        );
+        assert!(
+            commands.is_empty(),
+            "a non-creatable annotation yields no panel commands: {commands:?}"
+        );
+    }
+
+    /// Headless stand-in for "click the red swatch, the annotation turns red":
+    /// sweep the window's swatch row with press+release clicks until one lands
+    /// on a swatch and the panel returns a `SetAnnotationColor`. Covers the
+    /// properties-panel field commit the manual click-through could not verify.
+    #[test]
+    fn properties_window_swatch_click_emits_set_annotation_color() {
+        let ctx = Context::default();
+        let palette = Theme::from_id(ThemeId::default()).palette;
+        let id = pdfreader_core::AnnotationId::new(0, 0);
+        let annotations = [pdfreader_core::AnnotationInfo {
+            id,
+            kind: pdfreader_core::AnnotationKind::Square,
+            rect: pdfreader_core::Rect::from_xywh(10.0, 20.0, 40.0, 10.0),
+            contents: None,
+            color: Some([255, 0, 0, 200]),
+        }];
+
+        // The window anchors RIGHT_CENTER at (-24, 0) on an 800×600 screen, so
+        // it occupies the right-hand strip. Sweep that strip with press+release
+        // clicks until one lands on a swatch.
+        let mut hit = None;
+        'outer: for y in (200..=400).step_by(8) {
+            for x in (510..=770).step_by(10) {
+                let p = egui::pos2(x as f32, y as f32);
+                draw_properties_window_pointer(&ctx, &palette, &annotations, Some(id), p, true);
+                let released =
+                    draw_properties_window_pointer(&ctx, &palette, &annotations, Some(id), p, false);
+                if let Some(cmd) = released
+                    .into_iter()
+                    .find(|c| matches!(c, Command::SetAnnotationColor { .. }))
+                {
+                    hit = Some(cmd);
+                    break 'outer;
+                }
+            }
+        }
+        assert!(
+            hit.is_some_and(|c| match c {
+                Command::SetAnnotationColor { id: ref cid, .. } => *cid == id,
+                _ => false,
+            }),
+            "clicking a swatch must emit SetAnnotationColor for the selected annotation"
+        );
+    }
+
+    /// Draw the Comments panel for one frame with the pointer pressed
+    /// (`pressed = true`) or released (`pressed = false`) at `pos`, returning
+    /// the commands it produced.
+    fn draw_comments_panel_pointer(
+        ctx: &Context,
+        palette: &Palette,
+        doc: DocumentId,
+        annotations: &[pdfreader_core::AnnotationInfo],
+        selected: Option<pdfreader_core::AnnotationId>,
+        pos: egui::Pos2,
+        pressed: bool,
+    ) -> Vec<Command> {
+        let mut raw = RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(320.0, 600.0),
+            )),
+            ..Default::default()
+        };
+        raw.events.push(egui::Event::PointerMoved(pos));
+        raw.events.push(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        });
+        let mut commands = Vec::new();
+        let mut out = ctx.run_ui(raw, |ui| {
+            commands = comments_panel(ui, palette, doc, annotations, selected);
+        });
+        out.textures_delta.clear();
+        commands
+    }
+
+    /// Hyperlinks are annotations but not comments: the Comments panel must not
+    /// list them (one row per link buried the real comments in link-heavy
+    /// PDFs), while genuine markup stays listed and selectable.
+    #[test]
+    fn comments_panel_hides_hyperlinks() {
+        let ctx = Context::default();
+        let palette = Theme::from_id(ThemeId::default()).palette;
+        let doc = DocumentId::from_raw(1);
+        let link = pdfreader_core::AnnotationId::new(0, 0);
+        let square = pdfreader_core::AnnotationId::new(0, 1);
+        let annotations = [
+            pdfreader_core::AnnotationInfo {
+                id: link,
+                kind: pdfreader_core::AnnotationKind::Link,
+                rect: pdfreader_core::Rect::from_xywh(0.0, 0.0, 10.0, 10.0),
+                contents: Some("https://example.com".to_string()),
+                color: None,
+            },
+            pdfreader_core::AnnotationInfo {
+                id: square,
+                kind: pdfreader_core::AnnotationKind::Square,
+                rect: pdfreader_core::Rect::from_xywh(0.0, 0.0, 10.0, 10.0),
+                contents: None,
+                color: Some([255, 0, 0, 255]),
+            },
+        ];
+
+        // Sweep the panel with press+release clicks and collect every id the
+        // panel offers to select.
+        let mut selected_ids = Vec::new();
+        for y in (0..=600).step_by(6) {
+            let p = egui::pos2(120.0, y as f32);
+            draw_comments_panel_pointer(&ctx, &palette, doc, &annotations, None, p, true);
+            for cmd in
+                draw_comments_panel_pointer(&ctx, &palette, doc, &annotations, None, p, false)
+            {
+                if let Command::SelectAnnotation(Some(id)) = cmd {
+                    selected_ids.push(id);
+                }
+            }
+        }
+        assert!(
+            !selected_ids.contains(&link),
+            "the hyperlink must not be listed in the Comments panel: {selected_ids:?}"
+        );
+        assert!(
+            selected_ids.contains(&square),
+            "the real annotation must still be listed and selectable: {selected_ids:?}"
         );
     }
 
@@ -2807,11 +3215,37 @@ const ANNOTATION_SWATCHES: [[u8; 4]; 8] = [
     [233, 30, 99, 255],   // pink
 ];
 
+/// Draft state for the properties window.
+///
+/// The engine is asynchronous: after a control is released, the PDFium list
+/// may still contain the old values for a few frames. Keeping the draft in
+/// egui's temporary memory prevents the slider and numeric fields from snapping
+/// back to those old values while the request is in flight.
+#[derive(Clone, PartialEq)]
+struct AnnotationPropertiesDraft {
+    color: [u8; 4],
+    rect: pdfreader_core::Rect,
+    pending_color: bool,
+    pending_rect: bool,
+}
+
+impl AnnotationPropertiesDraft {
+    fn from_annotation(annotation: &AnnotationInfo) -> Self {
+        Self {
+            color: annotation.color.unwrap_or([0, 0, 0, 255]),
+            rect: annotation.rect,
+            pending_color: false,
+            pending_rect: false,
+        }
+    }
+}
+
 /// The floating properties window for the selected annotation.
 ///
-/// Returns nothing when nothing (or nothing editable) is selected: links and
-/// foreign annotation types are listed in the Comments panel but their
-/// internals are not ours to edit.
+/// Every control keeps its value in an annotation-specific draft and commits
+/// once per completed gesture. This is deliberately not a local `let mut`
+/// value: local widget values are recreated from the stale PDFium list every
+/// frame, which made opacity and geometry appear not to apply.
 pub fn annotation_properties_window(
     ctx: &egui::Context,
     palette: &Palette,
@@ -2829,130 +3263,146 @@ pub fn annotation_properties_window(
         return commands;
     }
 
+    let state_id = Id::new(("annotation-properties", annotation.id));
+    let mut draft = ctx.data(|data| data.get_temp::<AnnotationPropertiesDraft>(state_id))
+        .unwrap_or_else(|| AnnotationPropertiesDraft::from_annotation(annotation));
+    let authoritative_color = annotation.color.unwrap_or(draft.color);
+
+    // A successful optimistic reducer update confirms the in-flight value.
+    // Do not overwrite an unfinished draft with an older engine response.
+    if draft.pending_color && authoritative_color == draft.color {
+        draft.pending_color = false;
+    }
+    if !draft.pending_color {
+        draft.color = authoritative_color;
+    }
+    if draft.pending_rect && annotation.rect == draft.rect {
+        draft.pending_rect = false;
+    }
+    if !draft.pending_rect {
+        draft.rect = annotation.rect;
+    }
+
     let title = format!("{} · page {}", annotation.kind.label(), annotation.id.page + 1);
     dialog_window(&title, palette)
         .anchor(Align2::RIGHT_CENTER, Vec2::new(-24.0, 0.0))
-        .default_width(240.0)
+        .default_width(270.0)
         .show(ctx, |ui| {
             ui.spacing_mut().item_spacing.y = 8.0;
+            ui.label(RichText::new("Changes apply automatically").size(11.0).color(palette.text_dim));
 
-            // Colour. One row of swatches; the current colour is outlined.
-            ui.label(
-                RichText::new("Colour").size(11.0).color(palette.text_dim),
-            );
-            let current = annotation.color.unwrap_or([0, 0, 0, 255]);
-            egui::Grid::new("swatches")
+            ui.label(RichText::new("Colour").size(11.0).color(palette.text_dim));
+            egui::Grid::new(state_id.with("swatches"))
                 .num_columns(8)
                 .spacing([6.0, 6.0])
                 .show(ui, |ui| {
                     for swatch in ANNOTATION_SWATCHES {
                         let fill = Color32::from_rgba_unmultiplied(
-                            swatch[0],
-                            swatch[1],
-                            swatch[2],
-                            swatch[3],
+                            swatch[0], swatch[1], swatch[2], swatch[3],
                         );
-                        let is_current = swatch[0..3] == current[0..3];
-                        let size = Vec2::splat(18.0);
-                        let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+                        let is_current = swatch[0..3] == draft.color[0..3];
+                        let (rect, response) = ui.allocate_exact_size(Vec2::splat(20.0), Sense::click());
                         let painter = ui.painter();
                         painter.rect_filled(rect, 4.0, fill);
-                        if is_current {
-                            painter.rect_stroke(
-                                rect,
-                                4.0,
-                                Stroke::new(2.0, palette.text),
-                                StrokeKind::Inside,
-                            );
-                        } else if response.hovered() {
-                            painter.rect_stroke(
-                                rect,
-                                4.0,
-                                Stroke::new(1.0, palette.text_dim),
-                                StrokeKind::Inside,
-                            );
-                        }
+                        painter.rect_stroke(
+                            rect,
+                            4.0,
+                            Stroke::new(if is_current { 2.0 } else { 1.0 }, if is_current { palette.text } else { palette.text_dim }),
+                            StrokeKind::Inside,
+                        );
                         if response.clicked() {
+                            draft.color = [swatch[0], swatch[1], swatch[2], draft.color[3]];
+                            draft.pending_color = true;
                             commands.push(Command::SetAnnotationColor {
                                 id: annotation.id,
-                                color: swatch,
+                                color: draft.color,
                             });
                         }
                     }
                     ui.end_row();
                 });
 
-            // Opacity. One control, one meaning: the alpha byte of the same
-            // colour. Changing it keeps the RGB.
-            ui.label(
-                RichText::new("Opacity")
-                    .size(11.0)
-                    .color(palette.text_dim),
-            );
-            let mut percent = (current[3] as f32 / 255.0 * 100.0).round();
-            let slider = egui::Slider::new(&mut percent, 10.0..=100.0)
-                .suffix("%")
-                .show_value(true);
-            let response = ui.add(slider);
-            if response.drag_stopped() || response.lost_focus() {
-                let alpha = (percent / 100.0 * 255.0).round().clamp(26.0, 255.0) as u8;
-                commands.push(Command::SetAnnotationColor {
-                    id: annotation.id,
-                    color: [current[0], current[1], current[2], alpha],
-                });
-            }
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Opacity").size(11.0).color(palette.text_dim));
+                let mut percent = (draft.color[3] as f32 / 255.0 * 100.0).round();
+                let response = ui.add(
+                    egui::Slider::new(&mut percent, 10.0..=100.0)
+                        .suffix("%")
+                        .show_value(true),
+                );
+                if response.changed() {
+                    draft.color[3] = (percent / 100.0 * 255.0).round().clamp(26.0, 255.0) as u8;
+                }
+                if response.drag_stopped() || (response.changed() && !ui.input(|i| i.pointer.primary_down())) {
+                    draft.pending_color = true;
+                    commands.push(Command::SetAnnotationColor {
+                        id: annotation.id,
+                        color: draft.color,
+                    });
+                }
+            });
 
-            // Geometry. The four numbers are the annotation's PDF-space
-            // rectangle; W and H grow from the bottom-left corner.
-            ui.label(
-                RichText::new("Size & position (pt)")
-                    .size(11.0)
-                    .color(palette.text_dim),
-            );
-            egui::Grid::new("geometry")
+            ui.label(RichText::new("Position and size (PDF points)").size(11.0).color(palette.text_dim));
+            let enter_pressed = ui.input(|i| i.key_pressed(egui::Key::Enter));
+            let mut commit_rect = false;
+            egui::Grid::new(state_id.with("geometry"))
                 .num_columns(4)
                 .spacing([8.0, 4.0])
                 .show(ui, |ui| {
-                    let w = annotation.rect.width();
-                    let h = annotation.rect.height();
-                    for (label, value, min) in [
-                        ("X", annotation.rect.min_x, f32::NEG_INFINITY),
-                        ("Y", annotation.rect.min_y, f32::NEG_INFINITY),
-                        ("W", w, 1.0),
-                        ("H", h, 1.0),
-                    ] {
+                    let values = [
+                        ("X", draft.rect.min_x, -1_000_000.0),
+                        ("Y", draft.rect.min_y, -1_000_000.0),
+                        ("W", draft.rect.width(), 1.0),
+                        ("H", draft.rect.height(), 1.0),
+                    ];
+                    for (label, value, min) in values {
                         ui.label(RichText::new(label).size(11.0).color(palette.text_dim));
-                        let mut v = value;
+                        let mut edited = value;
                         let response = ui.add(
-                            egui::DragValue::new(&mut v)
+                            egui::DragValue::new(&mut edited)
                                 .speed(0.5)
-                                .range(min..=f32::INFINITY),
+                                .range(min..=1_000_000.0),
                         );
-                        if (response.drag_stopped() || response.lost_focus()) && v != value {
-                            let rect = match label {
-                                "X" => pdf_rect_moved_x(annotation.rect, v),
-                                "Y" => pdf_rect_moved_y(annotation.rect, v),
-                                "W" => pdf_rect_with_width(annotation.rect, v),
-                                _ => pdf_rect_with_height(annotation.rect, v),
+                        if response.changed() {
+                            draft.rect = match label {
+                                "X" => pdf_rect_moved_x(draft.rect, edited),
+                                "Y" => pdf_rect_moved_y(draft.rect, edited),
+                                "W" => pdf_rect_with_width(draft.rect, edited),
+                                _ => pdf_rect_with_height(draft.rect, edited),
                             };
-                            commands.push(Command::UpdateAnnotationBounds {
-                                id: annotation.id,
-                                rect,
-                            });
                         }
+                        // Commit on mouse release, Enter, or blur. The draft
+                        // may have changed one frame earlier while typing, so
+                        // do not require `lost_focus && changed` on the same
+                        // frame.
+                        commit_rect |= response.drag_stopped()
+                            || response.lost_focus()
+                            || enter_pressed;
                     }
                     ui.end_row();
                 });
+            if commit_rect && draft.rect != annotation.rect {
+                draft.pending_rect = true;
+                commands.push(Command::UpdateAnnotationBounds {
+                    id: annotation.id,
+                    rect: draft.rect,
+                });
+            }
 
             ui.separator();
-            let delete = egui::Button::new(
-                RichText::new("Delete").color(Color32::from_rgb(198, 40, 40)),
-            );
-            if ui.add(delete).clicked() {
-                commands.push(Command::DeleteAnnotation(annotation.id));
-            }
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Changes are undoable with Ctrl+Z").size(10.0).color(palette.text_dim));
+                if ui.button("Delete").clicked() {
+                    commands.push(Command::DeleteAnnotation(annotation.id));
+                }
+            });
         });
 
+    ctx.data_mut(|data| {
+        let saved = draft.clone();
+        let initial = saved.clone();
+        *data.get_temp_mut_or_insert_with(state_id, || initial) = saved;
+    });
     commands
 }
 

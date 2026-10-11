@@ -20,6 +20,7 @@ use crate::bindgen::{
         FPDF_ANNOT_FLAG_TOGGLENOVIEW, FPDF_OBJECT_STRING, FPDF_WCHAR, FS_RECTF,
     };
     use crate::error::{PdfiumError, PdfiumInternalError};
+    use crate::pdf::appearance_mode::PdfAppearanceMode;
     use crate::pdf::color::PdfColor;
     use crate::pdf::document::page::annotation::attachment_points::PdfPageAnnotationAttachmentPoints;
     use crate::pdf::document::page::annotation::objects::PdfPageAnnotationObjects;
@@ -133,6 +134,32 @@ use crate::bindgen::{
     {
         /// Returns the internal `FPDF_ANNOTATION` handle for this [PdfPageAnnotation].
         fn handle(&self) -> FPDF_ANNOTATION;
+
+        /// Removes this annotation's normal appearance stream (`/AP /N`), so
+        /// Pdfium rebuilds it from the annotation's current geometry the next
+        /// time it renders.
+        ///
+        /// Pdfium generates a markup annotation's appearance and then *caches*
+        /// it the first time it renders the annotation. Changing the quad
+        /// points afterwards (a resize) leaves that cached appearance in place,
+        /// so the annotation keeps drawing at its old size. Clearing the stream
+        /// forces a rebuild. A missing stream is not an error.
+        fn remove_normal_appearance_stream(&mut self) -> Result<(), PdfiumError> {
+            let cleared = unsafe {
+                self.bindings().FPDFAnnot_SetAP(
+                    self.handle(),
+                    PdfAppearanceMode::Normal.as_pdfium(),
+                    std::ptr::null(),
+                )
+            };
+            if self.bindings().is_true(cleared) {
+                Ok(())
+            } else {
+                Err(PdfiumError::PdfiumLibraryInternalError(
+                    PdfiumInternalError::Unknown,
+                ))
+            }
+        }
 
         /// Returns the ownership hierarchy for this [PdfPageAnnotation].
         fn ownership(&self) -> &PdfPageObjectOwnership;

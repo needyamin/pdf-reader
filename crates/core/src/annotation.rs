@@ -168,6 +168,25 @@ impl Tool {
             Self::Eraser => "Eraser",
         }
     }
+
+    /// The single-key shortcut that arms this tool, shown in its tooltip.
+    ///
+    /// These follow the convention every PDF editor uses (V selects, H
+    /// highlights, R draws a rectangle, and so on) so muscle memory carries
+    /// over. The keys are only live when no text field owns the keyboard — see
+    /// `App::shortcuts`.
+    pub const fn shortcut(self) -> &'static str {
+        match self {
+            Self::Select => "V",
+            Self::Highlight => "H",
+            Self::Underline => "U",
+            Self::StrikeOut => "S",
+            Self::Squiggly => "Q",
+            Self::Square => "R",
+            Self::StickyNote => "N",
+            Self::Eraser => "E",
+        }
+    }
 }
 
 /// A description of a new annotation to create.
@@ -319,5 +338,16 @@ mod tests {
         let count = labels.len();
         labels.dedup();
         assert_eq!(labels.len(), count, "tool labels must be unique");
+    }
+
+    #[test]
+    fn every_tool_has_a_unique_single_key_shortcut() {
+        let mut keys: Vec<&str> = Tool::ALL.iter().map(|t| t.shortcut()).collect();
+        keys.sort_unstable();
+        let count = keys.len();
+        keys.dedup();
+        assert_eq!(keys.len(), count, "tool shortcuts must be unique");
+        // One character each, so the tooltip reads as a clean key hint.
+        assert!(keys.iter().all(|k| k.len() == 1));
     }
 }

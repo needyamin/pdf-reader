@@ -400,6 +400,63 @@ fn update_bounds_moves_and_resizes_every_kind() {
     }
 }
 
+/// Growing and shrinking an annotation *in place* (no move) must change what
+/// the engine reports — the exact case a resize-handle drag produces, and the
+/// one where a markup annotation's quad has to be rewritten.
+#[test]
+fn update_bounds_grows_and_shrinks_in_place() {
+    let Some(dir) = find_pdfium() else {
+        eprintln!("SKIP: no PDFium library staged under target/native");
+        return;
+    };
+    let mut engine = PdfiumEngine::bind(Some(dir.as_path())).expect("bind");
+    let path = workspace_root()
+        .join("target")
+        .join("test-pdfs")
+        .join("small-3p.pdf");
+    if !path.exists() {
+        eprintln!("SKIP: fixture missing (run tools/generate_fixtures.py)");
+        return;
+    }
+    let (handle, _info) = engine.open(&path, None).expect("open");
+
+    let cases: Vec<NewAnnotation> = vec![
+        NewAnnotation::Highlight(Rect::from_xywh(40.0, 700.0, 120.0, 14.0)),
+        NewAnnotation::Square(Rect::from_xywh(40.0, 500.0, 120.0, 60.0)),
+    ];
+    for new in &cases {
+        let id = engine.add_annotation(handle, 0, new.clone()).expect("create");
+        let base = new.rect().expect("geometry");
+
+        // Grow: keep the left/top edge, widen by 80.
+        let grown = Rect::from_xywh(base.min_x, base.min_y, base.width() + 80.0, base.height());
+        assert!(
+            engine.update_annotation_bounds(handle, id, grown).expect("grow"),
+            "the id must resolve"
+        );
+        let list = engine.annotations(handle).expect("list");
+        assert!(
+            list.iter().any(|a| a.rect == grown),
+            "{new:?}: growing in place was not applied, want {grown:?}, got {:?}",
+            list.iter().map(|a| a.rect).collect::<Vec<_>>()
+        );
+
+        // Shrink: keep the left/top edge, narrow back below the original.
+        let shrunk =
+            Rect::from_xywh(base.min_x, base.min_y, (base.width() - 60.0).max(20.0), base.height());
+        assert!(
+            engine.update_annotation_bounds(handle, id, shrunk).expect("shrink"),
+            "the id must resolve"
+        );
+        let list = engine.annotations(handle).expect("list");
+        assert!(
+            list.iter().any(|a| a.rect == shrunk),
+            "{new:?}: shrinking in place was not applied, want {shrunk:?}, got {:?}",
+            list.iter().map(|a| a.rect).collect::<Vec<_>>()
+        );
+    }
+}
+
 /// Recolouring an annotation changes what the engine reports, including the
 /// alpha byte — the opacity the properties panel edits.
 #[test]

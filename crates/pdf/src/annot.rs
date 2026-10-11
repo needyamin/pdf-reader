@@ -415,6 +415,15 @@ pub(crate) fn update_annotation_bounds(
         }
         _ => {}
     }
+    // Pdfium generates a markup annotation's appearance stream the first time it
+    // renders the annotation and then *caches* it. Changing the quad points (a
+    // resize) leaves that cached appearance in place, so the mark keeps drawing
+    // at its old size no matter what the annotation dictionary now says —
+    // exactly why highlights, underlines and squigglies would not resize while
+    // the bounds-based rectangle did. Clearing the stream makes Pdfium rebuild
+    // it from the new geometry. Best-effort: a document that refuses the write
+    // simply keeps Pdfium's existing appearance.
+    let _ = annotation.remove_appearance_stream();
     page.regenerate_content()?;
     Ok(true)
 }
@@ -490,7 +499,9 @@ pub(crate) fn remove_annotation(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pdfium_render::prelude::{PdfPageAnnotationCommon, PdfPagePaperSize, Pdfium};
+    use pdfium_render::prelude::{
+        PdfBitmapFormat, PdfPageAnnotationCommon, PdfPagePaperSize, PdfRenderConfig, Pdfium,
+    };
     use std::path::PathBuf;
 
     /// Locate the staged PDFium library under `target/native/*`.
@@ -542,5 +553,223 @@ mod tests {
         let page = document.pages().get(0).expect("page");
         let printed = page.annotations().iter().any(|a| a.is_printed());
         assert!(printed, "a created annotation must be printable");
+    }
+
+    /// Read the first quad of the highlight at `index`, as (left, bottom, right, top).
+    fn highlight_quad(document: &mut PdfDocument<'_>, index: usize) -> (f32, f32, f32, f32) {
+        let mut page = document.pages_mut().get(0).expect("page");
+        let mut annotation = page.annotations_mut().get(index).expect("annotation");
+        let highlight = annotation
+            .as_highlight_annotation_mut()
+            .expect("a highlight annotation");
+        let quad = highlight.attachment_points_mut().first().expect("a quad");
+        (
+            quad.left().value,
+            quad.bottom().value,
+            quad.right().value,
+            quad.top().value,
+        )
+    }
+
+    /// Resizing a markup annotation must rewrite its quad points, not just its
+    /// `/Rect`: PDFium renders a highlight (and underline/strikeout/squiggly)
+    /// from the quads, so a bounds-only update leaves the ink exactly where it
+    /// was — the "resize does nothing for highlights" report.
+    #[test]
+    fn resizing_a_highlight_rewrites_its_quad() {
+        let Some(dir) = find_pdfium() else {
+            eprintln!("SKIP: no PDFium library staged under target/native");
+            return;
+        };
+        let bindings = Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path(&dir))
+            .or_else(|_| Pdfium::bind_to_system_library())
+            .expect("bind PDFium");
+        let pdfium = Pdfium::new(bindings);
+
+        let mut document = pdfium.create_new_pdf().expect("new document");
+        document
+            .pages_mut()
+            .create_page_at_end(PdfPagePaperSize::a4())
+            .expect("add a page");
+
+        let a = Rect::from_xywh(40.0, 700.0, 120.0, 14.0);
+        let id = create_annotation(&mut document, 0, &NewAnnotation::Highlight(a)).expect("create");
+        let (l, b, r, t) = highlight_quad(&mut document, id.annot_index as usize);
+        assert!(
+            (l - a.min_x).abs() < 0.5
+                && (b - a.min_y).abs() < 0.5
+                && (r - a.max_x).abs() < 0.5
+                && (t - a.max_y).abs() < 0.5,
+            "the created quad must match the rect: quad ({l},{b},{r},{t}) vs {a:?}"
+        );
+
+        let grown = Rect::from_xywh(40.0, 700.0, 240.0, 14.0);
+        assert!(update_annotation_bounds(&mut document, id, grown).expect("resize"));
+        let (l, b, r, t) = highlight_quad(&mut document, id.annot_index as usize);
+        assert!(
+            (l - grown.min_x).abs() < 0.5 && (r - grown.max_x).abs() < 0.5,
+            "resizing must rewrite the quad, got ({l},{b},{r},{t}) want {grown:?}"
+        );
+    }
+
+    /// Count the non-white pixels PDFium rasterises for the page. Used to prove
+    /// a resize changes the rendered ink, not merely the reported bounds.
+    fn ink_pixels(document: &mut PdfDocument<'_>) -> usize {
+        let page = document.pages().get(0).expect("page");
+        let config = PdfRenderConfig::new()
+            .scale_page_by_factor(1.0)
+            .set_format(PdfBitmapFormat::BGRA)
+            .render_annotations(true)
+            .clear_before_rendering(true)
+            .set_clear_color(PdfColor::WHITE);
+        let bitmap = page.render_with_config(&config).expect("render");
+        let data = bitmap.as_raw_bytes();
+        data.chunks_exact(4)
+            .filter(|p| !(p[0] > 240 && p[1] > 240 && p[2] > 240))
+            .count()
+    }
+
+    /// Bounding box (min_x, min_y, max_x, max_y) of the page's non-white pixels.
+    fn ink_bbox(document: &mut PdfDocument<'_>) -> (usize, usize, usize, usize) {
+        let page = document.pages().get(0).expect("page");
+        let config = PdfRenderConfig::new()
+            .scale_page_by_factor(1.0)
+            .set_format(PdfBitmapFormat::BGRA)
+            .render_annotations(true)
+            .clear_before_rendering(true)
+            .set_clear_color(PdfColor::WHITE);
+        let bitmap = page.render_with_config(&config).expect("render");
+        let w = bitmap.width() as usize;
+        let h = bitmap.height() as usize;
+        let data = bitmap.as_raw_bytes();
+        let (mut minx, mut miny, mut maxx, mut maxy) = (usize::MAX, usize::MAX, 0, 0);
+        for y in 0..h {
+            for x in 0..w {
+                let i = (y * w + x) * 4;
+                if !(data[i] > 240 && data[i + 1] > 240 && data[i + 2] > 240) {
+                    minx = minx.min(x);
+                    miny = miny.min(y);
+                    maxx = maxx.max(x);
+                    maxy = maxy.max(y);
+                }
+            }
+        }
+        (minx, miny, maxx, maxy)
+    }
+
+    /// The whole point of the quad rewrite: growing a highlight must add ink to
+    /// the rasterised page. If it does not, the mark is stuck at its old size
+    /// no matter what the annotation list reports.
+    #[test]
+    fn resizing_a_highlight_changes_the_rendered_ink() {
+        let Some(dir) = find_pdfium() else {
+            eprintln!("SKIP: no PDFium library staged under target/native");
+            return;
+        };
+        let bindings = Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path(&dir))
+            .or_else(|_| Pdfium::bind_to_system_library())
+            .expect("bind PDFium");
+        let pdfium = Pdfium::new(bindings);
+
+        let mut document = pdfium.create_new_pdf().expect("new document");
+        document
+            .pages_mut()
+            .create_page_at_end(PdfPagePaperSize::a4())
+            .expect("add a page");
+
+        let a = Rect::from_xywh(100.0, 700.0, 100.0, 20.0);
+        let id = create_annotation(&mut document, 0, &NewAnnotation::Highlight(a)).expect("create");
+        // Render once *before* the resize: that first render is what makes
+        // Pdfium cache the annotation's appearance stream, which is the whole
+        // reason the resize used to be invisible.
+        let before = ink_pixels(&mut document);
+        let bbox_before = ink_bbox(&mut document);
+
+        let grown = Rect::from_xywh(100.0, 700.0, 300.0, 20.0);
+        assert!(update_annotation_bounds(&mut document, id, grown).expect("resize"));
+        let after = ink_pixels(&mut document);
+        let bbox_after = ink_bbox(&mut document);
+
+        assert!(
+            after > before,
+            "growing the highlight must add ink: before {before} {bbox_before:?}, after {after} {bbox_after:?}"
+        );
+        assert!(
+            bbox_after.2 >= 290,
+            "the rendered ink must widen to ~x299, got {bbox_after:?}"
+        );
+    }
+
+    /// Recolour and resize a freshly created Square and read it back. This is
+    /// the engine round-trip the properties panel depends on: every edit is
+    /// followed by a re-list, and `AnnotationsLoaded` replaces the whole
+    /// annotation list with whatever that re-list returns. If `set_stroke_color`
+    /// or `set_bounds` is silently rejected (the patched best-effort path
+    /// returns `Ok(false)`), the re-list carries the OLD values and the edit
+    /// appears to do nothing on screen.
+    #[test]
+    fn square_colour_and_bounds_round_trip_on_relist() {
+        let Some(dir) = find_pdfium() else {
+            eprintln!("SKIP: no PDFium library staged under target/native");
+            return;
+        };
+        let bindings = Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path(&dir))
+            .or_else(|_| Pdfium::bind_to_system_library())
+            .expect("bind PDFium");
+        let pdfium = Pdfium::new(bindings);
+
+        let mut document = pdfium.create_new_pdf().expect("new document");
+        document
+            .pages_mut()
+            .create_page_at_end(PdfPagePaperSize::a4())
+            .expect("add a page");
+
+        let id = create_annotation(
+            &mut document,
+            0,
+            &NewAnnotation::Square(Rect::from_xywh(80.0, 700.0, 140.0, 80.0)),
+        )
+        .expect("create a square");
+
+        let before = list_annotations(&document);
+        let before = before.iter().find(|a| a.id == id).expect("square present");
+        eprintln!("before colour = {:?} bounds = {:?}", before.color, before.rect);
+        // The default square colour is red (see create_annotation).
+        assert_eq!(before.color, Some([255, 0, 0, 255]), "square starts red");
+
+        // Recolour to blue.
+        let applied = set_annotation_color(&mut document, id, [33, 150, 243, 255])
+            .expect("no PDFium error");
+        eprintln!("set_annotation_color applied = {applied}");
+        let after_color = list_annotations(&document);
+        let after_color = after_color.iter().find(|a| a.id == id).expect("square present");
+        eprintln!("after colour = {:?}", after_color.color);
+        assert_eq!(
+            after_color.color,
+            Some([33, 150, 243, 255]),
+            "blue must round-trip through the re-list"
+        );
+
+        // Resize.
+        let moved = Rect::from_xywh(100.0, 600.0, 220.0, 120.0);
+        let bounds_applied = update_annotation_bounds(&mut document, id, moved).expect("no error");
+        eprintln!("update_annotation_bounds applied = {bounds_applied}");
+        let after_bounds = list_annotations(&document);
+        let after_bounds = after_bounds.iter().find(|a| a.id == id).expect("square present");
+        eprintln!("after bounds = {:?}", after_bounds.rect);
+        assert_eq!(after_bounds.rect, moved, "bounds must round-trip");
+
+        // Opacity is carried as the colour alpha in this design; confirm the
+        // alpha survives a re-list too.
+        set_annotation_color(&mut document, id, [33, 150, 243, 128])
+            .expect("no PDFium error");
+        let after_alpha = list_annotations(&document);
+        let after_alpha = after_alpha.iter().find(|a| a.id == id).expect("square present");
+        eprintln!("after alpha colour = {:?}", after_alpha.color);
+        assert_eq!(
+            after_alpha.color,
+            Some([33, 150, 243, 128]),
+            "alpha (opacity) must round-trip through /C"
+        );
     }
 }

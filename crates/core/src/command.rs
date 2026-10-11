@@ -294,6 +294,16 @@ pub enum Command {
         color: [u8; 4],
     },
 
+    /// Open or close the floating properties window for the selected
+    /// annotation, without changing the selection itself.
+    ///
+    /// The window is off by default so selecting an annotation shows only its
+    /// move/resize handles; this command lets the toolbar toggle it on demand.
+    SetPropertiesPanel {
+        /// Whether the window should be open.
+        open: bool,
+    },
+
     /// Undo the last annotation operation on the active document.
     Undo,
 
