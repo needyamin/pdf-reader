@@ -7,6 +7,8 @@ A fast native PDF reader for people who actually work in a document: read, mark 
 ![Rust](https://img.shields.io/badge/rust-1.98.1-orange)
 ![Version](https://img.shields.io/badge/version-5.0.3-green)
 
+<img width="800" height="447" alt="Image" src="https://github.com/user-attachments/assets/07aeb57d-aa2b-4cec-8ea4-3c9554d2c5e4" />
+
 Built in **Rust**. Drawn with **egui** and **wgpu**. Pages come from **PDFium**, the same engine Chrome uses, on a tile renderer made for large files.
 
 ---
