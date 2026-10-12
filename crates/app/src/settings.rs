@@ -930,6 +930,11 @@ const PROFILE_LINKS: &[(&str, &str)] = &[
 /// The GitHub profile the "Visit GitHub" button opens.
 const PROFILE_GITHUB: &str = "https://github.com/needyamin";
 
+/// Who makes the reader and where to find them. Written in the "About this app"
+/// card as a sentence with the company name as its hyperlink.
+const COMPANY_NAME: &str = "AnsNew Tech";
+const COMPANY_URL: &str = "https://inside.ansnew.com/";
+
 /// Size the profile photo is drawn at.
 const PHOTO_SIZE: f32 = 76.0;
 
@@ -1096,6 +1101,36 @@ impl App {
                                 .size(12.5)
                                 .color(palette.text),
                             );
+                            ui.add_space(6.0);
+                            // The company credit, with the company name as its
+                            // own hyperlink — the same `visit` route every other
+                            // link in this window takes, so it opens the system
+                            // browser and logs a warning instead of failing
+                            // silently if that is blocked.
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(
+                                    RichText::new("This product is made by ")
+                                        .size(12.5)
+                                        .color(palette.text),
+                                );
+                                if ui
+                                    .link(
+                                        RichText::new(COMPANY_NAME)
+                                            .size(12.5)
+                                            .strong()
+                                            .color(palette.accent),
+                                    )
+                                    .on_hover_text(COMPANY_URL)
+                                    .clicked()
+                                {
+                                    visit = Some(COMPANY_URL);
+                                }
+                                ui.label(
+                                    RichText::new(".")
+                                        .size(12.5)
+                                        .color(palette.text),
+                                );
+                            });
                         });
 
                         ui.add_space(8.0);

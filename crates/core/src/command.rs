@@ -216,10 +216,6 @@ pub enum Command {
         doc: crate::document::DocumentId,
     },
 
-    /// Flatten the active document: bake field values and annotations into
-    /// page content. Marks the document dirty; saving afterwards is expected.
-    FlattenDocument,
-
     /// Close a tab unconditionally, after the user confirmed discarding.
     ConfirmCloseTab(TabId),
 

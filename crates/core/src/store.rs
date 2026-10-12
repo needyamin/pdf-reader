@@ -674,24 +674,6 @@ impl Store {
                 }]
             }
 
-            Command::FlattenDocument => {
-                let Some(tab) = self.state.active() else {
-                    return Vec::new();
-                };
-                let Some(doc) = tab.document.as_ref().map(|d| d.id) else {
-                    return Vec::new();
-                };
-                let path = tab.path.clone();
-                if let Some(tab) = self.state.active_mut() {
-                    tab.dirty = true;
-                }
-                vec![Effect::SaveDocument {
-                    doc,
-                    path,
-                    flatten: true,
-                }]
-            }
-
             // The export window is shell work: the reducer cannot draw one, and
             // it must not invent a path the user never chose. Everything the
             // window collects arrives later as one of the commands below.

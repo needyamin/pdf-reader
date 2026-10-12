@@ -276,14 +276,6 @@ fn file_menu(ui: &mut Ui, state: &AppState) -> Vec<Command> {
         }
     });
 
-    ui.separator();
-    ui.add_enabled_ui(has_doc, |ui| {
-        if menu_item(ui, "Flatten Document", "").clicked() {
-            commands.push(Command::FlattenDocument);
-            ui.close();
-        }
-    });
-
     // Export sits outside the enabled blocks: two of its five tasks work from
     // files the user picks and need no open document, which is exactly when
     // someone wants to merge two PDFs they have not opened. It carries the
@@ -510,7 +502,7 @@ pub fn menu_bar(ui: &mut Ui, state: &AppState, palette: &Palette) -> Vec<Command
                     ui.close();
                 }
                 ui.separator();
-                if menu_item(ui, "About AnsNew PDF Reader", "").clicked() {
+                if menu_item(ui, "About Us", "").clicked() {
                     commands.push(Command::ShowAbout);
                     ui.close();
                 }
