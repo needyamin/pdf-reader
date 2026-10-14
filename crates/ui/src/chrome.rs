@@ -9,14 +9,17 @@ use std::sync::Arc;
 use egui::{
     Align2, Color32, FontId, Galley, Id, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, Ui, Vec2,
     ViewportCommand, containers::menu::SubMenuButton,
-};use pdfreader_core::{
+};
+use pdfreader_core::{
     AnnotationId, AnnotationInfo, AnnotationKind, AppState, Command, DocumentId, ExportTask,
-    FieldId, FieldValue, FormFieldInfo, FormFieldType, FormInfo, Outline, OutlineNode, SidebarTab,
-    Tab, ThemeId, Tool, ViewMode, ZoomMode,
+    FieldId, FieldValue, FormFieldInfo, FormFieldType, FormInfo, GuideTopic, Outline, OutlineNode,
+    PageObjectInfo, PageObjectKind, SidebarTab, Tab, TextFormat, ThemeId, Tool, ViewMode, ZoomMode,
 };
 
 use crate::theme::Palette;
-use crate::window::{floating_window, primary_button as window_primary_button};
+use crate::window::{
+    floating_window, hint, primary_button as window_primary_button, secondary_button,
+};
 
 /// Height of the compact application menu.
 pub const MENUBAR_HEIGHT: f32 = 28.0;
@@ -214,8 +217,31 @@ pub enum Icon {
     StrikeoutTool,
     SquigglyTool,
     RectangleTool,
+    /// A capital T. The note tool places text, and the letter is what the
+    /// button is recognised by.
     NoteTool,
     EraserTool,
+    /// The list-editing glyphs used by the export window's ordered file stack:
+    /// reorder, remove, add, and the two file-type badges.
+    MoveUp,
+    MoveDown,
+    DragHandle,
+    Add,
+    Remove,
+    /// A picture frame with a sun and a hill — marks an image in a file list.
+    ImageFile,
+    /// A page with a folded corner and a text band — marks a PDF.
+    PdfFile,
+    /// Two arrows swapping: reverse the order of a list.
+    Reverse,
+    /// Rows growing downwards with an arrow: sort a list by name.
+    SortName,
+    /// A pencil: the content editor's toggle.
+    EditContent,
+    /// A speaker with no waves: the lookup card is quiet.
+    Speak,
+    /// The same speaker with sound waves: a voice is playing.
+    Speaking,
 }
 
 /// The Edit menu: the annotation history, enabled only when there is history.
@@ -497,6 +523,13 @@ pub fn menu_bar(ui: &mut Ui, state: &AppState, palette: &Palette) -> Vec<Command
                 commands.push(Command::ShowExportWindow(ExportTask::default()));
             }
             menu_button(ui, palette, "Help", |ui| {
+                for topic in GuideTopic::ALL {
+                    if menu_item(ui, topic.label(), "").clicked() {
+                        commands.push(Command::ShowGuide(topic));
+                        ui.close();
+                    }
+                }
+                ui.separator();
                 if menu_item(ui, "Keyboard Shortcuts", "").clicked() {
                     commands.push(Command::ShowShortcuts);
                     ui.close();
@@ -686,6 +719,10 @@ pub fn toolbar(
                     if outcome.cleared {
                         commands.push(Command::Search(String::new()));
                     }
+                    ui.add_space(6.0);
+                    if let Some(page) = page_jump(ui, palette, page_count) {
+                        commands.push(Command::GoToPage(page));
+                    }
                 });
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -866,6 +903,103 @@ pub fn search_field(
     );
 
     output
+}
+
+/// A page number and a Go button, drawn after the find field.
+///
+/// The number is 1-based, the same way the toolbar's page box counts. Enter
+/// and the button both jump. Anything past the last page lands on the last
+/// page. An empty box or a zero does not move.
+pub fn page_jump(ui: &mut Ui, palette: &Palette, page_count: u32) -> Option<u32> {
+    let id = ui.id().with("page-jump");
+    let mut text = ui
+        .data(|data| data.get_temp::<String>(id))
+        .unwrap_or_default();
+    // Closed until the field is clicked. The wide size is remembered from the
+    // previous frame, which is when the click took focus.
+    let expanded = ui
+        .data(|data| data.get_temp::<bool>(id.with("expanded")))
+        .unwrap_or(false);
+    let field_width = if expanded { 210.0 } else { 72.0 };
+    let hint = if expanded {
+        "Type a page number and Go"
+    } else {
+        "Page"
+    };
+    let mut go = false;
+    let mut focused = false;
+
+    let frame = egui::Frame::new()
+        .fill(palette.surface)
+        .corner_radius(BUTTON_RADIUS)
+        .show(ui, |ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            ui.horizontal(|ui| {
+                let response = ui.add_sized(
+                    Vec2::new(field_width, SEARCH_FIELD_HEIGHT),
+                    egui::TextEdit::singleline(&mut text)
+                        .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(8, 0)))
+                        .vertical_align(egui::Align::Center)
+                        .font(FontId::new(12.0, egui::FontFamily::Proportional))
+                        .hint_text(hint),
+                );
+                focused = response.has_focus();
+                if response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+                    go = true;
+                }
+                let button = ui.add_sized(
+                    Vec2::new(36.0, SEARCH_FIELD_HEIGHT),
+                    egui::Button::new(RichText::new("Go").size(12.0).color(palette.accent))
+                        .fill(palette.accent_soft)
+                        .corner_radius(0),
+                );
+                let tip = if page_count == 0 {
+                    "Open a document to jump to a page".to_owned()
+                } else {
+                    format!("Go to page (1–{page_count})")
+                };
+                if button.on_hover_text(tip).clicked() {
+                    go = true;
+                }
+            });
+        });
+
+    text.retain(|c| c.is_ascii_digit());
+    if text.len() > 6 {
+        text.truncate(6);
+    }
+    ui.data_mut(|data| {
+        data.insert_temp(id, text.clone());
+        data.insert_temp(id.with("expanded"), focused);
+    });
+
+    ui.painter().rect_stroke(
+        frame.response.rect,
+        BUTTON_RADIUS,
+        Stroke::new(
+            1.0,
+            if focused {
+                palette.accent
+            } else {
+                palette.border
+            },
+        ),
+        StrokeKind::Inside,
+    );
+
+    go.then(|| page_index(&text, page_count)).flatten()
+}
+
+/// Turn a typed page number into a 0-based index.
+///
+/// `None` when the box is empty, not a number, or zero. A number past the end
+/// of the document is the last page, so Go always lands somewhere real.
+fn page_index(text: &str, page_count: u32) -> Option<u32> {
+    let typed = text.trim().parse::<u32>().ok()?;
+    if typed == 0 || page_count == 0 {
+        return None;
+    }
+    Some(typed.min(page_count) - 1)
 }
 
 /// Width of the "Find" addon: pad, magnifier, gap, label, pad. The label is
@@ -1172,7 +1306,14 @@ pub fn annotation_bar(
                     if previous.is_some_and(|prev| tool_group(prev) != tool_group(tool)) {
                         ui.separator();
                     }
-                    if tool_button(ui, palette, tool, state.tool == tool).clicked() {
+                    // Dimmed, not hidden, while the content editor is on: the
+                    // tools are one toggle away, and a row that reflowed every
+                    // time the mode changed would move the button the user is
+                    // reaching for.
+                    let enabled = !state.editing_content;
+                    if tool_button(ui, palette, tool, state.tool == tool, enabled).clicked()
+                        && enabled
+                    {
                         commands.push(Command::SetTool(tool));
                     }
                     previous = Some(tool);
@@ -1225,16 +1366,77 @@ pub fn annotation_bar(
                 // shows its move/resize handles. This is the on-demand open.
                 {
                     let selected = state.active().and_then(|tab| tab.view.selected_annotation);
-                    let open = state.active().is_some_and(|tab| tab.view.properties_panel_open);
-                    let label = RichText::new("Properties")
-                        .size(11.5)
-                        .color(if open { palette.accent } else { palette.text });
+                    let open = state
+                        .active()
+                        .is_some_and(|tab| tab.view.properties_panel_open);
+                    let label = RichText::new("Properties").size(11.5).color(if open {
+                        palette.accent
+                    } else {
+                        palette.text
+                    });
                     let button = egui::Button::new(label)
-                        .fill(if open { palette.accent_soft } else { Color32::TRANSPARENT })
+                        .fill(if open {
+                            palette.accent_soft
+                        } else {
+                            Color32::TRANSPARENT
+                        })
                         .corner_radius(4.0);
                     let response = ui.add_enabled(selected.is_some(), button);
                     if response.clicked() && selected.is_some() {
                         commands.push(Command::SetPropertiesPanel { open: !open });
+                    }
+                }
+                // "Edit" switches the canvas from *marking* the page to
+                // *changing* it: the annotate tools go dim and the pointer
+                // selects, moves and retypes the page's own text and images.
+                // Disabled rather than silently ignoring the click for a
+                // document that cannot be written, so the reason is visible
+                // before the user tries.
+                {
+                    let editable = state
+                        .active()
+                        .and_then(|tab| tab.document.as_ref())
+                        .is_some_and(|document| document.can_edit_content);
+                    let on = state.editing_content;
+                    // While editing, the same control is the way out. "Done" is
+                    // the exit action; the status chip beside it says the mode
+                    // is on, so the button does not repeat that.
+                    let label = RichText::new(if on { "Done" } else { "Edit PDF" })
+                        .size(11.5)
+                        .color(if on { palette.accent } else { palette.text });
+                    let button = egui::Button::new(label)
+                        .fill(if on {
+                            palette.accent_soft
+                        } else {
+                            Color32::TRANSPARENT
+                        })
+                        .corner_radius(4.0);
+                    let hint = if !editable {
+                        "This document's permissions do not allow its content to be changed"
+                    } else if on {
+                        "Leave PDF editing mode"
+                    } else {
+                        "Click text to select it, drag to move, click again or double-click to edit"
+                    };
+                    let response = ui.add_enabled(editable, button).on_hover_text(hint);
+                    if response.clicked() && editable {
+                        commands.push(Command::SetEditingContent { on: !on });
+                    }
+                    if on {
+                        ui.add_space(6.0);
+                        egui::Frame::new()
+                            .fill(palette.accent_soft)
+                            .stroke(egui::Stroke::new(1.0, palette.accent))
+                            .corner_radius(palette.radius.max(4.0))
+                            .inner_margin(egui::Margin::symmetric(8, 3))
+                            .show(ui, |ui| {
+                                ui.label(
+                                    RichText::new("PDF Editing Mode Is ON")
+                                        .color(palette.accent)
+                                        .size(11.0)
+                                        .strong(),
+                                );
+                            });
                     }
                 }
             });
@@ -1273,9 +1475,24 @@ fn tool_group(tool: Tool) -> u8 {
 /// The icon is the mark the tool makes (matching the cursor badge), filled in
 /// `accent` while armed and `text` otherwise, with a hover fill and a tooltip
 /// carrying the tool name and its shortcut.
-fn tool_button(ui: &mut Ui, palette: &Palette, tool: Tool, active: bool) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(28.0, 22.0), Sense::click());
-    let fill = if active {
+fn tool_button(
+    ui: &mut Ui,
+    palette: &Palette,
+    tool: Tool,
+    active: bool,
+    enabled: bool,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(
+        Vec2::new(28.0, 22.0),
+        if enabled {
+            Sense::click()
+        } else {
+            Sense::hover()
+        },
+    );
+    let fill = if !enabled {
+        Color32::TRANSPARENT
+    } else if active {
         palette.accent_soft
     } else if response.hovered() {
         palette.surface_hover
@@ -1285,11 +1502,18 @@ fn tool_button(ui: &mut Ui, palette: &Palette, tool: Tool, active: bool) -> egui
     if fill != Color32::TRANSPARENT {
         ui.painter().rect_filled(rect, 4.0, fill);
     }
-    let color = if active { palette.accent } else { palette.text };
+    let color = match (enabled, active) {
+        (false, _) => palette.text_dim.gamma_multiply(0.45),
+        (true, true) => palette.accent,
+        (true, false) => palette.text,
+    };
     draw_icon(ui.painter(), rect.center(), tool_icon(tool), color);
-    response
-        .on_hover_cursor(egui::CursorIcon::PointingHand)
-        .on_hover_text(format!("{} ({})", tool.label(), tool.shortcut()))
+    let response = if enabled {
+        response.on_hover_cursor(egui::CursorIcon::PointingHand)
+    } else {
+        response
+    };
+    response.on_hover_text(format!("{} ({})", tool.label(), tool.shortcut()))
 }
 
 /// Whether a text field is open for typing.
@@ -2352,7 +2576,13 @@ fn truncate(text: &str, max_chars: usize) -> String {
     out
 }
 
-fn draw_icon(painter: &egui::Painter, center: Pos2, icon: Icon, color: Color32) {
+/// Draw one toolbar or list icon, centred on `center`, in a single colour.
+///
+/// Exposed so a panel outside this module — the export window's ordered file
+/// stack — can use the same glyphs the toolbar does instead of inventing its
+/// own. Every icon is drawn from primitives so it stays crisp at any scale and
+/// picks up the theme colour it is handed.
+pub fn draw_icon(painter: &egui::Painter, center: Pos2, icon: Icon, color: Color32) {
     let stroke = Stroke::new(1.6, color);
     let c = center;
     match icon {
@@ -2598,11 +2828,7 @@ fn draw_icon(painter: &egui::Painter, center: Pos2, icon: Icon, color: Color32) 
         }
         Icon::HighlightTool => {
             // A solid band — the highlight covers the text it marks.
-            painter.rect_filled(
-                Rect::from_center_size(c, Vec2::new(13.0, 7.0)),
-                2.5,
-                color,
-            );
+            painter.rect_filled(Rect::from_center_size(c, Vec2::new(13.0, 7.0)), 2.5, color);
         }
         Icon::UnderlineTool => {
             // A line of text with the rule drawn beneath it.
@@ -2656,17 +2882,15 @@ fn draw_icon(painter: &egui::Painter, center: Pos2, icon: Icon, color: Color32) 
             );
         }
         Icon::NoteTool => {
-            // The folded-corner sticky note.
-            let r = Rect::from_center_size(c, Vec2::new(12.0, 12.0));
-            painter.rect_stroke(r, 1.5, stroke, StrokeKind::Inside);
-            painter.line(
-                vec![
-                    r.right_top() + Vec2::new(-4.5, 0.0),
-                    r.right_top() + Vec2::new(0.0, 4.5),
-                    r.right_top() + Vec2::new(-4.5, 4.5),
-                ],
-                stroke,
+            // A capital T, heavy enough to read inside the 22px tool button.
+            // The bar sits on top and the stem drops from its middle, so it
+            // cannot be mistaken for a plus.
+            let bar = Stroke::new(2.2, color);
+            painter.line_segment(
+                [c + Vec2::new(-5.5, -5.0), c + Vec2::new(5.5, -5.0)],
+                bar,
             );
+            painter.line_segment([c + Vec2::new(0.0, -5.0), c + Vec2::new(0.0, 6.0)], bar);
         }
         Icon::EraserTool => {
             // A slanted eraser block lifted off the surface line.
@@ -2685,7 +2909,207 @@ fn draw_icon(painter: &egui::Painter, center: Pos2, icon: Icon, color: Color32) 
                 Stroke::new(1.6, color),
             );
         }
+        // ---- List-editing glyphs (the export window's ordered file stack) ----
+        Icon::MoveUp => {
+            painter.line(
+                vec![
+                    c + Vec2::new(-4.5, 2.0),
+                    c + Vec2::new(0.0, -3.5),
+                    c + Vec2::new(4.5, 2.0),
+                ],
+                stroke,
+            );
+        }
+        Icon::MoveDown => {
+            painter.line(
+                vec![
+                    c + Vec2::new(-4.5, -2.0),
+                    c + Vec2::new(0.0, 3.5),
+                    c + Vec2::new(4.5, -2.0),
+                ],
+                stroke,
+            );
+        }
+        // A six-dot grip: the conventional "drag me" handle for a list row.
+        // Three rows of two dots read as a handle at 16 px without needing a
+        // literal hand, which turns to mush at icon size.
+        Icon::DragHandle => {
+            for row in [-3.5_f32, 0.0, 3.5] {
+                for column in [-2.0_f32, 2.0] {
+                    painter.circle_filled(c + Vec2::new(column, row), 1.15, color);
+                }
+            }
+        }
+        Icon::Add => {
+            painter.line_segment([c + Vec2::new(0.0, -5.0), c + Vec2::new(0.0, 5.0)], stroke);
+            painter.line_segment([c + Vec2::new(-5.0, 0.0), c + Vec2::new(5.0, 0.0)], stroke);
+        }
+        // A waste bin. Reads as "delete this entry" where an X reads as "close
+        // the window", which is the distinction a row control has to make.
+        Icon::Remove => {
+            painter.rect_stroke(
+                Rect::from_min_max(c + Vec2::new(-4.0, -2.5), c + Vec2::new(4.0, 6.0)),
+                1.0,
+                stroke,
+                StrokeKind::Inside,
+            );
+            painter.line_segment(
+                [c + Vec2::new(-6.0, -3.5), c + Vec2::new(6.0, -3.5)],
+                stroke,
+            );
+            painter.line(
+                vec![
+                    c + Vec2::new(-1.8, -5.5),
+                    c + Vec2::new(1.8, -5.5),
+                    c + Vec2::new(1.8, -3.5),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [c + Vec2::new(-1.8, -3.5), c + Vec2::new(-1.8, -5.5)],
+                stroke,
+            );
+        }
+        // A picture: frame, sun and hill.
+        Icon::ImageFile => {
+            let frame = Rect::from_center_size(c, Vec2::new(15.0, 12.0));
+            painter.rect_stroke(frame, 2.0, stroke, StrokeKind::Inside);
+            painter.circle_filled(frame.left_top() + Vec2::new(4.2, 3.6), 1.4, color);
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    frame.left_bottom() + Vec2::new(1.5, -1.5),
+                    frame.center_bottom() + Vec2::new(0.5, -6.0),
+                    frame.right_bottom() + Vec2::new(-1.5, -1.5),
+                ],
+                color,
+                Stroke::NONE,
+            ));
+        }
+        // A document: a page with a folded corner and a text band.
+        Icon::PdfFile => {
+            let sheet = Rect::from_center_size(c, Vec2::new(12.0, 15.0));
+            painter.rect_stroke(sheet, 2.0, stroke, StrokeKind::Inside);
+            let fold = 4.5;
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    Pos2::new(sheet.right() - fold, sheet.top()),
+                    Pos2::new(sheet.right(), sheet.top() + fold),
+                    Pos2::new(sheet.right() - fold, sheet.top() + fold),
+                ],
+                color,
+                Stroke::NONE,
+            ));
+            painter.rect_filled(
+                Rect::from_min_size(
+                    sheet.min + Vec2::new(2.5, sheet.height() * 0.6),
+                    Vec2::new(sheet.width() - 5.0, 1.5),
+                ),
+                0.8,
+                color,
+            );
+        }
+        // Two arrows swapping ends: reverse the order.
+        Icon::Reverse => {
+            painter.line(
+                vec![
+                    c + Vec2::new(-5.5, -3.0),
+                    c + Vec2::new(4.0, -3.0),
+                    c + Vec2::new(1.5, -5.5),
+                ],
+                stroke,
+            );
+            painter.line(
+                vec![
+                    c + Vec2::new(5.5, 3.0),
+                    c + Vec2::new(-4.0, 3.0),
+                    c + Vec2::new(-1.5, 5.5),
+                ],
+                stroke,
+            );
+        }
+        // Rows growing downwards with an arrow: sort by name.
+        Icon::SortName => {
+            for (y, width) in [(-5.5_f32, 6.0_f32), (0.0, 9.0), (5.5, 12.0)] {
+                painter.line_segment(
+                    [c + Vec2::new(-7.0, y), c + Vec2::new(-7.0 + width, y)],
+                    Stroke::new(1.5, color),
+                );
+            }
+            painter.line(
+                vec![
+                    c + Vec2::new(5.0, -6.0),
+                    c + Vec2::new(5.0, 6.0),
+                    c + Vec2::new(2.5, 3.5),
+                ],
+                stroke,
+            );
+        }
+        // A pencil: a shaft lying at 45 degrees with a point at its lower-left.
+        // Two filled shapes, so it stays legible at 16 px where an outline
+        // pencil turns into a smudge.
+        Icon::EditContent => {
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    c + Vec2::new(-3.8, 1.6),
+                    c + Vec2::new(-1.4, 4.0),
+                    c + Vec2::new(4.6, -2.0),
+                    c + Vec2::new(2.2, -4.4),
+                ],
+                color,
+                Stroke::NONE,
+            ));
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    c + Vec2::new(-3.8, 1.6),
+                    c + Vec2::new(-1.4, 4.0),
+                    c + Vec2::new(-6.4, 6.4),
+                ],
+                color,
+                Stroke::NONE,
+            ));
+        }
+        Icon::Speak => speaker_glyph(painter, c, color),
+        Icon::Speaking => {
+            speaker_glyph(painter, c, color);
+            // Two arcs just past the cone's mouth. Same speaker as `Speak`,
+            // so the only change while a voice is playing is the waves.
+            let mouth = c + Vec2::new(1.4, 0.0);
+            for radius in [2.8, 4.6] {
+                let points: Vec<Pos2> = (0..=5)
+                    .map(|i| {
+                        let angle = -0.9 + (i as f32 / 5.0) * 1.8;
+                        mouth + Vec2::new(angle.cos() * radius, angle.sin() * radius)
+                    })
+                    .collect();
+                painter.line(points, stroke);
+            }
+        }
     }
+}
+
+/// The speaker cone shared by [`Icon::Speak`] and [`Icon::Speaking`].
+///
+/// Nudged left so the sounding waves sit in the same box without moving the cone.
+fn speaker_glyph(painter: &egui::Painter, center: Pos2, color: Color32) {
+    let origin = center + Vec2::new(-1.0, 0.0);
+    painter.rect_filled(
+        Rect::from_min_max(
+            origin + Vec2::new(-4.2, -2.0),
+            origin + Vec2::new(-1.6, 2.0),
+        ),
+        0.6,
+        color,
+    );
+    painter.add(egui::Shape::convex_polygon(
+        vec![
+            origin + Vec2::new(-1.6, -2.1),
+            origin + Vec2::new(2.4, -5.4),
+            origin + Vec2::new(2.4, 5.4),
+            origin + Vec2::new(-1.6, 2.1),
+        ],
+        color,
+        Stroke::NONE,
+    ));
 }
 
 #[cfg(test)]
@@ -2693,7 +3117,7 @@ mod tests {
     use super::{
         ANNOTATION_SWATCHES, PROPERTIES_PANEL_WIDTH, Palette, SEARCH_FIELD_HEIGHT,
         SearchFieldOutput, TOOLBAR_HEIGHT, TOOLBAR_PAD_Y, annotation_properties_window,
-        comments_panel, properties_panel_origin, search_field, status_bar, toolbar,
+        comments_panel, page_index, properties_panel_origin, search_field, status_bar, toolbar,
     };
     use crate::theme::Theme;
     use egui::{Context, RawInput, Rect};
@@ -2862,7 +3286,7 @@ mod tests {
         id: pdfreader_core::AnnotationId,
     ) -> egui::Pos2 {
         let probe = Context::default();
-        for y in (120..=420).step_by(10) {
+        for y in (120..=560).step_by(10) {
             for x in (330..=780).step_by(10) {
                 let p = egui::pos2(x as f32, y as f32);
                 draw_properties_window_pointer(&probe, palette, annotations, Some(id), p, true);
@@ -2874,7 +3298,7 @@ mod tests {
             palette,
             annotations,
             Some(id),
-            120..=420,
+            120..=560,
             330..=780,
             4,
             |c| matches!(c, Command::SetAnnotationColor { .. }),
@@ -2895,6 +3319,7 @@ mod tests {
             rect: pdfreader_core::Rect::from_xywh(0.0, 0.0, 10.0, 10.0),
             contents: None,
             color: None,
+            thickness: 0.45,
         }];
         let commands = draw_properties_window(
             &ctx,
@@ -2925,6 +3350,7 @@ mod tests {
             rect: pdfreader_core::Rect::from_xywh(10.0, 20.0, 40.0, 10.0),
             contents: None,
             color: Some(start),
+            thickness: 0.45,
         }];
 
         // Apply is disabled until something is staged, so its position is
@@ -2943,8 +3369,14 @@ mod tests {
             for x in (330..=780).step_by(6) {
                 let stage = egui::pos2(x as f32, y as f32);
                 draw_properties_window_pointer(&ctx, &palette, &annotations, Some(id), stage, true);
-                let on_click =
-                    draw_properties_window_pointer(&ctx, &palette, &annotations, Some(id), stage, false);
+                let on_click = draw_properties_window_pointer(
+                    &ctx,
+                    &palette,
+                    &annotations,
+                    Some(id),
+                    stage,
+                    false,
+                );
                 assert!(
                     !on_click
                         .iter()
@@ -2952,8 +3384,14 @@ mod tests {
                     "clicking {stage:?} must only stage a value, never write it: {on_click:?}"
                 );
                 draw_properties_window_pointer(&ctx, &palette, &annotations, Some(id), apply, true);
-                let commands =
-                    draw_properties_window_pointer(&ctx, &palette, &annotations, Some(id), apply, false);
+                let commands = draw_properties_window_pointer(
+                    &ctx,
+                    &palette,
+                    &annotations,
+                    Some(id),
+                    apply,
+                    false,
+                );
                 let Some(cmd) = commands
                     .into_iter()
                     .find(|c| matches!(c, Command::SetAnnotationColor { .. }))
@@ -2991,17 +3429,24 @@ mod tests {
             rect: pdfreader_core::Rect::from_xywh(10.0, 20.0, 40.0, 10.0),
             contents: None,
             color: Some([255, 0, 0, 200]),
+            thickness: 0.45,
         }];
 
         // The Delete button sits below the geometry grid, near the window's
         // left edge, so sweep the whole window rather than guessing its row.
         let mut hit = None;
-        'outer: for y in (150..=470).step_by(6) {
+        'outer: for y in (150..=560).step_by(6) {
             for x in (330..=780).step_by(6) {
                 let p = egui::pos2(x as f32, y as f32);
                 draw_properties_window_pointer(&ctx, &palette, &annotations, Some(id), p, true);
-                let released =
-                    draw_properties_window_pointer(&ctx, &palette, &annotations, Some(id), p, false);
+                let released = draw_properties_window_pointer(
+                    &ctx,
+                    &palette,
+                    &annotations,
+                    Some(id),
+                    p,
+                    false,
+                );
                 if let Some(cmd) = released
                     .into_iter()
                     .find(|c| matches!(c, Command::DeleteAnnotation(_)))
@@ -3015,6 +3460,69 @@ mod tests {
             hit.is_some_and(|c| matches!(c, Command::DeleteAnnotation(rid) if rid == id)),
             "the panel's Delete button must emit DeleteAnnotation for the shown annotation"
         );
+    }
+
+    /// The 1px / 2px / 5px presets only stage a weight. Apply is what writes
+    /// it, and the command carries the preset that was clicked.
+    #[test]
+    fn properties_window_apply_writes_the_staged_line_weight() {
+        let palette = Theme::from_id(ThemeId::default()).palette;
+        let id = pdfreader_core::AnnotationId::new(0, 0);
+        let annotations = [pdfreader_core::AnnotationInfo {
+            id,
+            kind: pdfreader_core::AnnotationKind::Underline,
+            rect: pdfreader_core::Rect::from_xywh(10.0, 20.0, 80.0, 14.0),
+            contents: None,
+            color: Some([0, 0, 0, 255]),
+            thickness: pdfreader_core::DEFAULT_LINE_WEIGHT,
+        }];
+        let apply = find_apply_button(&palette, &annotations, id);
+        let ctx = Context::default();
+        for _ in 0..2 {
+            draw_properties_window(&ctx, &palette, &annotations, Some(id));
+        }
+
+        let mut written = None;
+        'search: for y in (120..=560).step_by(8) {
+            for x in (330..=780).step_by(8) {
+                let stage = egui::pos2(x as f32, y as f32);
+                draw_properties_window_pointer(&ctx, &palette, &annotations, Some(id), stage, true);
+                let staged = draw_properties_window_pointer(
+                    &ctx,
+                    &palette,
+                    &annotations,
+                    Some(id),
+                    stage,
+                    false,
+                );
+                assert!(
+                    !staged
+                        .iter()
+                        .any(|c| matches!(c, Command::SetAnnotationThickness { .. })),
+                    "a line-weight click must only stage, never write: {staged:?}"
+                );
+                draw_properties_window_pointer(&ctx, &palette, &annotations, Some(id), apply, true);
+                let commands = draw_properties_window_pointer(
+                    &ctx,
+                    &palette,
+                    &annotations,
+                    Some(id),
+                    apply,
+                    false,
+                );
+                if let Some(Command::SetAnnotationThickness { thickness, .. }) = commands
+                    .iter()
+                    .find(|c| matches!(c, Command::SetAnnotationThickness { .. }))
+                {
+                    if (*thickness - 5.0).abs() < 0.05 {
+                        written = Some(*thickness);
+                        break 'search;
+                    }
+                }
+            }
+        }
+        let written = written.expect("clicking 5px and Apply must emit that weight");
+        assert!((written - 5.0).abs() < 0.05, "5px preset, got {written}");
     }
 
     /// The properties window must be draggable, and must stay where it is put.
@@ -3035,6 +3543,7 @@ mod tests {
             rect: pdfreader_core::Rect::from_xywh(10.0, 20.0, 40.0, 10.0),
             contents: None,
             color: Some([255, 0, 0, 200]),
+            thickness: 0.45,
         }];
         let screen = Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
         let origin = properties_panel_origin(screen);
@@ -3088,13 +3597,15 @@ mod tests {
                 &palette,
                 &annotations,
                 Some(id),
-                120..=520,
-                330..=790,
+                40..=580,
+                200..=790,
                 6,
                 delete,
             ) {
                 // The sweep lands on a 6px grid, so each axis of the recovered
                 // position can be half a cell out; the drag itself is exact.
+                // The box is taller than the panel's first-open guess: the line
+                // weight row pushes Delete down, and the drag pushes it further.
                 let miss = (p - start - delta).abs();
                 if miss.max_elem() <= 6.5 {
                     dragged = Some(p);
@@ -3200,6 +3711,7 @@ mod tests {
             rect: pdfreader_core::Rect::from_xywh(10.0, 20.0, 40.0, 10.0),
             contents: None,
             color: Some(start),
+            thickness: 0.45,
         }];
         let apply = find_apply_button(&palette, &annotations, id);
 
@@ -3313,6 +3825,7 @@ mod tests {
                 rect: pdfreader_core::Rect::from_xywh(0.0, 0.0, 10.0, 10.0),
                 contents: Some("https://example.com".to_string()),
                 color: None,
+                thickness: 0.45,
             },
             pdfreader_core::AnnotationInfo {
                 id: square,
@@ -3320,6 +3833,7 @@ mod tests {
                 rect: pdfreader_core::Rect::from_xywh(0.0, 0.0, 10.0, 10.0),
                 contents: None,
                 color: Some([255, 0, 0, 255]),
+                thickness: 0.45,
             },
         ];
 
@@ -3486,6 +4000,19 @@ mod tests {
         );
     }
 
+    /// A typed page is 1-based. Past the end of the document, Go lands on the
+    /// last page. An empty box or a zero does not move.
+    #[test]
+    fn a_typed_page_number_becomes_that_page() {
+        assert_eq!(page_index("1", 12), Some(0));
+        assert_eq!(page_index("7", 12), Some(6));
+        assert_eq!(page_index("99", 12), Some(11));
+        assert_eq!(page_index("007", 12), Some(6));
+        assert_eq!(page_index("", 12), None);
+        assert_eq!(page_index("0", 12), None);
+        assert_eq!(page_index("3", 0), None);
+    }
+
     /// Enter runs the search — the field has no submit button, so the key is
     /// the only way to run a query.
     #[test]
@@ -3531,6 +4058,7 @@ mod tests {
                 title: "doc".into(),
                 pages: vec![PageGeometry::A4; 3],
                 encrypted: false,
+                can_edit_content: true,
                 outline: Outline::default(),
             },
         });
@@ -3605,7 +4133,7 @@ const PROPERTIES_PANEL_MARGIN: f32 = 24.0;
 ///
 /// The real height is whatever the swatch grid and the two rows need; this is
 /// only the first-open placement, before the user drags the window anywhere.
-const PROPERTIES_PANEL_HEIGHT: f32 = 240.0;
+const PROPERTIES_PANEL_HEIGHT: f32 = 320.0;
 
 /// Where the properties window opens before the user drags it: the right-hand
 /// strip it used to be anchored to, expressed as a *position* instead of a pin.
@@ -3624,14 +4152,14 @@ fn properties_panel_origin(screen: Rect) -> Pos2 {
 /// Colour presets the properties panel offers, as RGBA bytes. The alpha byte
 /// is the annotation's rendered opacity, so these swatches are fully opaque.
 const ANNOTATION_SWATCHES: [[u8; 4]; 8] = [
-    [255, 202, 40, 255],  // yellow — the highlight default
-    [76, 175, 80, 255],   // green
-    [33, 150, 243, 255],  // blue
-    [244, 67, 54, 255],   // red — the rectangle default
-    [255, 152, 0, 255],   // orange
-    [156, 39, 176, 255],  // purple
-    [96, 125, 139, 255],  // grey
-    [233, 30, 99, 255],   // pink
+    [255, 202, 40, 255], // yellow — the highlight default
+    [76, 175, 80, 255],  // green
+    [33, 150, 243, 255], // blue
+    [244, 67, 54, 255],  // red — the rectangle default
+    [255, 152, 0, 255],  // orange
+    [156, 39, 176, 255], // purple
+    [96, 125, 139, 255], // grey
+    [233, 30, 99, 255],  // pink
 ];
 
 /// Draft state for the properties window.
@@ -3644,6 +4172,9 @@ const ANNOTATION_SWATCHES: [[u8; 4]; 8] = [
 #[derive(Clone, PartialEq)]
 struct AnnotationPropertiesDraft {
     color: [u8; 4],
+    /// Stroke weight in PDF points. Staged the same way as the colour: the
+    /// slider and the preset buttons only change this, and Apply writes it.
+    thickness: f32,
     dirty: bool,
 }
 
@@ -3651,17 +4182,28 @@ impl AnnotationPropertiesDraft {
     fn from_annotation(annotation: &AnnotationInfo) -> Self {
         Self {
             color: annotation.color.unwrap_or([0, 0, 0, 255]),
+            thickness: annotation.thickness,
             dirty: false,
         }
     }
 }
 
+/// How a stroke weight is written on the properties panel: `1px`, `2px`, and
+/// a single decimal when the mark is still the hairline it was drawn at.
+fn line_weight_text(weight: f32) -> String {
+    if (weight - weight.round()).abs() < 0.05 {
+        format!("{:.0}px", weight.round())
+    } else {
+        format!("{weight:.1}px")
+    }
+}
+
 /// The floating properties window for the selected annotation.
 ///
-/// Colour swatches and the opacity slider only stage a value; the Apply button
-/// is what writes it. This is deliberately not a local `let mut` value: local
-/// widget values are recreated from the stale PDFium list every frame, which is
-/// what made opacity appear not to apply.
+/// Colour swatches, the opacity slider and the line-weight controls only stage
+/// a value; the Apply button is what writes it. This is deliberately not a
+/// local `let mut` value: local widget values are recreated from the stale
+/// PDFium list every frame, which is what made opacity appear not to apply.
 ///
 /// There is no position/size section: an annotation is dragged and resized on
 /// the page itself, where the user can see what they are doing, and four
@@ -3685,7 +4227,8 @@ pub fn annotation_properties_window(
     }
 
     let state_id = Id::new(("annotation-properties", annotation.id));
-    let mut draft = ctx.data(|data| data.get_temp::<AnnotationPropertiesDraft>(state_id))
+    let mut draft = ctx
+        .data(|data| data.get_temp::<AnnotationPropertiesDraft>(state_id))
         .unwrap_or_else(|| AnnotationPropertiesDraft::from_annotation(annotation));
     // The engine's colour, which is `None` for a mark that carries no `/C`.
     let engine_color = annotation.color;
@@ -3696,9 +4239,14 @@ pub fn annotation_properties_window(
         if let Some(color) = engine_color {
             draft.color = color;
         }
+        draft.thickness = annotation.thickness;
     }
 
-    let title = format!("{} · page {}", annotation.kind.label(), annotation.id.page + 1);
+    let title = format!(
+        "{} · page {}",
+        annotation.kind.label(),
+        annotation.id.page + 1
+    );
     // A fixed id rather than the title: the title changes with every
     // annotation, and egui files a window's remembered position under its id —
     // a per-annotation id would drop the panel back into its corner every time
@@ -3720,13 +4268,21 @@ pub fn annotation_properties_window(
                             swatch[0], swatch[1], swatch[2], swatch[3],
                         );
                         let is_current = swatch[0..3] == draft.color[0..3];
-                        let (rect, response) = ui.allocate_exact_size(Vec2::splat(20.0), Sense::click());
+                        let (rect, response) =
+                            ui.allocate_exact_size(Vec2::splat(20.0), Sense::click());
                         let painter = ui.painter();
                         painter.rect_filled(rect, 4.0, fill);
                         painter.rect_stroke(
                             rect,
                             4.0,
-                            Stroke::new(if is_current { 2.0 } else { 1.0 }, if is_current { palette.text } else { palette.text_dim }),
+                            Stroke::new(
+                                if is_current { 2.0 } else { 1.0 },
+                                if is_current {
+                                    palette.text
+                                } else {
+                                    palette.text_dim
+                                },
+                            ),
                             StrokeKind::Inside,
                         );
                         if response.clicked() {
@@ -3752,6 +4308,52 @@ pub fn annotation_properties_window(
                 }
             });
 
+            // Line markups and rectangles have a real stroke. A highlight is a
+            // filled band and a note is an icon, so the control is omitted
+            // there rather than offering a weight that would not show up.
+            if annotation.kind.has_line_weight() {
+                ui.label(RichText::new("Line").size(11.0).color(palette.text_dim));
+                ui.horizontal(|ui| {
+                    for preset in pdfreader_core::LINE_WEIGHT_PRESETS {
+                        let selected = (draft.thickness - preset).abs() < 0.05;
+                        let label = format!("{preset:.0}px");
+                        if ui
+                            .selectable_label(selected, label)
+                            .on_hover_text(format!("Set the line to {preset:.0}px"))
+                            .clicked()
+                        {
+                            draft.thickness = preset;
+                            draft.dirty = true;
+                        }
+                    }
+                });
+                ui.horizontal(|ui| {
+                    // The slider starts at 1px. A mark that is still the
+                    // hairline it was drawn at sits below that, and forcing the
+                    // widget's clamp back into the draft would stage a change
+                    // the user never made.
+                    let mut weight = draft.thickness.clamp(1.0, pdfreader_core::MAX_LINE_WEIGHT);
+                    let response = ui.add(
+                        egui::Slider::new(&mut weight, 1.0..=pdfreader_core::MAX_LINE_WEIGHT)
+                            .integer()
+                            .suffix("px")
+                            .show_value(true),
+                    );
+                    if response.changed() {
+                        draft.thickness =
+                            weight.round().clamp(1.0, pdfreader_core::MAX_LINE_WEIGHT);
+                        draft.dirty = true;
+                    }
+                    if draft.thickness < 1.0 {
+                        ui.label(
+                            RichText::new(line_weight_text(draft.thickness))
+                                .size(11.0)
+                                .color(palette.text_dim),
+                        );
+                    }
+                });
+            }
+
             ui.separator();
             // Apply commits the staged colour; it is off until there is
             // something new to write, so it never lies about a click doing
@@ -3759,17 +4361,30 @@ pub fn annotation_properties_window(
             // actions a panel like this has, one to keep the edit and one to
             // throw the mark away, and burying the destructive one under the
             // constructive one wasted a whole row of a 270px window.
-            let pending = draft.dirty && Some(draft.color) != engine_color;
+            let color_changed = Some(draft.color) != engine_color;
+            let weight_changed = annotation.kind.has_line_weight()
+                && (draft.thickness - annotation.thickness).abs() > 0.05;
+            let pending = draft.dirty && (color_changed || weight_changed);
             ui.horizontal(|ui| {
                 let response = ui
                     .add_enabled(pending, window_primary_button(palette, "Apply"))
-                    .on_hover_text("Apply the staged colour and opacity (Ctrl+Z undoes it)");
+                    .on_hover_text(
+                        "Apply the staged colour, opacity and line weight (Ctrl+Z undoes it)",
+                    );
                 if response.clicked() && pending {
                     draft.dirty = false;
-                    commands.push(Command::SetAnnotationColor {
-                        id: annotation.id,
-                        color: draft.color,
-                    });
+                    if color_changed {
+                        commands.push(Command::SetAnnotationColor {
+                            id: annotation.id,
+                            color: draft.color,
+                        });
+                    }
+                    if weight_changed {
+                        commands.push(Command::SetAnnotationThickness {
+                            id: annotation.id,
+                            thickness: draft.thickness,
+                        });
+                    }
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("Delete").clicked() {
@@ -3784,5 +4399,226 @@ pub fn annotation_properties_window(
         let initial = saved.clone();
         *data.get_temp_mut_or_insert_with(state_id, || initial) = saved;
     });
+    commands
+}
+
+// --- Content-editing object actions ----------------------------------------
+//
+// While the content editor is on, the selected page object gets a small
+// floating panel of the things that can be done to it. It is a panel rather
+// than a row in the annotate bar because what can be done depends on *what* is
+// selected — only an image can be replaced — and the bar has no way to know
+// that: the object list lives in the shell, next to the engine.
+
+/// The actions available for the selected page-content object.
+///
+/// Returns the commands the user asked for. The panel is drawn from the record
+/// the shell already holds, so it needs no engine call of its own.
+/// The actions and properties of the selected page-content object: text
+/// styling (bold, size, colour), paint order, and the destructive shortcuts.
+/// Presentation only — every control emits commands.
+pub fn object_actions_window(
+    ctx: &egui::Context,
+    palette: &Palette,
+    info: &PageObjectInfo,
+    original: TextFormat,
+) -> Vec<Command> {
+    let mut commands = Vec::new();
+
+    let title = match info.kind {
+        PageObjectKind::Text => "Text object",
+        PageObjectKind::Image => "Image",
+    };
+
+    floating_window(title, palette)
+        .id(egui::Id::new("content-object-actions"))
+        .resizable(false)
+        .default_pos(properties_panel_origin(ctx.viewport_rect()))
+        .default_width(PROPERTIES_PANEL_WIDTH)
+        .show(ctx, |ui| {
+            ui.set_min_width(250.0);
+            ui.label(hint(
+                palette,
+                &format!(
+                    "{:.0} × {:.0} pt  ·  page {}  ·  {x:.0}, {y:.0}",
+                    info.bounds.width(),
+                    info.bounds.height(),
+                    info.id.page + 1,
+                    x = info.bounds.min_x,
+                    y = info.bounds.min_y,
+                ),
+            ));
+            ui.add_space(8.0);
+
+            // Text styling: bold, size and colour are synthetic on a PDF text
+            // run, so the panel toggles them and the engine fakes the result.
+            // Every change is accumulated into one `next` format and dispatched
+            // as a single command, so a combined edit is one undo step.
+            if info.kind == PageObjectKind::Text {
+                let font_size = info.font_size.unwrap_or(12.0);
+                if let Some(text) = info.text.as_deref().filter(|text| !text.is_empty()) {
+                    let preview: String = text.chars().take(80).collect();
+                    ui.label(RichText::new(preview).size(12.0).color(palette.text));
+                    ui.add_space(6.0);
+                }
+                if ui
+                    .add(window_primary_button(palette, "Edit text"))
+                    .on_hover_text("Type in this block. Double-click it on the page, too")
+                    .clicked()
+                {
+                    commands.push(Command::BeginObjectTextEdit { info: info.clone() });
+                }
+                ui.add_space(8.0);
+
+                ui.group(|ui| {
+                    ui.label(hint(palette, "Text style"));
+
+                    let mut next = info.format;
+
+                    ui.horizontal(|ui| {
+                        if ui
+                            .selectable_label(next.bold, RichText::new("B").strong())
+                            .on_hover_text("Toggle bold")
+                            .clicked()
+                        {
+                            next.bold = !next.bold;
+                        }
+                        ui.add_space(8.0);
+                        ui.label(hint(palette, "Size"));
+                        // The scrub keeps its value in egui memory. Rebuilding
+                        // it from the committed size every frame throws the
+                        // drag away, so the number looks stuck.
+                        let size_key = Id::new(("text-object-size", info.id));
+                        let mut size = ctx
+                            .data(|data| data.get_temp::<f32>(size_key))
+                            .unwrap_or_else(|| next.size.unwrap_or(font_size));
+                        let size_edit = ui
+                            .add(
+                                egui::DragValue::new(&mut size)
+                                    .speed(0.5)
+                                    .range(2.0..=144.0),
+                            )
+                            .on_hover_text("Point size. Release to apply");
+                        if size_edit.dragged() {
+                            ctx.data_mut(|data| data.insert_temp(size_key, size));
+                        }
+                        if size_edit.drag_stopped()
+                            || (size_edit.changed() && size_edit.lost_focus())
+                        {
+                            ctx.data_mut(|data| data.remove::<f32>(size_key));
+                            next.size = Some(size);
+                        }
+                    });
+
+                    ui.add_space(6.0);
+
+                    // Colour: the engine cannot read a run's colour back, so
+                    // the shell is the source of truth. A swatch or the picker
+                    // sets an explicit RGBA.
+                    ui.label(hint(palette, "Colour"));
+                    ui.horizontal_wrapped(|ui| {
+                        for swatch in ANNOTATION_SWATCHES {
+                            let fill = Color32::from_rgba_unmultiplied(
+                                swatch[0], swatch[1], swatch[2], swatch[3],
+                            );
+                            let is_current =
+                                next.color.is_some_and(|color| color[0..3] == swatch[0..3]);
+                            let (rect, response) =
+                                ui.allocate_exact_size(Vec2::splat(18.0), Sense::click());
+                            ui.painter().rect_filled(rect, 4.0, fill);
+                            ui.painter().rect_stroke(
+                                rect,
+                                4.0,
+                                Stroke::new(
+                                    if is_current { 2.0 } else { 1.0 },
+                                    if is_current {
+                                        palette.text
+                                    } else {
+                                        palette.text_dim
+                                    },
+                                ),
+                                StrokeKind::Inside,
+                            );
+                            if response.clicked() {
+                                next.color = Some(swatch);
+                            }
+                        }
+                        let mut rgb = next.color.map(|c| [c[0], c[1], c[2]]).unwrap_or([0, 0, 0]);
+                        if ui
+                            .color_edit_button_srgb(&mut rgb)
+                            .on_hover_text("Custom ink colour")
+                            .changed()
+                        {
+                            next.color = Some([rgb[0], rgb[1], rgb[2], 255]);
+                        }
+                    });
+
+                    if ui
+                        .add(secondary_button(palette, "Reset style"))
+                        .on_hover_text("Put back the bold, size, and ink this text had in the PDF")
+                        .clicked()
+                    {
+                        commands.push(Command::SetPageObjectFormat {
+                            id: info.id,
+                            layout_bounds: info.layout_bounds,
+                            base_font_size: original.size.unwrap_or(font_size),
+                            previous_format: info.format,
+                            format: original,
+                        });
+                    }
+
+                    // One command for whatever changed this frame. The reducer
+                    // no-ops when `next` equals the current format, so a click on
+                    // an already-set toggle costs nothing.
+                    if next != info.format {
+                        commands.push(Command::SetPageObjectFormat {
+                            id: info.id,
+                            layout_bounds: info.layout_bounds,
+                            base_font_size: font_size,
+                            previous_format: info.format,
+                            format: next,
+                        });
+                    }
+                });
+                ui.add_space(8.0);
+            }
+
+            if info.kind == PageObjectKind::Image
+                && ui
+                    .add(secondary_button(palette, "Replace image…"))
+                    .on_hover_text("Swap the picture, keeping its place on the page")
+                    .clicked()
+            {
+                commands.push(Command::PickReplacementImage(info.id));
+            }
+
+            if ui
+                .add(secondary_button(palette, "Delete"))
+                .on_hover_text("Remove it from the page (Delete key)")
+                .clicked()
+            {
+                commands.push(Command::DeletePageObject { info: info.clone() });
+            }
+
+            if info.kind == PageObjectKind::Text {
+                ui.add_space(6.0);
+                ui.label(hint(
+                    palette,
+                    "Drag to move · handles to resize · arrows nudge · click again to edit",
+                ));
+            }
+
+            // Say plainly what cannot be taken back. An image cannot be
+            // rebuilt on undo — its pixels would have to be kept — so offering
+            // a step that silently did nothing would be worse than saying so.
+            if info.kind == PageObjectKind::Image {
+                ui.add_space(6.0);
+                ui.label(hint(
+                    palette,
+                    "Deleting or replacing an image cannot be undone.",
+                ));
+            }
+        });
+
     commands
 }

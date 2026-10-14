@@ -17,8 +17,8 @@ use std::thread::JoinHandle;
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use pdfreader_core::{
-    Document, DocumentId, ExportTarget, FormInfo, ImageFormat, ImagePageSize, PageRange, Rotation,
-    TabId,
+    Document, DocumentId, ExportTarget, FormInfo, ImageFormat, ImagePageSize, PageObjectId,
+    PageObjectInfo, PageRange, Rotation, TabId,
 };
 use pdfreader_pdf::engine::{DocumentHandle, PdfEngine, PdfiumEngine, TilePixels, TileRequest};
 use pdfreader_pdf::{DocumentInfo, EngineError, JobProgress, TextPage};
@@ -158,6 +158,19 @@ pub enum EngineRequest {
         /// RGBA bytes; the alpha byte is the rendered opacity.
         color: [u8; 4],
     },
+    /// Change an annotation's stroke weight.
+    SetAnnotationThickness {
+        /// Document to edit.
+        doc: DocumentId,
+        /// Document to edit.
+        handle: DocumentHandle,
+        /// Which annotation.
+        id: pdfreader_core::AnnotationId,
+        /// The new stroke weight, in PDF points.
+        thickness: f32,
+        /// The bounds the stroke should occupy, in PDF page space.
+        rect: pdfreader_core::Rect,
+    },
     /// Extract and search all pages of a document on the engine thread.
     Search {
         /// Document the results belong to.
@@ -186,6 +199,123 @@ pub enum EngineRequest {
         handle: DocumentHandle,
         /// Zero-based page index.
         page: u32,
+    },
+    /// List a page's editable objects, for the content editor.
+    ///
+    /// Asked for only while edit mode is on, and cached by the shell: the walk
+    /// costs a `page.objects()` pass plus a text read per text run, which is not
+    /// worth paying for a document nobody is editing.
+    PageObjects {
+        /// Document the page belongs to.
+        doc: DocumentId,
+        /// Document to read from.
+        handle: DocumentHandle,
+        /// Zero-based page index.
+        page: u32,
+    },
+    /// Move or resize one page-content object.
+    SetPageObjectBounds {
+        /// Document to edit.
+        doc: DocumentId,
+        /// Document to edit.
+        handle: DocumentHandle,
+        /// Which object.
+        id: PageObjectId,
+        /// The new bounds, in PDF page space.
+        rect: pdfreader_core::Rect,
+    },
+    /// Remove one page-content object.
+    DeletePageObject {
+        /// Document to edit.
+        doc: DocumentId,
+        /// Document to edit.
+        handle: DocumentHandle,
+        /// Which object.
+        id: PageObjectId,
+    },
+    /// Remove the page-content object matching a record.
+    DeletePageObjectMatching {
+        /// Document to edit.
+        doc: DocumentId,
+        /// Document to edit.
+        handle: DocumentHandle,
+        /// The record to match.
+        info: PageObjectInfo,
+    },
+    /// Move a page-content object within the page's paint order.
+    RestackPageObject {
+        /// Document to edit.
+        doc: DocumentId,
+        /// Document to edit.
+        handle: DocumentHandle,
+        /// The record to match.
+        info: PageObjectInfo,
+        /// Where the object lands in the paint order.
+        target: pdfreader_core::pageobj::RestackTarget,
+    },
+    /// Replace the string a page-content text object holds.
+    SetPageObjectText {
+        /// Document to edit.
+        doc: DocumentId,
+        /// Document to edit.
+        handle: DocumentHandle,
+        /// Which object.
+        id: PageObjectId,
+        /// The text undo writes back.
+        previous: String,
+        /// The new text.
+        text: String,
+        /// The run's ink box when the edit was made.
+        layout_bounds: pdfreader_core::Rect,
+        /// The original point size. A retype keeps it.
+        base_font_size: f32,
+        /// The styling the object had before the edit. Undo applies this.
+        previous_format: pdfreader_core::TextFormat,
+        /// The styling to apply to the result.
+        format: pdfreader_core::TextFormat,
+    },
+    /// Restyle a page-content text object without changing its string.
+    SetPageObjectFormat {
+        /// Document to edit.
+        doc: DocumentId,
+        /// Document to edit.
+        handle: DocumentHandle,
+        /// Which object.
+        id: PageObjectId,
+        /// The fixed page area the object sits in; a style that overflows it is refused.
+        layout_bounds: pdfreader_core::Rect,
+        /// The original unscaled font size; the shear scales with it.
+        base_font_size: f32,
+        /// The styling the object had before; undo restores this.
+        previous_format: pdfreader_core::TextFormat,
+        /// The styling to apply.
+        format: pdfreader_core::TextFormat,
+    },
+    /// Swap an image object's pixels for a file on disk.
+    ReplacePageObjectImage {
+        /// Document to edit.
+        doc: DocumentId,
+        /// Document to edit.
+        handle: DocumentHandle,
+        /// Which object.
+        id: PageObjectId,
+        /// Picture to put in it.
+        path: PathBuf,
+    },
+    /// Add a new text object to a page.
+    InsertPageObjectText {
+        /// Document to edit.
+        doc: DocumentId,
+        /// Document to edit.
+        handle: DocumentHandle,
+        /// Page to add it to.
+        page: u32,
+        /// Where the click landed, in PDF page space.
+        point: (f32, f32),
+        /// What it says.
+        text: String,
+        /// Size to draw it at, in points.
+        font_size: f32,
     },
     /// Write one page out as an image file.
     ExportPageImage {
@@ -429,6 +559,57 @@ pub enum EngineResponse {
     /// for a result that will never arrive.
     PageTextFailed {
         /// Document the page belongs to.
+        doc: DocumentId,
+        /// Zero-based page index.
+        page: u32,
+        /// Human-readable reason.
+        reason: String,
+    },
+    /// One page's editable objects, ready to hit-test against.
+    PageObjects {
+        /// Document the page belongs to.
+        doc: DocumentId,
+        /// Zero-based page index.
+        page: u32,
+        /// Editable objects in object order.
+        objects: Vec<PageObjectInfo>,
+    },
+    /// Reading a page's objects failed.
+    PageObjectsFailed {
+        /// Document the page belongs to.
+        doc: DocumentId,
+        /// Zero-based page index.
+        page: u32,
+        /// Human-readable reason.
+        reason: String,
+    },
+    /// A page's objects were changed, with the list as it now stands.
+    ///
+    /// Every mutation answers with the refreshed list rather than an
+    /// acknowledgement, because a delete or an insert renumbers the page and the
+    /// shell's cache would otherwise be wrong from that moment on.
+    PageObjectsChanged {
+        /// Document that was edited.
+        doc: DocumentId,
+        /// Zero-based page index.
+        page: u32,
+        /// The page's objects, after the change.
+        objects: Vec<PageObjectInfo>,
+    },
+    /// A text object was created, so its index is now known.
+    PageObjectInserted {
+        /// Document that was edited.
+        doc: DocumentId,
+        /// Zero-based page index.
+        page: u32,
+        /// Where it landed.
+        id: PageObjectId,
+        /// The page's objects, after the insert.
+        objects: Vec<PageObjectInfo>,
+    },
+    /// A page-object operation failed.
+    PageObjectFailed {
+        /// Document the failed operation belonged to.
         doc: DocumentId,
         /// Zero-based page index.
         page: u32,
@@ -852,6 +1033,30 @@ fn run(
                     return;
                 }
             }
+            EngineRequest::SetAnnotationThickness {
+                doc,
+                handle,
+                id,
+                thickness,
+                rect,
+            } => {
+                let response = match engine.set_annotation_thickness(handle, id, thickness, rect) {
+                    Ok(_) => match engine.annotations(handle) {
+                        Ok(annotations) => EngineResponse::Annotations { doc, annotations },
+                        Err(error) => EngineResponse::AnnotationsFailed {
+                            doc,
+                            reason: error.to_string(),
+                        },
+                    },
+                    Err(error) => EngineResponse::AnnotationsFailed {
+                        doc,
+                        reason: error.to_string(),
+                    },
+                };
+                if responses.send(response).is_err() {
+                    return;
+                }
+            }
             EngineRequest::Search {
                 doc,
                 handle,
@@ -896,6 +1101,153 @@ fn run(
                 let response = match engine.page_text(handle, page) {
                     Ok(text) => EngineResponse::PageText { doc, page, text },
                     Err(error) => EngineResponse::PageTextFailed {
+                        doc,
+                        page,
+                        reason: error.to_string(),
+                    },
+                };
+                if responses.send(response).is_err() {
+                    return;
+                }
+            }
+            EngineRequest::PageObjects { doc, handle, page } => {
+                let response = match engine.page_objects(handle, page) {
+                    Ok(objects) => EngineResponse::PageObjects { doc, page, objects },
+                    Err(error) => EngineResponse::PageObjectsFailed {
+                        doc,
+                        page,
+                        reason: error.to_string(),
+                    },
+                };
+                if responses.send(response).is_err() {
+                    return;
+                }
+            }
+            EngineRequest::SetPageObjectBounds {
+                doc,
+                handle,
+                id,
+                rect,
+            } => {
+                let outcome = engine.set_page_object_bounds(handle, id, rect);
+                let response = relisted_objects(&mut engine, doc, handle, id.page, outcome);
+                if responses.send(response).is_err() {
+                    return;
+                }
+            }
+            EngineRequest::DeletePageObject { doc, handle, id } => {
+                let outcome = engine.delete_page_object(handle, id);
+                let response = relisted_objects(&mut engine, doc, handle, id.page, outcome);
+                if responses.send(response).is_err() {
+                    return;
+                }
+            }
+            EngineRequest::DeletePageObjectMatching { doc, handle, info } => {
+                let page = info.id.page;
+                let outcome = engine.delete_page_object_matching(handle, &info);
+                let response = relisted_objects(&mut engine, doc, handle, page, outcome);
+                if responses.send(response).is_err() {
+                    return;
+                }
+            }
+            EngineRequest::RestackPageObject {
+                doc,
+                handle,
+                info,
+                target,
+            } => {
+                let page = info.id.page;
+                let outcome = engine.restack_page_object(handle, &info, target);
+                let response = relisted_objects(&mut engine, doc, handle, page, outcome);
+                if responses.send(response).is_err() {
+                    return;
+                }
+            }
+            EngineRequest::SetPageObjectText {
+                doc,
+                handle,
+                id,
+                previous,
+                text,
+                layout_bounds,
+                base_font_size,
+                previous_format,
+                format,
+            } => {
+                let outcome = engine.set_page_object_text(
+                    handle,
+                    id,
+                    &previous,
+                    &text,
+                    layout_bounds,
+                    base_font_size,
+                    previous_format,
+                    format,
+                );
+                let response = relisted_objects(&mut engine, doc, handle, id.page, outcome);
+                if responses.send(response).is_err() {
+                    return;
+                }
+            }
+            EngineRequest::SetPageObjectFormat {
+                doc,
+                handle,
+                id,
+                layout_bounds,
+                base_font_size,
+                previous_format,
+                format,
+            } => {
+                let outcome = engine.apply_page_object_format(
+                    handle,
+                    id,
+                    layout_bounds,
+                    base_font_size,
+                    previous_format,
+                    format,
+                );
+                let response = relisted_objects(&mut engine, doc, handle, id.page, outcome);
+                if responses.send(response).is_err() {
+                    return;
+                }
+            }
+            EngineRequest::ReplacePageObjectImage {
+                doc,
+                handle,
+                id,
+                path,
+            } => {
+                let outcome = engine.replace_page_object_image(handle, id, &path);
+                let response = relisted_objects(&mut engine, doc, handle, id.page, outcome);
+                if responses.send(response).is_err() {
+                    return;
+                }
+            }
+            EngineRequest::InsertPageObjectText {
+                doc,
+                handle,
+                page,
+                point,
+                text,
+                font_size,
+            } => {
+                let outcome =
+                    engine.insert_text_object(handle, page, point.0, point.1, &text, font_size);
+                let response = match outcome {
+                    Ok(id) => match engine.page_objects(handle, page) {
+                        Ok(objects) => EngineResponse::PageObjectInserted {
+                            doc,
+                            page,
+                            id,
+                            objects,
+                        },
+                        Err(error) => EngineResponse::PageObjectFailed {
+                            doc,
+                            page,
+                            reason: error.to_string(),
+                        },
+                    },
+                    Err(error) => EngineResponse::PageObjectFailed {
                         doc,
                         page,
                         reason: error.to_string(),
@@ -1127,7 +1479,38 @@ where
 }
 
 /// Turn engine metadata into a domain document.
-fn build_document(path: &std::path::Path, info: DocumentInfo) -> Document {
+/// The response for a page-object mutation: the refreshed list.
+///
+/// Every mutation answers with the page as it now stands rather than an
+/// acknowledgement, because a delete or an insert renumbers the page: the ids
+/// the shell is holding are stale from that moment, and re-reading is the only
+/// way it can catch up. `Ok(false)` — a stale id that no longer holds the
+/// expected kind — is not a failure, and re-lists for the same reason.
+fn relisted_objects(
+    engine: &mut PdfiumEngine,
+    doc: DocumentId,
+    handle: DocumentHandle,
+    page: u32,
+    outcome: Result<bool, EngineError>,
+) -> EngineResponse {
+    match outcome {
+        Ok(_) => match engine.page_objects(handle, page) {
+            Ok(objects) => EngineResponse::PageObjectsChanged { doc, page, objects },
+            Err(error) => EngineResponse::PageObjectFailed {
+                doc,
+                page,
+                reason: error.to_string(),
+            },
+        },
+        Err(error) => EngineResponse::PageObjectFailed {
+            doc,
+            page,
+            reason: error.to_string(),
+        },
+    }
+}
+
+pub(crate) fn build_document(path: &std::path::Path, info: DocumentInfo) -> Document {
     let title = path
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())
@@ -1139,6 +1522,7 @@ fn build_document(path: &std::path::Path, info: DocumentInfo) -> Document {
         title,
         pages: info.pages,
         encrypted: info.encrypted,
+        can_edit_content: info.can_edit_content,
         outline: info.outline,
     }
 }

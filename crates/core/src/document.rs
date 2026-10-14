@@ -203,6 +203,11 @@ pub struct Document {
     pub pages: Vec<PageGeometry>,
     /// Whether the file required a password to open.
     pub encrypted: bool,
+    /// Whether the document's permissions allow its content to be changed.
+    ///
+    /// Not the same as [`Self::encrypted`]: a PDF may be encrypted only to
+    /// restrict permissions, open without a password, and still be editable.
+    pub can_edit_content: bool,
     /// Bookmarks tree, if any.
     pub outline: Outline,
 }

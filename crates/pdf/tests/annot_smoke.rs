@@ -126,7 +126,9 @@ fn full_annotation_lifecycle_smoke() {
             12.0 + index as f32 * 2.0,
         );
         assert!(
-            engine.update_annotation_bounds(handle, *id, moved).expect("move"),
+            engine
+                .update_annotation_bounds(handle, *id, moved)
+                .expect("move"),
             "the id must resolve right after creation"
         );
         let list = engine.annotations(handle).expect("list");
@@ -137,7 +139,9 @@ fn full_annotation_lifecycle_smoke() {
 
         let color = [(100 + index as u8) * 2, 80, 160, 200];
         assert!(
-            engine.set_annotation_color(handle, *id, color).expect("recolor"),
+            engine
+                .set_annotation_color(handle, *id, color)
+                .expect("recolor"),
             "recolor must apply"
         );
         let list = engine.annotations(handle).expect("list");
@@ -241,7 +245,13 @@ fn full_annotation_lifecycle_smoke() {
 /// The fixture page has text on it, so the mark's own ink has to be isolated by
 /// a window and compared against a baseline render of the same window — the
 /// page content is identical in both, so any difference is the mark.
-fn window_ink(pixels: &pdfreader_pdf::engine::TilePixels, x0: usize, x1: usize, y0: usize, y1: usize) -> usize {
+fn window_ink(
+    pixels: &pdfreader_pdf::engine::TilePixels,
+    x0: usize,
+    x1: usize,
+    y0: usize,
+    y1: usize,
+) -> usize {
     let width = pixels.width as usize;
     let mut ink = 0;
     for (index, pixel) in pixels.data.chunks_exact(4).enumerate() {
@@ -287,7 +297,9 @@ fn vertical_resize_thickens_a_line_markup_and_survives_reopen() {
     let (x0, x1) = (85, 235);
     let (y0, y1) = (300, 460);
     let baseline = window_ink(
-        &engine.render_page(handle, 0, Rotation::None, 1.0).expect("render"),
+        &engine
+            .render_page(handle, 0, Rotation::None, 1.0)
+            .expect("render"),
         x0,
         x1,
         y0,
@@ -306,7 +318,9 @@ fn vertical_resize_thickens_a_line_markup_and_survives_reopen() {
     // As drawn, the mark must stay a thin underline rather than filling the
     // band it was dragged over: a 1.4pt line over 160pt is ~230px of ink.
     let drawn = window_ink(
-        &engine.render_page(handle, 0, Rotation::None, 1.0).expect("render"),
+        &engine
+            .render_page(handle, 0, Rotation::None, 1.0)
+            .expect("render"),
         x0,
         x1,
         y0,
@@ -330,7 +344,9 @@ fn vertical_resize_thickens_a_line_markup_and_survives_reopen() {
     let listed = engine.annotations(handle).expect("list");
     assert!(find_rect(&listed, grown), "the new bounds must be reported");
     let thick = window_ink(
-        &engine.render_page(handle, 0, Rotation::None, 1.0).expect("render"),
+        &engine
+            .render_page(handle, 0, Rotation::None, 1.0)
+            .expect("render"),
         x0,
         x1,
         y0,
@@ -366,14 +382,20 @@ fn vertical_resize_thickens_a_line_markup_and_survives_reopen() {
         .iter()
         .find(|a| a.kind == AnnotationKind::Underline)
         .expect("the underline must survive the reopen");
-    assert_eq!(mark.color, Some(color), "the colour must survive the reopen");
+    assert_eq!(
+        mark.color,
+        Some(color),
+        "the colour must survive the reopen"
+    );
     assert!(
         (mark.rect.height() - 114.0).abs() < 1.0,
         "the resized bounds must survive the reopen, got {:?}",
         mark.rect
     );
     let persisted = window_ink(
-        &engine.render_page(reopen, 0, Rotation::None, 1.0).expect("render"),
+        &engine
+            .render_page(reopen, 0, Rotation::None, 1.0)
+            .expect("render"),
         x0,
         x1,
         y0,
@@ -565,14 +587,23 @@ fn rename_survives_save_reopen_minimal() {
         .set_annotation_contents(handle, id, "renamed note")
         .expect("rename");
     let live = engine.annotations(handle).expect("list");
-    eprintln!("DEBUG live contents: {:?}", live.iter().find(|a| a.id == id).map(|a| &a.contents));
+    eprintln!(
+        "DEBUG live contents: {:?}",
+        live.iter().find(|a| a.id == id).map(|a| &a.contents)
+    );
 
     let bytes = engine.save_to_bytes(handle, false).expect("save");
     let out = std::env::temp_dir().join("pdfreader-smoke-rename.pdf");
     std::fs::write(&out, &bytes).expect("write");
     let (reopen, _i) = engine.open(&out, None).expect("reopen");
     let after = engine.annotations(reopen).expect("list");
-    eprintln!("DEBUG reopened contents: {:?}", after.iter().find(|a| a.kind == AnnotationKind::StickyNote).map(|a| &a.contents));
+    eprintln!(
+        "DEBUG reopened contents: {:?}",
+        after
+            .iter()
+            .find(|a| a.kind == AnnotationKind::StickyNote)
+            .map(|a| &a.contents)
+    );
     let note = after
         .iter()
         .find(|a| a.kind == AnnotationKind::StickyNote)

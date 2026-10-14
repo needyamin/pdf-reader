@@ -19,18 +19,19 @@ use egui::{
 };
 use pdfreader_core::{
     AnnotationId, AnnotationInfo, AnnotationKind, Command, Document, DocumentId, FieldId,
-    FieldValue, FormFieldType, FormInfo, NewAnnotation, Rect as PdfSpaceRect, Rotation, Tool,
-    ViewMode, ViewState,
+    FieldValue, FormFieldType, FormInfo, NewAnnotation, PageObjectId, PageObjectInfo,
+    PageObjectKind, Rect as PdfSpaceRect, Rotation, TextFormat, Tool, ViewMode, ViewState,
 };
-use pdfreader_pdf::CharRange;
 use pdfreader_pdf::annot::{MIN_MARKUP_THICKNESS, SQUIGGLY_RISE_PT, SQUIGGLY_STEP_PT};
 use pdfreader_pdf::engine::{TilePixels, TileRequest};
+use pdfreader_pdf::{CharRange, TextPage};
 use pdfreader_render::{
-    PageBox, PageSpace, TILE_SIZE, TileKey, hit_page, level_scale, tile_grid, tile_pixel_rect,
-    zoom_level,
+    PageBox, PageSpace, ScreenRect, TILE_SIZE, TileKey, hit_page, level_scale, tile_grid,
+    tile_pixel_rect, zoom_level,
 };
 
 use crate::lens::{LookupRequest, PageTextCache};
+use crate::objects::PageObjectCache;
 
 /// Logical gap between consecutive pages, in points.
 pub const PAGE_GAP: f32 = 16.0;
@@ -179,6 +180,17 @@ impl Default for FormFont {
 /// thickens the strokes visibly without smearing the letterforms; more than
 /// about half a point starts to look like a drop shadow.
 const SYNTHETIC_BOLD_OFFSET: f32 = 0.35;
+
+/// How far the pointer must travel, in screen pixels, before a press on a page
+/// object or annotation counts as a drag.
+///
+/// Below it the release is a click — which for text opens the inline editor.
+/// Comparing against an epsilon instead was the bug: a click that wobbled half
+/// a pixel committed a micro-move (an undo entry and a full page re-render)
+/// instead of typing, so clicks felt unreliable and the undo stack filled with
+/// 0.5 pt moves. Four pixels is well under anything a deliberate drag covers
+/// and well over anything a resting hand produces.
+const DRAG_THRESHOLD_PX: f32 = 4.0;
 
 impl FormFont {
     /// The egui family to draw with, falling back to the default proportional
@@ -329,6 +341,24 @@ pub struct Canvas {
     /// space. Computed every frame from the pointer; on release it is what
     /// gets committed to the store.
     ann_drag_rect: Option<PdfSpaceRect>,
+    /// An in-progress drag of a page-content object, while the content
+    /// editor is on. Drawn as a ghost until the engine re-renders the page,
+    /// for the same reason an annotation drag is.
+    obj_drag: Option<ObjDrag>,
+    /// The rectangle that drag has produced so far, in PDF page space.
+    obj_drag_rect: Option<PdfSpaceRect>,
+    /// Pages the viewport covers, plus the look-ahead, from the last draw.
+    ///
+    /// Published for the shell: it is what stops the content editor asking the
+    /// engine for every page's object list the moment edit mode opens, which on
+    /// a long document would walk the whole file to answer a question about the
+    /// two pages in front of the user.
+    visible_pages: Vec<u32>,
+    /// The inline editor for a page text object, or for a new one.
+    obj_text_edit: Option<ObjTextEdit>,
+    /// A pending content edit whose pixels have not caught up yet. See
+    /// [`EditGhost`].
+    edit_ghost: Option<EditGhost>,
     /// Whether tiles just outside the viewport are requested ahead of time.
     /// Turning this off (Settings → Performance) saves memory and bandwidth at
     /// the cost of a brief blank flash when scrolling into a new area.
@@ -396,6 +426,239 @@ impl AnnDrag {
     }
 }
 
+/// What an in-progress page-content drag is doing.
+///
+/// The content editor's twin of [`AnnDrag`], and deliberately a separate type:
+/// the two address different things — an annotation id is a `(page, index)` into
+/// the annotation list, a page object is an index into the page's own objects —
+/// and conflating them would make a stale id act on the wrong layer.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum ObjDrag {
+    /// The object is being dragged: `start` is the content-local pointer
+    /// position at press, `rect` its bounds then.
+    Move {
+        id: PageObjectId,
+        start: (f32, f32),
+        rect: PdfSpaceRect,
+    },
+    /// One of its resize handles is being dragged; the opposite corner or edge
+    /// stays fixed.
+    Resize {
+        id: PageObjectId,
+        handle: ResizeHandle,
+        rect: PdfSpaceRect,
+    },
+}
+
+impl ObjDrag {
+    fn id(self) -> PageObjectId {
+        match self {
+            ObjDrag::Move { id, .. } | ObjDrag::Resize { id, .. } => id,
+        }
+    }
+
+    fn rect(self) -> PdfSpaceRect {
+        match self {
+            ObjDrag::Move { rect, .. } | ObjDrag::Resize { rect, .. } => rect,
+        }
+    }
+}
+
+/// The inline editor for a page text object — or for a new one.
+///
+/// Held on the canvas rather than in the store for the same reason the note
+/// popup is: it is transient widget state that exists only while a field is on
+/// screen, and nothing outside this frame needs to see the half-typed text.
+struct ObjTextEdit {
+    /// `None` while inserting a new object at `point`.
+    id: Option<PageObjectId>,
+    /// Page it belongs to, or will.
+    page: u32,
+    /// Where it is, or where a new one will be placed, in PDF page space.
+    point: (f32, f32),
+    /// The text being edited.
+    text: String,
+    /// What it said before, so undo has both ends of the change.
+    previous: String,
+    /// When editing a single word, the character range it covers in `previous`.
+    ///
+    /// This is what makes a double-click edit the word under the pointer instead
+    /// of the whole line: `text` holds only that word, and the commit splices it
+    /// back so the rest of the run is untouched. `None` means the whole run is
+    /// being edited.
+    word: Option<(usize, usize)>,
+    /// Where to put the caret when the editor opens, counted in characters of
+    /// `text`. A plain click opens the whole block with the caret where the user
+    /// clicked, so typing *inserts* rather than replacing; `None` leaves the
+    /// field's own default (and a word edit selects the word instead).
+    cursor: Option<usize>,
+    /// The run's ink box when the edit opened. The engine keeps the font and
+    /// size; it does not refit the string into this box.
+    layout_bounds: PdfSpaceRect,
+    /// The original point size. A text edit keeps it, and undo writes it back.
+    base_font_size: f32,
+    /// The styling the object had when this edit opened. A pure text change
+    /// carries it unchanged to both `previous_format` and `format`; the
+    /// formatting panel applies style through a separate command.
+    format: TextFormat,
+    /// Whether the field still has to be focused on its first frame.
+    opened: bool,
+    /// Focus was lost to a control inside this box (bold, size, colour). The
+    /// editor stays open and takes the caret back on the next frame.
+    refocus: bool,
+    /// Point size while the size control is being scrubbed.
+    ///
+    /// The value the widget shows has to survive from frame to frame. Rebuilding
+    /// it from the committed format every frame throws away the drag, so the
+    /// number never moves.
+    size_draft: Option<f32>,
+}
+
+/// The text a commit asked for, drawn over the page until the re-rendered
+/// tile arrives.
+///
+/// Between pressing Enter and the engine's fresh raster reaching the screen,
+/// the page's pixels still show the previous text. Drawing the committed words
+/// as a ghost bridges that gap — the words change the instant the engine
+/// confirms the edit instead of a beat later, which is what makes typing on the
+/// canvas feel live. The same trick the drag ghost uses for moves.
+#[derive(Clone, Debug)]
+struct TextGhost {
+    /// Document the edit belongs to.
+    doc: DocumentId,
+    /// Object that was retyped.
+    id: PageObjectId,
+    /// The full text as committed (a word edit already spliced back in).
+    text: String,
+    /// The block's fixed area, in PDF page space.
+    rect: PdfSpaceRect,
+    /// Point size to draw at, in PDF points.
+    font_size: f32,
+    /// Ink colour the object carries, when the shell knows one.
+    color: Option<Color32>,
+    /// The engine confirmed the change (fresh object list arrived).
+    confirmed: bool,
+}
+
+/// The bounds a move/resize commit asked for, held until the re-rendered tile
+/// arrives.
+///
+/// Without it a dragged object visibly snaps back: the drag ghost disappears at
+/// release and the selection outline falls back to the object's *stale* cached
+/// bounds until the engine re-renders. Holding the outline at the committed
+/// rect — and hit-testing against it — keeps the object where the user left it
+/// for the whole gap.
+#[derive(Clone, Copy, Debug)]
+struct BoundsGhost {
+    /// Document the edit belongs to.
+    doc: DocumentId,
+    /// Object that was moved or resized.
+    id: PageObjectId,
+    /// The bounds the commit asked for, in PDF page space.
+    rect: PdfSpaceRect,
+    /// The engine confirmed the change (fresh object list arrived).
+    confirmed: bool,
+}
+
+/// A pending content edit whose pixels have not caught up yet.
+///
+/// The lifecycle is two-phase because two clocks are involved: the engine
+/// re-lists the page quickly (the change is real), while the re-render is
+/// slower. The ghost is *confirmed* when the fresh object list arrives, and
+/// retired when the first tile rendered after that lands — before confirmation
+/// it cannot be trusted, because a refused edit would otherwise show content
+/// that is not in the document.
+#[derive(Clone, Debug)]
+enum EditGhost {
+    /// Committed text, drawn over the stale pixels.
+    Text(TextGhost),
+    /// Committed bounds, shown as the selection outline and used for
+    /// hit-testing.
+    Bounds(BoundsGhost),
+}
+
+impl TextGhost {
+    /// Whether this ghost belongs to `doc`'s `page`.
+    fn matches(&self, doc: DocumentId, page: u32) -> bool {
+        self.doc == doc && self.id.page == page
+    }
+}
+
+impl EditGhost {
+    /// Whether this ghost belongs to `doc`'s `page`.
+    fn matches(&self, doc: DocumentId, page: u32) -> bool {
+        match self {
+            EditGhost::Text(ghost) => ghost.matches(doc, page),
+            EditGhost::Bounds(ghost) => ghost.matches(doc, page),
+        }
+    }
+
+    /// Mark the change as engine-confirmed.
+    fn confirm(&mut self) {
+        match self {
+            EditGhost::Text(ghost) => ghost.confirmed = true,
+            EditGhost::Bounds(ghost) => ghost.confirmed = true,
+        }
+    }
+
+    /// Whether the engine has confirmed the change.
+    fn confirmed(&self) -> bool {
+        match self {
+            EditGhost::Text(ghost) => ghost.confirmed,
+            EditGhost::Bounds(ghost) => ghost.confirmed,
+        }
+    }
+}
+
+impl BoundsGhost {
+    /// Whether this ghost belongs to `doc`'s `page`.
+    fn matches(&self, doc: DocumentId, page: u32) -> bool {
+        self.doc == doc && self.id.page == page
+    }
+}
+
+/// What the content editor needs from the shell.
+///
+/// Grouped into one argument because the feature would otherwise add three
+/// parameters to a function that already takes fifteen, and because every
+/// caller with the editor switched off — which is every test, and most frames —
+/// can then pass one inert value.
+pub struct ContentEdit<'a> {
+    /// Whether the canvas is in content-edit mode.
+    pub editing: bool,
+    /// The objects of the pages on screen, as last read from the engine.
+    pub objects: &'a PageObjectCache,
+    /// The object the user has selected, if any.
+    pub selected: Option<PageObjectId>,
+}
+
+impl ContentEdit<'_> {
+    /// The inert view: editing off, nothing selected, nothing known.
+    ///
+    /// Only the tests need it — the shell always has a real cache to hand — but
+    /// it lives here rather than in the test module so the nineteen call sites
+    /// stay one line each.
+    #[cfg(test)]
+    pub fn none() -> ContentEdit<'static> {
+        ContentEdit {
+            editing: false,
+            objects: empty_object_cache(),
+            selected: None,
+        }
+    }
+}
+
+/// A cache that was never filled, for [`ContentEdit::none`].
+///
+/// A `static` rather than a `const` because the cache holds maps, and shared
+/// rather than allocated per call because `none()` runs on every frame that is
+/// not editing.
+#[cfg(test)]
+fn empty_object_cache() -> &'static PageObjectCache {
+    static EMPTY: std::sync::OnceLock<PageObjectCache> = std::sync::OnceLock::new();
+    EMPTY.get_or_init(PageObjectCache::default)
+}
+
 /// Which resize handle of a selected annotation is being dragged.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ResizeHandle {
@@ -412,6 +675,12 @@ enum ResizeHandle {
 /// The smallest allowed width or height of a resized annotation, in PDF
 /// points. Below this a drag would collapse the mark into an invisible line.
 const MIN_ANN_SIZE: f32 = 8.0;
+
+/// How far from a glyph a double-click still counts as being on that word.
+///
+/// Matches the text selection's own tolerance: clicking just past the end of a
+/// word should edit that word, not nothing.
+const WORD_PICK_TOLERANCE_PT: f32 = 6.0;
 
 impl Default for Canvas {
     fn default() -> Self {
@@ -459,6 +728,11 @@ impl Canvas {
             erase_last: None,
             ann_drag: None,
             ann_drag_rect: None,
+            obj_drag: None,
+            obj_drag_rect: None,
+            visible_pages: Vec::new(),
+            obj_text_edit: None,
+            edit_ghost: None,
             pressing_page: false,
             prefetch: true,
             form_font: FormFont::default(),
@@ -513,6 +787,11 @@ impl Canvas {
     /// Empty before the first draw. Callers convert an egui pointer position
     /// into document coordinates by subtracting the canvas origin, then feed it
     /// to `PageSpace::to_page`.
+    /// Page indices the viewport covered on the last draw.
+    pub fn visible_pages(&self) -> &[u32] {
+        &self.visible_pages
+    }
+
     pub fn page_spaces(&self) -> &[PageSpace] {
         &self.page_spaces
     }
@@ -537,6 +816,7 @@ impl Canvas {
     pub fn forget_edits(&mut self) {
         self.field_drafts.clear();
         self.open_editor = None;
+        self.obj_text_edit = None;
         self.edits.clear();
         // A drag in progress when the document switched must not commit onto
         // the new document: the start point is in the old document's space.
@@ -657,6 +937,207 @@ impl Canvas {
             .retain(|(d, _, p)| !(*d == doc && *p == page));
         self.thumb_failed
             .retain(|(d, _, p)| !(*d == doc && *p == page));
+    }
+
+    /// Stage the text a commit asked for, to be drawn over the page until the
+    /// re-rendered tile arrives. See [`EditGhost`].
+    pub fn stage_text_ghost(
+        &mut self,
+        doc: DocumentId,
+        id: PageObjectId,
+        text: String,
+        rect: PdfSpaceRect,
+        font_size: f32,
+        color: Option<Color32>,
+    ) {
+        self.edit_ghost = Some(EditGhost::Text(TextGhost {
+            doc,
+            id,
+            text,
+            rect,
+            font_size,
+            color,
+            confirmed: false,
+        }));
+    }
+
+    /// Stage the bounds a move/resize commit asked for, so the selection
+    /// outline and hit-testing stay at the committed spot until the re-rendered
+    /// tile arrives. See [`EditGhost`].
+    pub fn stage_bounds_ghost(&mut self, doc: DocumentId, id: PageObjectId, rect: PdfSpaceRect) {
+        self.edit_ghost = Some(EditGhost::Bounds(BoundsGhost {
+            doc,
+            id,
+            rect,
+            confirmed: false,
+        }));
+    }
+
+    /// The engine re-listed a page's objects, so any pending edit on that page
+    /// was accepted: confirm the ghost, letting the next fresh tile retire it.
+    pub fn page_objects_refreshed(&mut self, doc: DocumentId, page: u32) {
+        if let Some(ghost) = &mut self.edit_ghost
+            && ghost.matches(doc, page)
+        {
+            ghost.confirm();
+        }
+    }
+
+    /// A page-content edit was refused. Drop the ghost, which would otherwise
+    /// show content that is not in the document.
+    pub fn page_object_edit_failed(&mut self, doc: DocumentId, page: u32) {
+        if self
+            .edit_ghost
+            .as_ref()
+            .is_some_and(|ghost| ghost.matches(doc, page))
+        {
+            self.edit_ghost = None;
+        }
+    }
+
+    /// A freshly rendered tile arrived for a page. Retires a confirmed ghost —
+    /// the real pixels now show the committed content.
+    pub fn tile_rendered(&mut self, doc: DocumentId, page: u32) {
+        if self
+            .edit_ghost
+            .as_ref()
+            .is_some_and(|ghost| ghost.matches(doc, page) && ghost.confirmed())
+        {
+            self.edit_ghost = None;
+        }
+    }
+
+    /// The bounds a committed move/resize asked for, while the ghost for that
+    /// object is still bridging the re-render gap. `None` once retired or for
+    /// anything else — callers fall back to the object's cached bounds.
+    fn ghost_bounds(&self, doc: DocumentId, id: PageObjectId) -> Option<PdfSpaceRect> {
+        match &self.edit_ghost {
+            Some(EditGhost::Bounds(ghost)) if ghost.doc == doc && ghost.id == id => {
+                Some(ghost.rect)
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether a text ghost is being drawn over `page`. Test seam.
+    #[cfg(test)]
+    pub(crate) fn shows_text_ghost(&self, doc: DocumentId, page: u32) -> bool {
+        self.edit_ghost
+            .as_ref()
+            .is_some_and(|ghost| ghost.matches(doc, page))
+    }
+
+    /// Open the inline editor on a text object.
+    ///
+    /// Used by the Text object panel's Edit button. A canvas click on an
+    /// already-selected run does the same thing.
+    pub fn begin_text_edit(&mut self, info: &PageObjectInfo) {
+        if info.kind != PageObjectKind::Text {
+            return;
+        }
+        let run = info.text.clone().unwrap_or_default();
+        let end = run.chars().count();
+        self.obj_drag = None;
+        self.obj_drag_rect = None;
+        self.obj_text_edit = Some(ObjTextEdit {
+            id: Some(info.id),
+            page: info.id.page,
+            point: (info.bounds.min_x, info.bounds.min_y),
+            text: run.clone(),
+            previous: run,
+            word: None,
+            cursor: Some(end),
+            layout_bounds: info.layout_bounds,
+            base_font_size: info.font_size.unwrap_or(12.0),
+            format: info.format,
+            opened: true,
+            refocus: false,
+            size_draft: None,
+        });
+    }
+
+    /// Close the inline text editor without writing its draft.
+    ///
+    /// Used when Undo or Redo is clicked. A click on those buttons also makes
+    /// the field lose focus, and that blur would commit the draft in the same
+    /// frame — putting the edit straight back and making the click look dead.
+    pub fn discard_text_edit(&mut self) {
+        self.obj_text_edit = None;
+        self.obj_drag = None;
+        self.obj_drag_rect = None;
+        // The blur already staged a ghost of the draft. The history step is
+        // what should show, not that unsent text.
+        if matches!(self.edit_ghost, Some(EditGhost::Text(_))) {
+            self.edit_ghost = None;
+        }
+    }
+
+    /// Whether the inline content editor is open, focused or not.
+    ///
+    /// egui only reports the *focused* widget, and the editor keeps existing
+    /// (open, showing its draft) while the pointer does other things — so the
+    /// shell asks here rather than trusting focus alone when deciding whether a
+    /// keystroke belongs to the editor.
+    pub fn has_inline_editor(&self) -> bool {
+        self.obj_text_edit.is_some()
+    }
+
+    /// Turn a finished inline edit into its command, staging the text ghost so
+    /// the committed words appear the moment the engine confirms.
+    ///
+    /// `commit` is `false` for Escape — a discard. An empty draft is also a
+    /// discard: writing an empty run would leave an invisible object on the
+    /// page with nothing to select it by.
+    fn finish_object_text_edit(
+        &mut self,
+        doc: DocumentId,
+        edit: ObjTextEdit,
+        commit: bool,
+    ) -> Option<Command> {
+        let text = edit.text.trim().to_string();
+        if !commit || text.is_empty() {
+            return None;
+        }
+        let command = match edit.id {
+            Some(id) => {
+                let applied = match edit.word {
+                    Some((start, end)) => splice(&edit.previous, start, end, &text),
+                    None => text.clone(),
+                };
+                self.stage_text_ghost(
+                    doc,
+                    id,
+                    applied,
+                    edit.layout_bounds,
+                    edit.format.size.unwrap_or(edit.base_font_size),
+                    edit.format
+                        .color
+                        .map(|c| Color32::from_rgb(c[0], c[1], c[2])),
+                );
+                Command::SetPageObjectText {
+                    id,
+                    // A word edit puts the new word back where the old one
+                    // was, so the rest of the line is left exactly as it was.
+                    previous: edit.previous.clone(),
+                    text: match edit.word {
+                        Some((start, end)) => splice(&edit.previous, start, end, &text),
+                        None => text,
+                    },
+                    layout_bounds: edit.layout_bounds,
+                    base_font_size: edit.base_font_size,
+                    // A pure text change does not alter styling, so both
+                    // formats are the object's current style.
+                    previous_format: edit.format,
+                    format: edit.format,
+                }
+            }
+            None => Command::InsertPageObjectText {
+                page: edit.page,
+                point: edit.point,
+                text,
+            },
+        };
+        Some(command)
     }
 
     /// Store a rasterized tile, evicting the oldest if the cache is full.
@@ -838,6 +1319,9 @@ impl Canvas {
         selected: Option<FieldId>,
         accent: Color32,
         tool: Tool,
+        // Content-editing inputs, grouped so the feature is one argument rather
+        // than three. Inert unless the editor is on.
+        editor: ContentEdit<'_>,
         page_text: &PageTextCache,
         // Every annotation on the document, so placed notes stay visible and
         // clickable after the page re-renders.
@@ -997,16 +1481,12 @@ impl Canvas {
             // fighting the other `self` borrows in this closure. Written back
             // at the end of the frame.
             let mut note_input = self.note_input.take();
+            let mut obj_text_edit = self.obj_text_edit.take();
             let (_, page_area) = ui.allocate_exact_size(content, Sense::click_and_drag());
             let painter = ui.painter().clone();
 
-            // A press on the current selection's resize handle edits that mark
-            // instead of drawing a new one — even while an annotation tool is
-            // armed — so a freshly drawn annotation can be resized without
-            // switching back to Select first. Only the *handles* take priority:
-            // a press on the body still draws, so the armed tool can keep
-            // placing marks.
             let handle_press = !self.pan_tool
+                && !editor.editing
                 && ui.input(|i| i.pointer.latest_pos()).is_some_and(|pos| {
                     let local = pos2(pos.x - content_origin.x, pos.y - content_origin.y);
                     selected_annotation
@@ -1045,13 +1525,503 @@ impl Canvas {
                     .is_some_and(|top| top != ui.layer_id())
             });
 
+            // A press on the selection — its body, a resize handle, or a note
+            // card — keeps adjustment mode. A press anywhere else on the
+            // canvas leaves it: the selection drops and this gesture does not
+            // also start a new mark, so the click reads as "I'm done" rather
+            // than as another shape. The next press, with nothing selected,
+            // draws again. A press on a floating control (the properties
+            // window, a note popup) is not this gesture.
+            let pointer_now = ui.input(|i| i.pointer.clone());
+            let press_in_view = pointer_now.primary_pressed()
+                && !self.pan_tool
+                && !editor.editing
+                && !over_float
+                && pointer_now
+                    .latest_pos()
+                    .is_some_and(|pos| ui.clip_rect().contains(pos));
+            let press_at = press_in_view
+                .then(|| pointer_now.interact_pos().or(pointer_now.latest_pos()))
+                .flatten();
+            let on_selected_controls = press_at.is_some_and(|pos| {
+                selected_annotation.is_some_and(|sel| {
+                    on_selected_controls(
+                        &painter,
+                        &page_spaces,
+                        annotations,
+                        sel,
+                        pos2(pos.x - content_origin.x, pos.y - content_origin.y),
+                        pos,
+                        content_origin,
+                    )
+                })
+            });
+            // Placing a note owns the click (it commits the popup). Don't also
+            // treat that click as leaving adjustment.
+            let dismiss_adjustment = press_at.is_some()
+                && selected_annotation.is_some()
+                && !on_selected_controls
+                && note_input.is_none();
+
+            // Content editing owns the gesture while it is on. The annotate
+            // tools are dimmed in the toolbar and every block below is gated
+            // off, so this is the only thing that reacts to a press — which is
+            // what stops a half-armed mark from being drawn under the pointer
+            // while the user is moving a heading.
+            if editor.editing {
+                let pointer = ui.input(|i| i.pointer.clone());
+                let in_view = pointer
+                    .latest_pos()
+                    .is_some_and(|pos| ui.clip_rect().contains(pos));
+                let local = pointer
+                    .interact_pos()
+                    .or_else(|| pointer.latest_pos())
+                    .map(|pos| pos2(pos.x - content_origin.x, pos.y - content_origin.y));
+
+                if pointer.primary_pressed()
+                    && in_view
+                    && !over_float
+                    && let Some(local) = local
+                {
+                    // A press on a handle of the current selection resizes it,
+                    // ahead of everything else, so an object can be adjusted
+                    // without having to be reselected first. A just-moved object
+                    // sits at its ghost bounds until the engine re-renders, so
+                    // the handles follow those, not the stale cached ones.
+                    let on_handle = editor
+                        .selected
+                        .and_then(|sel| {
+                            object_info(editor.objects, doc.id, sel)
+                                .zip(page_spaces.iter().find(|sp| sp.index == sel.page))
+                        })
+                        .and_then(|(info, space)| {
+                            let bounds = self
+                                .ghost_bounds(doc.id, info.id)
+                                .unwrap_or(info.bounds);
+                            handle_hit(space, bounds, local).map(|handle| (info, bounds, handle))
+                        });
+
+                    if let Some((info, bounds, handle)) = on_handle {
+                        self.obj_drag = Some(ObjDrag::Resize {
+                            id: info.id,
+                            handle,
+                            rect: bounds,
+                        });
+                    } else {
+                        match object_hit(editor.objects, &page_spaces, doc.id, local) {
+                            Some(info) => {
+                                if editor.selected != Some(info.id) {
+                                    self.edits.push(Command::SelectPageObject(Some(info.id)));
+                                }
+                                let bounds = self
+                                    .ghost_bounds(doc.id, info.id)
+                                    .unwrap_or(info.bounds);
+                                self.obj_drag = Some(ObjDrag::Move {
+                                    id: info.id,
+                                    start: (local.x, local.y),
+                                    rect: bounds,
+                                });
+                            }
+                            None => {
+                                // The cache still holds the object's *old*
+                                // bounds right after a move, so a click at the
+                                // new spot would miss and drop the selection.
+                                // The ghost knows where the object really is.
+                                // The ghost rect is in PDF points. The pointer
+                                // is in layout pixels, so the hit test has to
+                                // project the rect first — comparing them raw
+                                // misses the object where the user just put it.
+                                let ghost_hit = match &self.edit_ghost {
+                                    Some(EditGhost::Bounds(bounds)) if bounds.doc == doc.id => {
+                                        page_spaces.iter().find(|sp| sp.index == bounds.id.page).and_then(|space| {
+                                            let screen = space.to_screen(bounds.rect);
+                                            let hit = Rect::from_min_size(
+                                                pos2(screen.x, screen.y),
+                                                vec2(screen.w.max(1.0), screen.h.max(1.0)),
+                                            );
+                                            hit.contains(local).then_some(bounds.id)
+                                        })
+                                    }
+                                    _ => None,
+                                };
+                                if let Some(id) = ghost_hit {
+                                    if editor.selected != Some(id) {
+                                        self.edits.push(Command::SelectPageObject(Some(id)));
+                                    }
+                                    let bounds = self
+                                        .ghost_bounds(doc.id, id)
+                                        .unwrap_or_default();
+                                    self.obj_drag = Some(ObjDrag::Move {
+                                        id,
+                                        start: (local.x, local.y),
+                                        rect: bounds,
+                                    });
+                                } else if editor.selected.is_some() {
+                                    // Bare page: drop the selection.
+                                    self.edits.push(Command::SelectPageObject(None));
+                                }
+                            }
+                        }
+                    }
+                    // The press is an edit gesture, not a click on the page.
+                    self.clicked_at = None;
+                }
+
+                // A double-click edits the words of a text object, or starts a
+                // new one on bare page. Both open the same inline field, which
+                // is why they are one gesture rather than two tools.
+                if pointer.button_double_clicked(egui::PointerButton::Primary)
+                    && in_view
+                    && !over_float
+                    && let Some(local) = local
+                {
+                    let hit = object_hit(editor.objects, &page_spaces, doc.id, local);
+                    let space = hit_page(&page_spaces, (local.x, local.y));
+                    match (hit, space) {
+                        // Existing words: edit the one under the pointer.
+                        //
+                        // Not the whole run: a run is a *line*, and opening the
+                        // line means typing replaces all of it — which is not
+                        // what any other editor does when you double-click a
+                        // word, and is how a single keystroke can destroy a
+                        // sentence.
+                        (Some(info), _) if info.kind == PageObjectKind::Text => {
+                            self.edits.push(Command::SelectPageObject(Some(info.id)));
+                            let run = info.text.clone().unwrap_or_default();
+                            let picked = space
+                                .map(|space| space.to_page((local.x, local.y)))
+                                .and_then(|point| {
+                                    page_text.get(doc.id, info.id.page).and_then(|text| {
+                                        word_span(&run, info.bounds, text, point)
+                                    })
+                                });
+                            let (text, word) = match picked {
+                                Some((start, end, word)) => (word, Some((start, end))),
+                                // No word under the pointer — edit the run, so
+                                // the gesture still does something.
+                                None => (run.clone(), None),
+                            };
+                            obj_text_edit = Some(ObjTextEdit {
+                                id: Some(info.id),
+                                page: info.id.page,
+                                point: (info.bounds.min_x, info.bounds.min_y),
+                                text,
+                                previous: run,
+                                word,
+                                cursor: None,
+                                layout_bounds: info.layout_bounds,
+                                base_font_size: info.font_size.unwrap_or(12.0),
+                                format: info.format,
+                                opened: true,
+                                refocus: false,
+                                size_draft: None,
+                            });
+                            self.obj_drag = None;
+                        }
+                        // Bare page: put new text where the click landed.
+                        (None, Some(space)) => {
+                            let (px, py) = space.to_page((local.x, local.y));
+                            obj_text_edit = Some(ObjTextEdit {
+                                id: None,
+                                page: space.index,
+                                point: (px, py),
+                                text: String::new(),
+                                previous: String::new(),
+                                word: None,
+                                cursor: None,
+                                layout_bounds: PdfSpaceRect::default(),
+                                base_font_size: 12.0,
+                                format: TextFormat::default(),
+                                opened: true,
+                                refocus: false,
+                                size_draft: None,
+                            });
+                            self.obj_drag = None;
+                        }
+                        _ => {}
+                    }
+                    self.clicked_at = None;
+                }
+
+                if let Some(drag) = self.obj_drag {
+                    // The page this object lives on. Move and resize are in PDF
+                    // points (y up, scaled by zoom), so the pointer is converted
+                    // before it is applied — the same conversion annotation
+                    // drags use. Adding the raw pixel delta flips vertical moves
+                    // and ignores zoom.
+                    let space = page_spaces
+                        .iter()
+                        .find(|sp| sp.index == drag.id().page)
+                        .copied();
+                    if let (Some(local), Some(space)) = (local, space) {
+                        // A press becomes a drag only once the pointer has
+                        // travelled a real distance: a click that wobbles a
+                        // pixel must open the editor, not commit a micro-move
+                        // (undo entry + full page re-render). Content-local
+                        // space is a pure screen translation, so this is a
+                        // true screen-space test. Resize drags are exempt —
+                        // a handle press is already deliberate.
+                        let past_threshold = match drag {
+                            ObjDrag::Move { start, .. } => {
+                                (local.x - start.0).hypot(local.y - start.1) > DRAG_THRESHOLD_PX
+                            }
+                            ObjDrag::Resize { .. } => true,
+                        };
+                        let target = past_threshold.then(|| match drag {
+                            ObjDrag::Move { start, rect, .. } => {
+                                let anchor = space.to_page(start);
+                                let now = space.to_page((local.x, local.y));
+                                PdfSpaceRect::from_xywh(
+                                    rect.min_x + (now.0 - anchor.0),
+                                    rect.min_y + (now.1 - anchor.1),
+                                    rect.width(),
+                                    rect.height(),
+                                )
+                            }
+                            ObjDrag::Resize { handle, rect, .. } => {
+                                resize_rect(rect, handle, space.to_page((local.x, local.y)))
+                            }
+                        });
+                        self.obj_drag_rect = target;
+                    }
+
+                    if pointer.primary_down() {
+                        // A ghost at the target: the page's own pixels still
+                        // show the object where it was until the engine
+                        // re-renders, and without this it would appear to snap
+                        // back for a few frames.
+                        if let (Some(rect), Some(space)) = (self.obj_drag_rect, space) {
+                            let screen = space.to_screen(rect);
+                            let ghost = Rect::from_min_size(
+                                pos2(screen.x, screen.y),
+                                vec2(screen.w.max(1.0), screen.h.max(1.0)),
+                            )
+                            .translate(content_origin.to_vec2());
+                            painter.rect_filled(
+                                ghost,
+                                2.0,
+                                Color32::from_rgba_unmultiplied(
+                                    accent.r(),
+                                    accent.g(),
+                                    accent.b(),
+                                    40,
+                                ),
+                            );
+                            painter.rect_stroke(
+                                ghost,
+                                2.0,
+                                Stroke::new(1.5, accent),
+                                StrokeKind::Outside,
+                            );
+                            if matches!(drag, ObjDrag::Resize { .. }) {
+                                draw_size_readout(
+                                    &painter,
+                                    ghost.right_bottom() + vec2(8.0, 8.0),
+                                    &format!("{:.0} × {:.0} pt", rect.width(), rect.height()),
+                                    accent,
+                                );
+                            }
+                        }
+                    } else {
+                        // Release: the drag rectangle only exists once the
+                        // pointer crossed the threshold, so a click that
+                        // merely selected an object records no undo step.
+                        self.obj_drag = None;
+                        match self.obj_drag_rect.take() {
+                            Some(rect) => {
+                                let before = drag.rect();
+                                let moved = (before.min_x - rect.min_x).abs() > f32::EPSILON
+                                    || (before.min_y - rect.min_y).abs() > f32::EPSILON
+                                    || (before.max_x - rect.max_x).abs() > f32::EPSILON
+                                    || (before.max_y - rect.max_y).abs() > f32::EPSILON;
+                                if moved {
+                                    // Hold the outline (and hit-testing) at the
+                                    // committed rect until the engine confirms
+                                    // and re-renders — without this the object
+                                    // visibly snaps back to its stale cached
+                                    // bounds for the whole render gap.
+                                    self.stage_bounds_ghost(doc.id, drag.id(), rect);
+                                    self.edits.push(Command::SetPageObjectBounds {
+                                        id: drag.id(),
+                                        previous: before,
+                                        rect,
+                                    });
+                                }
+                                // An armed-but-unmoved resize commits nothing.
+                            }
+                            None => {
+                                // Never crossed the threshold: a click, not a
+                                // move. The first click only selects. Opening
+                                // the editor on that click covers the glyphs,
+                                // so the drag the user starts next never
+                                // reaches the block. The second click — the
+                                // object was already selected when this press
+                                // began — opens the editor on the whole run,
+                                // with the caret where the pointer landed and
+                                // nothing pre-selected. Double-click still
+                                // edits immediately, including a single word.
+                                if editor.selected == Some(drag.id())
+                                    && let ObjDrag::Move { id, start, .. } = drag
+                                    && let Some(info) = object_info(editor.objects, doc.id, id)
+                                    && info.kind == PageObjectKind::Text
+                                    && let Some(space) =
+                                        page_spaces.iter().find(|sp| sp.index == id.page)
+                                {
+                                        let (px, py) = space.to_page(start);
+                                        let run = info.text.clone().unwrap_or_default();
+                                        // The word under the pointer supplies only
+                                        // the caret position; the editor holds the
+                                        // entire run.
+                                        let clicked_word = page_text
+                                            .get(doc.id, id.page)
+                                            .and_then(|text| {
+                                                word_span(&run, info.bounds, text, (px, py))
+                                            });
+                                        let end = run.chars().count();
+                                        obj_text_edit = Some(ObjTextEdit {
+                                            id: Some(info.id),
+                                            page: info.id.page,
+                                            point: (info.bounds.min_x, info.bounds.min_y),
+                                            text: run.clone(),
+                                            previous: run,
+                                            word: None,
+                                            cursor: Some(
+                                                clicked_word.map_or(end, |(at, _, _)| at),
+                                            ),
+                                            layout_bounds: info.layout_bounds,
+                                            base_font_size: info.font_size.unwrap_or(12.0),
+                                            format: info.format,
+                                            opened: true,
+                                            refocus: false,
+                                            size_draft: None,
+                                        });
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // The ghost of a just-committed text edit, drawn over the page's
+                // still-stale pixels so the words change the instant the engine
+                // confirms instead of when the re-render lands. Cleared by the
+                // shell once a fresh tile arrives (or an edit is refused).
+                // (A bounds ghost is not drawn here: it shows through the
+                // selection outline below, which rides it.)
+                if editor.editing
+                    && let Some(EditGhost::Text(ghost)) = &self.edit_ghost
+                    && ghost.doc == doc.id
+                    && let Some(space) = page_spaces.iter().find(|sp| sp.index == ghost.id.page)
+                {
+                    // `min_y` is the bottom of the ink. Drawing downward from
+                    // there puts the ghost under the glyphs. The screen rect's
+                    // top-left is where the run actually starts.
+                    let screen = space.to_screen(ghost.rect);
+                    let ghost_px = (ghost.font_size * space.zoom).clamp(8.0, 96.0).round();
+                    painter.text(
+                        pos2(
+                            screen.x + content_origin.x,
+                            screen.y + content_origin.y,
+                        ),
+                        egui::Align2::LEFT_TOP,
+                        &ghost.text,
+                        egui::FontId::proportional(ghost_px),
+                        ghost.color.unwrap_or(Color32::BLACK),
+                    );
+                }
+
+                // The selected object: an accent outline plus resize handles,
+                // following the live rectangle mid-drag so the grip the user
+                // started from never disappears.
+                if let Some(sel) = editor.selected
+                    && let Some(info) = object_info(editor.objects, doc.id, sel)
+                    && let Some(space) = page_spaces.iter().find(|sp| sp.index == sel.page)
+                {
+                    let dragging = self.obj_drag.is_some();
+                    // Mid-drag the live rectangle wins; right after a commit the
+                    // bounds ghost does — the cached bounds are stale until the
+                    // engine re-renders, and falling back to them is exactly the
+                    // snap-back this exists to prevent.
+                    let rect = self
+                        .obj_drag_rect
+                        .filter(|_| dragging)
+                        .or_else(|| self.ghost_bounds(doc.id, sel))
+                        .unwrap_or(info.bounds);
+                    let screen = space.to_screen(rect);
+                    let outline = Rect::from_min_size(
+                        pos2(screen.x, screen.y),
+                        vec2(screen.w.max(1.0), screen.h.max(1.0)),
+                    )
+                    .translate(content_origin.to_vec2());
+                    if !dragging {
+                        painter.rect_stroke(
+                            outline,
+                            2.0,
+                            Stroke::new(1.4, accent),
+                            StrokeKind::Outside,
+                        );
+                    }
+                    let hovered = if dragging {
+                        None
+                    } else {
+                        local.and_then(|local| handle_hit(space, rect, local))
+                    };
+                    for (index, point) in handle_points(outline).into_iter().enumerate() {
+                        let hot = hovered.is_some_and(|handle| handle_index(handle) == index);
+                        let side = if hot { 9.0 } else { 7.0 };
+                        let cell = Rect::from_center_size(point, vec2(side, side));
+                        painter.rect_filled(cell, 1.5, if hot { accent } else { Color32::WHITE });
+                        painter.rect_stroke(
+                            cell,
+                            1.5,
+                            Stroke::new(1.0, accent),
+                            StrokeKind::Inside,
+                        );
+                    }
+                }
+
+                // A page with nothing to edit looks exactly like a broken
+                // editor, so say so. Held back until every page on screen has
+                // been read, or the notice would flash while the lists are
+                // still arriving.
+                let visible: Vec<u32> = page_spaces.iter().map(|sp| sp.index).collect();
+                let all_read = visible
+                    .iter()
+                    .all(|page| editor.objects.get(doc.id, *page).is_some());
+                let all_empty = visible.iter().all(|page| {
+                    editor.objects
+                        .get(doc.id, *page)
+                        .is_some_and(<[_]>::is_empty)
+                });
+                if !visible.is_empty() && all_read && all_empty {
+                    let clip = ui.clip_rect();
+                    let galley = painter.layout_no_wrap(
+                        "No editable text or images on this page".to_owned(),
+                        egui::FontId::proportional(12.0),
+                        accent,
+                    );
+                    let pad = vec2(10.0, 6.0);
+                    let at = pos2(
+                        clip.center().x - galley.size().x / 2.0,
+                        clip.top() + 18.0,
+                    );
+                    painter.rect_filled(
+                        Rect::from_min_size(at - pad, galley.size() + pad * 2.0),
+                        4.0,
+                        background,
+                    );
+                    painter.galley(at, galley, accent);
+                }
+            }
+
             // Annotation tools: the shape appears on the very first frame of
             // the press and follows the pointer live; releasing commits it.
             // Raw pointer state rather than the page area's drag flags — with
             // Sense::click_and_drag those are postponed until the pointer has
             // moved a bit (egui is deciding click vs drag), which read as a
             // delay before anything appeared.
-            if let Some(kind) = tool.annotation_kind() {
+            if let Some(kind) = tool.annotation_kind()
+                && !editor.editing
+            {
                 let pointer = ui.input(|i| i.pointer.clone());
                 let in_view = pointer
                     .latest_pos()
@@ -1084,7 +2054,10 @@ impl Canvas {
                             );
                         }
                     }
-                    if note_input.is_none() {
+                    // On the mark being adjusted, or on the click that leaves
+                    // adjustment, do not start a shape. A blank click must
+                    // exit adjustment rather than place another mark on top.
+                    if note_input.is_none() && !dismiss_adjustment && !on_selected_controls {
                         if let Some(pos) = pointer.interact_pos() {
                             let local = (pos.x - content_origin.x, pos.y - content_origin.y);
                             if let Some(space) = page_spaces.iter().find(|sp| {
@@ -1240,7 +2213,7 @@ impl Canvas {
             //
             // `!over_float` keeps a click inside the properties window from
             // grabbing whatever mark happens to sit behind the window.
-            if !self.pan_tool {
+            if !self.pan_tool && !editor.editing {
                 let pointer = ui.input(|i| i.pointer.clone());
                 let in_view = pointer
                     .latest_pos()
@@ -1321,18 +2294,17 @@ impl Canvas {
                             self.clicked_at = None;
                         }
 
-                        // A press on bare paper — not on a handle, not on a
-                        // mark — is the canvas's own "I am done here". The
-                        // properties window is a floating panel now, one the
-                        // user can drag anywhere over the page, so it needs the
-                        // gesture every floating panel has: a click anywhere
-                        // else puts it away. Presses that land on the panel
-                        // never get this far (`over_float` above), and only the
-                        // panel's Apply writes a staged edit, so a stray click
-                        // cannot lose one.
-                        if !started && view.properties_panel_open {
+                        // Bare paper, the margin, or any other spot that is not
+                        // this mark or its controls: leave adjustment. That
+                        // clears the selection, which also hides the handles
+                        // and the properties window. A press on the mark, a
+                        // handle, or the properties window never gets here.
+                        if !started && dismiss_adjustment {
                             self.edits
-                                .push(Command::SetPropertiesPanel { open: false });
+                                .push(Command::SelectAnnotationInPlace(None));
+                            // The release must not fall through to the note-card
+                            // click path and select something else.
+                            self.clicked_at = None;
                         }
                     }
                 }
@@ -1348,6 +2320,7 @@ impl Canvas {
             if tool.annotation_kind().is_none()
                 && !self.pan_tool
                 && tool != Tool::Eraser
+                && !editor.editing
                 && self.ann_drag.is_none()
             {
                 let pointer = ui.input(|i| i.pointer.clone());
@@ -1430,6 +2403,20 @@ impl Canvas {
                 viewport
             };
             let center = viewport.center();
+
+            // The pages this frame will draw, published for the shell's object
+            // request loop.
+            self.visible_pages = page_spaces
+                .iter()
+                .filter(|space| {
+                    Rect::from_min_size(
+                        pos2(space.origin.0, space.origin.1),
+                        vec2(space.size.0, space.size.1),
+                    )
+                    .intersects(prefetch)
+                })
+                .map(|space| space.index)
+                .collect();
 
             for pb in &boxes {
                 let page_rect_local = Rect::from_min_size(pos2(pb.x, pb.y), vec2(pb.w, pb.h));
@@ -1695,7 +2682,17 @@ impl Canvas {
                 ) {
                     let local = (pos.x - content_origin.x, pos.y - content_origin.y);
                     let start_pdf = space.to_page(local);
-                    let new = match drag {
+                    // Same rule as page objects: a move becomes a drag only
+                    // once the pointer has travelled a real distance, so a
+                    // wobbly click on a mark never commits a micro-nudge.
+                    // Resize drags are exempt — a handle press is deliberate.
+                    let past_threshold = match drag {
+                        AnnDrag::Move { start, .. } => {
+                            (local.0 - start.0).hypot(local.1 - start.1) > DRAG_THRESHOLD_PX
+                        }
+                        AnnDrag::Resize { .. } => true,
+                    };
+                    let new = past_threshold.then(|| match drag {
                         AnnDrag::Move { start, rect, .. } => {
                             let anchor = space.to_page(start);
                             PdfSpaceRect::from_xywh(
@@ -1721,12 +2718,16 @@ impl Canvas {
                                 resize_rect(rect, handle, start_pdf)
                             }
                         }
-                    };
-                    self.ann_drag_rect = Some(new);
+                    });
+                    self.ann_drag_rect = new;
 
                     let held = pointer.primary_down();
+                    // Held but below the threshold draws no ghost — and must
+                    // NOT fall into the release arm, which would consume the
+                    // drag in the very frame it started.
                     if held {
-                        let screen = space.to_screen(new);
+                        if let Some(new) = new {
+                            let screen = space.to_screen(new);
                         let ghost = Rect::from_min_size(
                             pos2(screen.x, screen.y),
                             vec2(screen.w.max(1.0), screen.h.max(1.0)),
@@ -1753,6 +2754,7 @@ impl Canvas {
                                 &format!("{:.0} × {:.0} pt", new.width(), new.height()),
                                 accent,
                             );
+                        }
                         }
                     } else {
                         // Release. The recorded click is consumed UNCONDITION-
@@ -1960,7 +2962,7 @@ impl Canvas {
             // intact so field picking still runs.
             if let Some(pt) = click {
                 let screen_pt = pos2(pt.0 + content_origin.x, pt.1 + content_origin.y);
-                if tool == Tool::Eraser {
+                if tool == Tool::Eraser && !editor.editing {
                     // Deletion happens on *press* in the eraser block below —
                     // the mark should vanish the instant the button goes down,
                     // and a held drag should sweep across several marks. This
@@ -2103,8 +3105,299 @@ impl Canvas {
                 }
             }
 
+            // Inline editor for a page text object — or for a new one. Anchored
+            // at the object so the words are edited where they are rather than
+            // in a dialog somewhere else on screen.
+            if let Some(edit) = &mut obj_text_edit {
+                if !page_spaces.iter().any(|sp| sp.index == edit.page) {
+                    // The page scrolled out of view: commit rather than
+                    // discard. The engine's fit logic guards the result, and
+                    // silently throwing away what the user typed is the worst
+                    // possible outcome of scrolling mid-edit.
+                    if let Some(edit) = obj_text_edit.take()
+                        && let Some(command) =
+                            self.finish_object_text_edit(doc.id, edit, true)
+                    {
+                        self.edits.push(command);
+                    }
+                } else if let Some(space) = page_spaces.iter().find(|sp| sp.index == edit.page) {
+                    // An existing run is anchored on the top-left of its ink
+                    // box. PDF `min_y` is the bottom of the glyphs, and drawing
+                    // the field downward from there puts it under the text.
+                    // A new run's click is the baseline `insert_text` uses, so
+                    // the field is shifted up by a typical Latin ascent.
+                    let placed = if edit.id.is_some() && !edit.layout_bounds.is_degenerate() {
+                        space.to_screen(edit.layout_bounds)
+                    } else {
+                        let (lx, ly) = space.to_screen_point(edit.point);
+                        let ascent = edit.base_font_size * 0.8 * space.zoom;
+                        ScreenRect::new(
+                            lx,
+                            ly - ascent,
+                            180.0,
+                            (edit.base_font_size * space.zoom).max(1.0),
+                        )
+                    };
+                    // The frame's padding sits outside the glyphs. Inset by it
+                    // so the text inside the field lines up with the run.
+                    const FRAME_PAD: f32 = 6.0;
+                    let view = ui.ctx().content_rect();
+                    let anchor = pos2(
+                        (placed.x + content_origin.x - FRAME_PAD)
+                            .min(view.right() - 48.0)
+                            .max(view.left() + 8.0),
+                        (placed.y + content_origin.y - FRAME_PAD)
+                            .min(view.bottom() - 72.0)
+                            .max(view.top() + 8.0),
+                    );
+                    let input_id = egui::Id::new(("object-text-input", doc.id.raw()));
+                    // A style change made in the box's own toolbar; collected
+                    // by the closure, dispatched once the Area is done.
+                    let mut toolbar_command: Option<Command> = None;
+                    let decision = egui::Area::new(input_id)
+                        .order(egui::Order::Foreground)
+                        .fixed_pos(anchor)
+                        .show(ui.ctx(), |ui| {
+                            egui::Frame::new()
+                                .fill(background)
+                                .stroke(egui::Stroke::new(1.0, accent.gamma_multiply(0.6)))
+                                .corner_radius(self.corner_radius)
+                                .inner_margin(egui::Margin::same(6))
+                                .show(ui, |ui| {
+                                    let Some(edit) = obj_text_edit.as_mut() else {
+                                        return None;
+                                    };
+                                    // Style toolbar: the format the user applies
+                                    // while the box is open lands on the whole
+                                    // block (a PDF text run has one style —
+                                    // per-character rich text would need to split
+                                    // it into separate runs, which PDFium's
+                                    // page-object API cannot lay out). The box
+                                    // restyles its own text live; the command
+                                    // reaches the page behind it.
+                                    if edit.id.is_some() {
+                                        ui.horizontal(|ui| {
+                                            let mut next = edit.format;
+                                            if ui
+                                                .selectable_label(
+                                                    next.bold,
+                                                    egui::RichText::new("B").strong(),
+                                                )
+                                                .on_hover_text("Bold for this block")
+                                                .clicked()
+                                            {
+                                                next.bold = !next.bold;
+                                            }
+                                            // The scrub has to keep its own value.
+                                            // Rebuilding from the committed
+                                            // size every frame drops the drag,
+                                            // so the number never moves.
+                                            let mut size = edit.size_draft.unwrap_or(
+                                                next.size.unwrap_or(edit.base_font_size),
+                                            );
+                                            let size_edit = ui
+                                                .add(
+                                                    egui::DragValue::new(&mut size)
+                                                        .speed(0.5)
+                                                        .range(2.0..=144.0),
+                                                )
+                                                .on_hover_text("Point size for this block");
+                                            if size_edit.dragged() {
+                                                edit.size_draft = Some(size);
+                                            }
+                                            if size_edit.drag_stopped()
+                                                || (size_edit.changed()
+                                                    && size_edit.lost_focus())
+                                            {
+                                                edit.size_draft = None;
+                                                next.size = Some(size);
+                                            }
+                                            let mut rgb = next
+                                                .color
+                                                .map(|c| [c[0], c[1], c[2]])
+                                                .unwrap_or([0, 0, 0]);
+                                            if ui
+                                                .color_edit_button_srgb(&mut rgb)
+                                                .on_hover_text("Ink colour for this block")
+                                                .changed()
+                                            {
+                                                next.color = Some([rgb[0], rgb[1], rgb[2], 255]);
+                                            }
+                                            if next != edit.format
+                                                && let Some(id) = edit.id
+                                            {
+                                                toolbar_command =
+                                                    Some(Command::SetPageObjectFormat {
+                                                        id,
+                                                        layout_bounds: edit.layout_bounds,
+                                                        base_font_size: edit.base_font_size,
+                                                        previous_format: edit.format,
+                                                        format: next,
+                                                    });
+                                                // Restyle the box itself right
+                                                // away — the size and colour are
+                                                // what this editor draws with.
+                                                edit.format = next;
+                                            }
+                                        });
+                                        ui.add_space(2.0);
+                                    }
+
+                                    // The box hugs the block it edits: its width
+                                    // follows the block's on-screen width and its
+                                    // text is drawn at the block's own on-screen
+                                    // size and colour, so editing feels like
+                                    // editing the page rather than filling a form
+                                    // somewhere above it.
+                                    let scale = space.zoom.max(0.05);
+                                    // Match the run on screen. A hard 180 px
+                                    // floor made a short word's field much
+                                    // wider than the glyphs, and the 42 px font
+                                    // cap made large type look like a form.
+                                    let viewport_cap = (view.width() - 24.0).max(48.0);
+                                    let box_width = if edit.id.is_some()
+                                        && !edit.layout_bounds.is_degenerate()
+                                    {
+                                        (edit.layout_bounds.width() * scale)
+                                            .max(48.0)
+                                            .min(viewport_cap)
+                                    } else {
+                                        180.0_f32.min(viewport_cap)
+                                    };
+                                    let font_px = (edit
+                                        .format
+                                        .size
+                                        .unwrap_or(edit.base_font_size)
+                                        * scale)
+                                        .clamp(8.0, 96.0);
+                                    let text_color = edit
+                                        .format
+                                        .color
+                                        .map(|c| Color32::from_rgb(c[0], c[1], c[2]))
+                                        .unwrap_or_else(|| ui.style().visuals.text_color());
+                                    ui.style_mut().text_styles.insert(
+                                        egui::TextStyle::Body,
+                                        egui::FontId::proportional(font_px),
+                                    );
+                                    ui.visuals_mut().override_text_color = Some(text_color);
+                                    ui.set_min_width(box_width + 12.0);
+                                    let hint = if edit.word.is_some() {
+                                        "Edit this word…"
+                                    } else {
+                                        "Edit this text…"
+                                    };
+                                    let response = ui.add(
+                                        egui::TextEdit::multiline(&mut edit.text)
+                                            .hint_text(hint)
+                                            .desired_width(box_width)
+                                            .desired_rows(1),
+                                    );
+                                    ui.visuals_mut().override_text_color = None;
+                                    let escape =
+                                        ui.input(|i| i.key_pressed(egui::Key::Escape));
+                                    let apply = ui.input(|i| {
+                                        i.key_pressed(egui::Key::Enter) && !i.modifiers.shift
+                                    });
+                                    // The keys are non-obvious on an editor that
+                                    // looks like it sits on the page; say them.
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "Enter to apply · Shift+Enter for a new line · Esc to cancel",
+                                        )
+                                        .size(10.0)
+                                        .weak(),
+                                    );
+                                    if edit.opened || edit.refocus {
+                                        response.request_focus();
+                                        // A word edit selects the word, so the
+                                        // first keystroke replaces it rather
+                                        // than being appended — what every editor
+                                        // does when you double-click a word. A
+                                        // block edit instead parks the caret
+                                        // where the user clicked and selects
+                                        // nothing, so typing inserts into the
+                                        // text they can see. Refocus after a
+                                        // toolbar click leaves that caret alone.
+                                        if edit.opened {
+                                            if edit.word.is_some()
+                                                && let Some(mut state) =
+                                                    egui::text_edit::TextEditState::load(
+                                                        ui.ctx(),
+                                                        response.id,
+                                                    )
+                                            {
+                                                let end = edit.text.chars().count();
+                                                state.cursor.set_char_range(Some(
+                                                    egui::text::CCursorRange::two(
+                                                        egui::text::CCursor::new(0),
+                                                        egui::text::CCursor::new(end),
+                                                    ),
+                                                ));
+                                                state.store(ui.ctx(), response.id);
+                                            } else if let Some(at) = edit.cursor
+                                                && let Some(mut state) =
+                                                    egui::text_edit::TextEditState::load(
+                                                        ui.ctx(),
+                                                        response.id,
+                                                    )
+                                            {
+                                                let at = at.min(edit.text.chars().count());
+                                                state.cursor.set_char_range(Some(
+                                                    egui::text::CCursorRange::one(
+                                                        egui::text::CCursor::new(at),
+                                                    ),
+                                                ));
+                                                state.store(ui.ctx(), response.id);
+                                            }
+                                        }
+                                        edit.opened = false;
+                                        edit.refocus = false;
+                                    }
+                                    // Escape discards; Enter commits (Shift+
+                                    // Enter keeps the line break). A click on
+                                    // the style controls also drops focus, and
+                                    // that must not commit — the box stays open
+                                    // and the caret comes back next frame.
+                                    if escape {
+                                        return Some(false);
+                                    }
+                                    if apply {
+                                        return Some(true);
+                                    }
+                                    if response.lost_focus() {
+                                        let inside = ui.ctx().pointer_interact_pos().is_some_and(
+                                            |pos| ui.min_rect().expand(8.0).contains(pos),
+                                        );
+                                        if inside {
+                                            edit.refocus = true;
+                                        } else {
+                                            return Some(true);
+                                        }
+                                    }
+                                    None
+                                })
+                                .inner
+                        })
+                        .inner;
+
+                    // A toolbar style change applies without closing the box.
+                    if let Some(command) = toolbar_command.take() {
+                        self.edits.push(command);
+                    }
+                    if let Some(commit) = decision {
+                        if let Some(edit) = obj_text_edit.take()
+                            && let Some(command) =
+                                self.finish_object_text_edit(doc.id, edit, commit)
+                        {
+                            self.edits.push(command);
+                        }
+                    }
+                }
+            }
+
             // Write the note popup state back for the next frame.
             self.note_input = note_input;
+            self.obj_text_edit = obj_text_edit;
         });
 
         self.scroll_offset = output.state.offset;
@@ -2194,6 +3487,22 @@ impl Canvas {
                 // back to a plain arrow; the four-way move arrows read as
                 // "the view is being dragged".
                 egui::CursorIcon::Move
+            } else if editor.editing {
+                // While editing: a directional arrow over a handle of the
+                // selection, the move arrows over anything changeable, and the
+                // text caret elsewhere — which doubles as the "double-click
+                // here to add text" affordance.
+                match ui.input(|i| i.pointer.interact_pos().or_else(|| i.pointer.latest_pos())) {
+                    Some(pos) => object_hover_cursor(
+                        editor.objects,
+                        doc.id,
+                        &page_spaces,
+                        editor.selected,
+                        content_origin,
+                        pos,
+                    ),
+                    None => egui::CursorIcon::Text,
+                }
             } else if let Some(drag) = &self.ann_drag {
                 // While moving/resizing an annotation the cursor shows what
                 // the gesture will do: the four-way arrows for a move, a
@@ -2213,8 +3522,8 @@ impl Canvas {
                 // Hover affordances in Select mode: a directional arrow over a
                 // resize handle and the move arrows over any editable body, so
                 // a resize/move is discoverable before the button goes down.
-                let pointer = ui
-                    .input(|i| i.pointer.interact_pos().or_else(|| i.pointer.latest_pos()));
+                let pointer =
+                    ui.input(|i| i.pointer.interact_pos().or_else(|| i.pointer.latest_pos()));
                 match pointer {
                     Some(pos) => annotation_hover_cursor(
                         &page_spaces,
@@ -2426,6 +3735,42 @@ fn draw_note_tag(painter: &egui::Painter, point: (f32, f32), content_origin: egu
 /// exactly where it was placed — while the bubble grows to the right, flipping
 /// to the left when it would run off the canvas. Returns the card's screen rect
 /// so the caller can ring it when selected and hit-test clicks against it.
+/// Screen rect of a sticky-note card, matching what [`draw_note_card`] paints.
+///
+/// Shared with hit-testing so a click on the card counts as a click on the
+/// note, not as a click on blank paper.
+fn note_card_rect(
+    painter: &egui::Painter,
+    point: (f32, f32),
+    text: &str,
+    content_origin: egui::Pos2,
+) -> Rect {
+    const PAD_X: f32 = 9.0;
+    const PAD_Y: f32 = 6.0;
+    const GLYPH: f32 = 16.0;
+    const GAP: f32 = 9.0;
+
+    let font = egui::FontId::proportional(11.5);
+    let ink = Color32::from_rgb(58, 44, 6);
+    let shown = truncate_chars(text.trim(), 48);
+    let text_size = if shown.is_empty() {
+        Vec2::ZERO
+    } else {
+        painter.layout_no_wrap(shown, font, ink).rect.size()
+    };
+    let height = text_size.y.max(GLYPH) + PAD_Y * 2.0;
+    let width = PAD_X + GLYPH + GAP + text_size.x + PAD_X;
+    let glyph_center = pos2(point.0 + content_origin.x, point.1 + content_origin.y);
+    let mut left = glyph_center.x - GLYPH / 2.0 - PAD_X;
+    if left + width > painter.clip_rect().right() - 4.0 {
+        left = glyph_center.x + GLYPH / 2.0 + PAD_X - width;
+    }
+    Rect::from_min_size(
+        pos2(left, glyph_center.y - height / 2.0),
+        vec2(width, height),
+    )
+}
+
 fn draw_note_card(
     painter: &egui::Painter,
     point: (f32, f32),
@@ -2435,7 +3780,6 @@ fn draw_note_card(
     // A roomy horizontal pad and a generous icon→text gap keep the two from
     // ever crowding each other.
     const PAD_X: f32 = 9.0;
-    const PAD_Y: f32 = 6.0;
     const GLYPH: f32 = 16.0;
     const GAP: f32 = 9.0;
 
@@ -2444,28 +3788,13 @@ fn draw_note_card(
     let fill = Color32::from_rgb(255, 244, 196);
     let border = Color32::from_rgb(216, 180, 62);
 
-    // One trimmed line keeps the card a tidy, predictable size.
-    let shown = truncate_chars(text.trim(), 48);
-    let galley = (!shown.is_empty()).then(|| painter.layout_no_wrap(shown, font.clone(), ink));
-    let text_size = galley.as_ref().map_or(Vec2::ZERO, |g| g.rect.size());
-
-    let height = text_size.y.max(GLYPH) + PAD_Y * 2.0;
-    let width = PAD_X + GLYPH + GAP + text_size.x + PAD_X;
-
+    let card = note_card_rect(painter, point, text, content_origin);
     let glyph_center = pos2(point.0 + content_origin.x, point.1 + content_origin.y);
-
-    // Default: the glyph sits at the note's point and the bubble grows right.
-    let mut left = glyph_center.x - GLYPH / 2.0 - PAD_X;
-    let mut text_on_right = true;
-    // Flip to the left of the point when the bubble would run off the canvas.
-    if left + width > painter.clip_rect().right() - 4.0 {
-        left = glyph_center.x + GLYPH / 2.0 + PAD_X - width;
-        text_on_right = false;
-    }
-    let card = Rect::from_min_size(
-        pos2(left, glyph_center.y - height / 2.0),
-        vec2(width, height),
-    );
+    // The glyph sits on the note's point. When the bubble flips to stay on
+    // screen, that point is on the right of the card and the words sit left.
+    let text_on_right = glyph_center.x < card.center().x;
+    let shown = truncate_chars(text.trim(), 48);
+    let galley = (!shown.is_empty()).then(|| painter.layout_no_wrap(shown, font, ink));
 
     // A soft drop shadow lifts the card off the page for a tidier look.
     painter.rect_filled(
@@ -2484,7 +3813,7 @@ fn draw_note_card(
             card.min.x + PAD_X
         };
         painter.galley(
-            pos2(text_x, card.center().y - text_size.y / 2.0),
+            pos2(text_x, card.center().y - galley.size().y / 2.0),
             galley,
             ink,
         );
@@ -2539,6 +3868,48 @@ fn erase_hit(
     best.map(|(id, _)| id)
 }
 
+/// Whether `local` is on the selected annotation or the controls used to
+/// adjust it: the body, a resize handle, or the sticky-note card.
+///
+/// `local` is content-local (the space `to_screen` and `handle_hit` use).
+/// `global` is the pointer in screen space, which is where the note card is
+/// painted.
+fn on_selected_controls(
+    painter: &egui::Painter,
+    page_spaces: &[PageSpace],
+    annotations: &[AnnotationInfo],
+    selected: AnnotationId,
+    local: Pos2,
+    global: Pos2,
+    content_origin: Pos2,
+) -> bool {
+    let Some(info) = annotations.iter().find(|a| a.id == selected) else {
+        return false;
+    };
+    if let Some(space) = page_spaces.iter().find(|sp| sp.index == info.id.page) {
+        if info.kind != AnnotationKind::StickyNote && handle_hit(space, info.rect, local).is_some()
+        {
+            return true;
+        }
+        let (px, py) = space.to_page((local.x, local.y));
+        if info.rect.contains(px, py) {
+            return true;
+        }
+        if info.kind == AnnotationKind::StickyNote {
+            let anchor = (
+                (info.rect.min_x + info.rect.max_x) / 2.0,
+                (info.rect.min_y + info.rect.max_y) / 2.0,
+            );
+            let point = space.to_screen_point(anchor);
+            let card = note_card_rect(painter, point, info.display_contents(), content_origin);
+            if card.contains(global) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Find an editable annotation to select at a Select-tool click.
 ///
 /// Same hit rule as [`erase_hit`] — smallest containing rect — but restricted
@@ -2555,6 +3926,138 @@ fn select_hit(
         .cloned()
         .collect();
     erase_hit(page_spaces, &editable, screen_pt)
+}
+
+/// One cached page object's record, if that page's list has been read.
+fn object_info(
+    objects: &PageObjectCache,
+    doc: DocumentId,
+    id: PageObjectId,
+) -> Option<PageObjectInfo> {
+    objects
+        .get(doc, id.page)?
+        .iter()
+        .find(|object| object.id == id)
+        .cloned()
+}
+
+/// The page object under a content-local pointer position.
+///
+/// The content editor's twin of [`erase_hit`], and the same rule: find the page
+/// under the point, convert to PDF space, and take the **smallest** object
+/// containing it — so a caption sitting on a picture selects the caption rather
+/// than the picture behind it.
+fn object_hit(
+    objects: &PageObjectCache,
+    page_spaces: &[PageSpace],
+    doc: DocumentId,
+    local: Pos2,
+) -> Option<PageObjectInfo> {
+    let space = hit_page(page_spaces, (local.x, local.y))?;
+    let (px, py) = space.to_page((local.x, local.y));
+    objects
+        .get(doc, space.index)?
+        .iter()
+        .filter(|object| object.bounds.contains(px, py))
+        .min_by(|a, b| a.bounds.area().total_cmp(&b.bounds.area()))
+        .cloned()
+}
+
+/// The word under a point, as a character range inside one text run.
+///
+/// Returns where the word starts and ends **within the run's own string**, and
+/// the word itself. `None` when the point is not over a word, or when the run's
+/// string and the page's characters disagree — in which case the caller edits
+/// the whole run rather than risk splicing the wrong characters.
+///
+/// This is what lets a double-click edit one word. A text object is a *line*, so
+/// without it every edit would replace the whole line — which is not what any
+/// other editor does, and is how one keystroke can destroy a sentence.
+fn word_span(
+    run: &str,
+    bounds: PdfSpaceRect,
+    text: &TextPage,
+    point: (f32, f32),
+) -> Option<(usize, usize, String)> {
+    let range = text.word_at(point.0, point.1, WORD_PICK_TOLERANCE_PT)?;
+
+    // The run's characters are the page's characters whose centres fall inside
+    // the run's box: the page list is in reading order and carries boxes in PDF
+    // space, which is enough to tell one run from another.
+    let owned: Vec<u32> = (0..u32::try_from(text.chars.len()).unwrap_or(u32::MAX))
+        .filter(|index| {
+            let rect = text.chars[*index as usize].rect;
+            let centre = (
+                (rect.min_x + rect.max_x) / 2.0,
+                (rect.min_y + rect.max_y) / 2.0,
+            );
+            bounds.contains(centre.0, centre.1)
+        })
+        .collect();
+
+    // Map the page's character range onto positions inside the run.
+    let start = owned.iter().position(|index| *index >= range.first)?;
+    let end = owned
+        .iter()
+        .position(|index| *index >= range.last)
+        .unwrap_or(owned.len());
+    if end <= start {
+        return None;
+    }
+
+    let chars: Vec<char> = run.chars().collect();
+    // The run's string is shorter than the characters attributed to it, so the
+    // two disagree; splicing would corrupt the run.
+    if end > chars.len() {
+        return None;
+    }
+
+    let word: String = chars[start..end].iter().collect();
+    (!word.trim().is_empty()).then_some((start, end, word))
+}
+
+/// Replace the characters `[start, end)` of `run` with `replacement`.
+///
+/// Counted in characters, not bytes: a run may hold any script, and a byte
+/// offset would split a multi-byte character in half.
+pub(crate) fn splice(run: &str, start: usize, end: usize, replacement: &str) -> String {
+    let chars: Vec<char> = run.chars().collect();
+    let start = start.min(chars.len());
+    let end = end.clamp(start, chars.len());
+    let mut out: String = chars[..start].iter().collect();
+    out.push_str(replacement);
+    out.extend(chars[end..].iter());
+    out
+}
+
+/// The cursor for a pointer over the page while the content editor is on.
+///
+/// Same shape as [`annotation_hover_cursor`]: a directional arrow over a handle
+/// of the current selection, the move arrows over anything changeable, and the
+/// text caret everywhere else.
+fn object_hover_cursor(
+    objects: &PageObjectCache,
+    doc: DocumentId,
+    page_spaces: &[PageSpace],
+    selected: Option<PageObjectId>,
+    origin: Pos2,
+    screen_pos: Pos2,
+) -> egui::CursorIcon {
+    let local = pos2(screen_pos.x - origin.x, screen_pos.y - origin.y);
+
+    if let Some(sel) = selected
+        && let Some(info) = object_info(objects, doc, sel)
+        && let Some(space) = page_spaces.iter().find(|sp| sp.index == sel.page)
+        && let Some(handle) = handle_hit(space, info.bounds, local)
+    {
+        return resize_cursor(handle);
+    }
+
+    if object_hit(objects, page_spaces, doc, local).is_some() {
+        egui::CursorIcon::Move
+    } else {
+        egui::CursorIcon::Text
+    }
 }
 
 /// Screen-space centres of the eight resize handles around `outline`.
@@ -2604,12 +4107,7 @@ fn draw_size_readout(painter: &egui::Painter, anchor: Pos2, text: &str, accent: 
     let pad = vec2(6.0, 3.0);
     let rect = Rect::from_min_size(anchor, galley.size() + pad * 2.0);
     painter.rect_filled(rect, 4.0, Color32::from_rgba_unmultiplied(0, 0, 0, 190));
-    painter.rect_stroke(
-        rect,
-        4.0,
-        Stroke::new(1.0, accent),
-        StrokeKind::Inside,
-    );
+    painter.rect_stroke(rect, 4.0, Stroke::new(1.0, accent), StrokeKind::Inside);
     painter.galley(rect.min + pad, galley, Color32::WHITE);
 }
 
@@ -2922,7 +4420,11 @@ fn draw_tool_badge(painter: &egui::Painter, tool: Tool, pos: Pos2) {
         // Underline: a text band with the (black) rule along its bottom edge.
         Tool::Underline => {
             let band = Rect::from_min_size(tip, vec2(20.0, 10.0));
-            painter.rect_filled(band, 2.0, Color32::from_rgba_unmultiplied(150, 150, 150, 40));
+            painter.rect_filled(
+                band,
+                2.0,
+                Color32::from_rgba_unmultiplied(150, 150, 150, 40),
+            );
             painter.line_segment(
                 [pos2(tip.x, tip.y + 9.5), pos2(tip.x + 20.0, tip.y + 9.5)],
                 Stroke::new(2.0, Color32::from_rgb(30, 30, 30)),
@@ -2931,7 +4433,11 @@ fn draw_tool_badge(painter: &egui::Painter, tool: Tool, pos: Pos2) {
         // Strikeout: a text band with the (red) rule through its middle.
         Tool::StrikeOut => {
             let band = Rect::from_min_size(tip, vec2(20.0, 10.0));
-            painter.rect_filled(band, 2.0, Color32::from_rgba_unmultiplied(150, 150, 150, 40));
+            painter.rect_filled(
+                band,
+                2.0,
+                Color32::from_rgba_unmultiplied(150, 150, 150, 40),
+            );
             painter.line_segment(
                 [pos2(tip.x, tip.y + 5.0), pos2(tip.x + 20.0, tip.y + 5.0)],
                 Stroke::new(2.0, Color32::from_rgb(198, 40, 40)),
@@ -2940,7 +4446,11 @@ fn draw_tool_badge(painter: &egui::Painter, tool: Tool, pos: Pos2) {
         // Squiggly: a text band with the (green) zig-zag along its bottom edge.
         Tool::Squiggly => {
             let band = Rect::from_min_size(tip, vec2(20.0, 10.0));
-            painter.rect_filled(band, 2.0, Color32::from_rgba_unmultiplied(150, 150, 150, 40));
+            painter.rect_filled(
+                band,
+                2.0,
+                Color32::from_rgba_unmultiplied(150, 150, 150, 40),
+            );
             // The badge is a fixed-size icon, not a document preview, so it is
             // drawn at 1:1 whatever the page zoom is.
             draw_squiggle(painter, band, Color32::from_rgb(46, 125, 50), 1.0);
@@ -2955,27 +4465,13 @@ fn draw_tool_badge(painter: &egui::Painter, tool: Tool, pos: Pos2) {
                 StrokeKind::Inside,
             );
         }
-        // Sticky note: the folded-corner square, drawn with three shapes.
+        // Sticky note: the same capital T as the toolbar button, so the
+        // pointer and the Note (N) control agree.
         Tool::StickyNote => {
-            let body = Rect::from_min_size(tip, vec2(16.0, 16.0));
-            let fold = 5.0;
-            painter.rect_filled(body, 1.0, Color32::from_rgb(255, 241, 118));
-            let corner = [
-                pos2(body.max.x - fold, body.max.y),
-                body.max,
-                pos2(body.max.x, body.max.y - fold),
-            ];
-            painter.add(egui::Shape::convex_polygon(
-                corner.to_vec(),
-                Color32::from_rgb(240, 215, 90),
-                Stroke::NONE,
-            ));
-            painter.rect_stroke(
-                body,
-                1.0,
-                Stroke::new(1.0, Color32::from_rgb(160, 140, 40)),
-                StrokeKind::Inside,
-            );
+            let ink = Color32::from_rgb(32, 32, 32);
+            let bar = Stroke::new(2.4, ink);
+            painter.line_segment([tip + vec2(1.0, 2.0), tip + vec2(15.0, 2.0)], bar);
+            painter.line_segment([tip + vec2(8.0, 2.0), tip + vec2(8.0, 15.0)], bar);
         }
         _ => {}
     }
@@ -3715,8 +5211,8 @@ mod tests {
         ctx.input(|i| i.time) + 0.001
     }
     use pdfreader_core::{Outline, PageGeometry};
-    use pdfreader_pdf::TextPage;
     use pdfreader_pdf::annot::DEFAULT_MARKUP_THICKNESS;
+    use pdfreader_pdf::{CharBox, TextPage};
 
     /// One line of text laid out on a 200×100 point page, plus the page space
     /// that maps it to layout coordinates at 1:1 zoom with no rotation.
@@ -3786,8 +5282,9 @@ mod tests {
             kind: AnnotationKind::Highlight,
             rect: PdfSpaceRect::from_xywh(20.0, 250.0, 40.0, 30.0),
             contents: None,
-                color: None,
-}];
+            color: None,
+            thickness: 0.45,
+        }];
 
         // Click at content-local (140, 85) → PDF (40, 265), inside the rect.
         assert_eq!(
@@ -3853,7 +5350,8 @@ mod tests {
                 screen_rect: Some(screen),
                 ..Default::default()
             };
-            raw.events.push(egui::Event::PointerMoved(egui::pos2(400.0, 300.0)));
+            raw.events
+                .push(egui::Event::PointerMoved(egui::pos2(400.0, 300.0)));
             let mut out = ctx.run_ui(raw, |ui| {
                 canvas.draw(
                     ui,
@@ -3868,6 +5366,7 @@ mod tests {
                     None,
                     egui::Color32::TRANSPARENT,
                     tool,
+                    ContentEdit::none(),
                     &PageTextCache::new(),
                     &annotations,
                     None,
@@ -3909,14 +5408,16 @@ mod tests {
         let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
         let annotations: Vec<AnnotationInfo> = Vec::new();
         // The canvas sits below a 40px annotation bar.
-        let canvas_rect = egui::Rect::from_min_size(egui::pos2(0.0, 40.0), egui::vec2(800.0, 560.0));
+        let canvas_rect =
+            egui::Rect::from_min_size(egui::pos2(0.0, 40.0), egui::vec2(800.0, 560.0));
 
         let mut raw = egui::RawInput {
             screen_rect: Some(screen),
             ..Default::default()
         };
         // Pointer over the bar, above the canvas viewport.
-        raw.events.push(egui::Event::PointerMoved(egui::pos2(400.0, 20.0)));
+        raw.events
+            .push(egui::Event::PointerMoved(egui::pos2(400.0, 20.0)));
         let mut out = ctx.run_ui(raw, |ui| {
             ui.scope_builder(egui::UiBuilder::new().max_rect(canvas_rect), |ui| {
                 canvas.draw(
@@ -3932,6 +5433,7 @@ mod tests {
                     None,
                     egui::Color32::TRANSPARENT,
                     Tool::Highlight,
+                    ContentEdit::none(),
                     &PageTextCache::new(),
                     &annotations,
                     None,
@@ -4053,9 +5555,8 @@ mod tests {
         use ResizeHandle::North;
         let band = 8.0;
         let rect = PdfSpaceRect::from_xywh(100.0, 100.0, 200.0, band);
-        let reachable = |floor: f32| {
-            (DEFAULT_MARKUP_THICKNESS + (floor - band)).max(MIN_MARKUP_THICKNESS)
-        };
+        let reachable =
+            |floor: f32| (DEFAULT_MARKUP_THICKNESS + (floor - band)).max(MIN_MARKUP_THICKNESS);
         // Far past the opposite edge: it is the floor, not the pointer, that
         // stops the drag.
         let to = (150.0, 101.0);
@@ -4182,6 +5683,7 @@ mod tests {
                 rect: PdfSpaceRect::from_xywh(20.0, 20.0, 40.0, 10.0),
                 contents: None,
                 color: None,
+                thickness: 0.45,
             },
             AnnotationInfo {
                 id: AnnotationId::new(0, 1),
@@ -4189,6 +5691,7 @@ mod tests {
                 rect: PdfSpaceRect::from_xywh(20.0, 20.0, 40.0, 10.0),
                 contents: None,
                 color: None,
+                thickness: 0.45,
             },
         ];
         // Both occupy the same spot at PDF (30, 25) — content-local y 375,
@@ -4199,7 +5702,10 @@ mod tests {
             Some(AnnotationId::new(0, 0))
         );
         // Outside everything: nothing is selected.
-        assert_eq!(select_hit(&page_spaces, &annotations, pos2(300.0, 300.0)), None);
+        assert_eq!(
+            select_hit(&page_spaces, &annotations, pos2(300.0, 300.0)),
+            None
+        );
     }
 
     /// Each resize handle maps to the matching directional resize cursor.
@@ -4244,6 +5750,7 @@ mod tests {
             rect,
             contents: None,
             color: Some([255, 0, 0, 255]),
+            thickness: 0.45,
         }];
         // The canvas sits below the tabbar/toolbar, so the origin is not the
         // window origin and each pointer below is in global space.
@@ -4274,7 +5781,6 @@ mod tests {
         );
     }
 
-
     /// The layout-space point over the first glyph: PDF (14, 55) at 1:1.
     const ON_HELLO: (f32, f32) = (14.0, 45.0);
     /// A point over the last glyph of "world", so a drag to here covers both
@@ -4288,6 +5794,7 @@ mod tests {
             title: "x".into(),
             pages: vec![PageGeometry::A4; pages],
             encrypted: false,
+            can_edit_content: true,
             outline: Outline::default(),
         }
     }
@@ -4429,6 +5936,7 @@ mod tests {
                     None,
                     Color32::TRANSPARENT,
                     Tool::Select,
+                    ContentEdit::none(),
                     &PageTextCache::new(),
                     &[],
                     None,
@@ -4492,6 +6000,7 @@ mod tests {
                     None,
                     Color32::TRANSPARENT,
                     Tool::Select,
+                    ContentEdit::none(),
                     &PageTextCache::new(),
                     &[],
                     None,
@@ -4542,6 +6051,7 @@ mod tests {
                 None,
                 Color32::TRANSPARENT,
                 Tool::Select,
+                ContentEdit::none(),
                 &PageTextCache::new(),
                 &[],
                 None,
@@ -4601,6 +6111,7 @@ mod tests {
                 None,
                 Color32::TRANSPARENT,
                 Tool::Select,
+                ContentEdit::none(),
                 &PageTextCache::new(),
                 &[],
                 None,
@@ -4635,6 +6146,7 @@ mod tests {
                 None,
                 Color32::TRANSPARENT,
                 Tool::Select,
+                ContentEdit::none(),
                 &PageTextCache::new(),
                 &[],
                 None,
@@ -4679,6 +6191,7 @@ mod tests {
                     None,
                     Color32::TRANSPARENT,
                     Tool::Select,
+                    ContentEdit::none(),
                     &PageTextCache::new(),
                     &[],
                     None,
@@ -4739,6 +6252,7 @@ mod tests {
                         None,
                         Color32::TRANSPARENT,
                         Tool::Select,
+                        ContentEdit::none(),
                         &PageTextCache::new(),
                         &[],
                         None,
@@ -4849,6 +6363,7 @@ mod tests {
                     None,
                     Color32::TRANSPARENT,
                     Tool::Select,
+                    ContentEdit::none(),
                     &PageTextCache::new(),
                     &[],
                     None,
@@ -5007,6 +6522,7 @@ mod tests {
                     None,
                     Color32::TRANSPARENT,
                     Tool::Select,
+                    ContentEdit::none(),
                     &PageTextCache::new(),
                     &[],
                     None,
@@ -5043,6 +6559,7 @@ mod tests {
                     None,
                     Color32::TRANSPARENT,
                     Tool::Select,
+                    ContentEdit::none(),
                     &PageTextCache::new(),
                     &[],
                     None,
@@ -5754,8 +7271,9 @@ mod tests {
             kind: AnnotationKind::StickyNote,
             rect: PdfSpaceRect::from_xywh(100.0, 100.0, 20.0, 20.0),
             contents: Some("Reviewed later".into()),
-                color: None,
-}];
+            color: None,
+            thickness: 0.45,
+        }];
 
         let raw = egui::RawInput {
             screen_rect: Some(screen),
@@ -5775,6 +7293,7 @@ mod tests {
                 None,
                 Color32::TRANSPARENT,
                 Tool::Select,
+                ContentEdit::none(),
                 &PageTextCache::new(),
                 &notes,
                 None,
@@ -6017,6 +7536,7 @@ mod tests {
             rect: PdfSpaceRect::from_xywh(80.0, 700.0, 140.0, 80.0),
             contents: None,
             color: Some([255, 0, 0, 200]),
+            thickness: 0.45,
         };
         let annotations = vec![ann.clone()];
 
@@ -6052,6 +7572,7 @@ mod tests {
                     None,
                     egui::Color32::TRANSPARENT,
                     Tool::Select,
+                    ContentEdit::none(),
                     &PageTextCache::new(),
                     &annotations,
                     selected,
@@ -6076,7 +7597,12 @@ mod tests {
         // Press on the body: selects it in place and starts a move.
         edits.extend(frame(&mut canvas, center, Some(true), None));
         // Drag 40px right while still holding the button.
-        edits.extend(frame(&mut canvas, egui::pos2(center.x + 40.0, center.y), None, None));
+        edits.extend(frame(
+            &mut canvas,
+            egui::pos2(center.x + 40.0, center.y),
+            None,
+            None,
+        ));
         // Release: commits the move (only if the rect actually changed).
         edits.extend(frame(
             &mut canvas,
@@ -6106,7 +7632,9 @@ mod tests {
         // Regression: the release must not deselect (that was the bug that
         // made every annotation impossible to edit after the first click).
         assert!(
-            !edits.iter().any(|c| matches!(c, Command::SelectAnnotation(None))),
+            !edits
+                .iter()
+                .any(|c| matches!(c, Command::SelectAnnotation(None))),
             "selection must survive the release (regression): {edits:?}"
         );
     }
@@ -6139,6 +7667,7 @@ mod tests {
             rect: PdfSpaceRect::from_xywh(80.0, 700.0, 140.0, 80.0),
             contents: None,
             color: Some([255, 0, 0, 200]),
+            thickness: 0.45,
         };
         let annotations = vec![ann.clone()];
         let id = AnnotationId::new(0, 0);
@@ -6184,6 +7713,7 @@ mod tests {
                             None,
                             egui::Color32::TRANSPARENT,
                             Tool::Select,
+                            ContentEdit::none(),
                             &PageTextCache::new(),
                             &annotations,
                             selected,
@@ -6237,6 +7767,99 @@ mod tests {
         );
     }
 
+    /// A wobbly click on an annotation commits nothing — the same screen-space
+    /// threshold rule page objects follow. Real hand tremor is 1–3 px; treating
+    /// it as a drag used to push micro-nudges onto the undo stack.
+    #[test]
+    fn an_annotation_micro_jiggle_commits_nothing() {
+        use pdfreader_core::{AnnotationId, AnnotationInfo, AnnotationKind, Command};
+
+        let ctx = egui::Context::default();
+        let mut canvas = Canvas::new();
+        let doc = doc(1);
+        let view = ViewState::default();
+        let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(900.0, 700.0));
+        let offset = egui::vec2(37.0, 53.0);
+
+        let ann = AnnotationInfo {
+            id: AnnotationId::new(0, 0),
+            kind: AnnotationKind::Square,
+            rect: PdfSpaceRect::from_xywh(80.0, 700.0, 140.0, 80.0),
+            contents: None,
+            color: Some([255, 0, 0, 200]),
+            thickness: 0.45,
+        };
+        let annotations = vec![ann.clone()];
+        let id = AnnotationId::new(0, 0);
+
+        let frame = |canvas: &mut Canvas, pos: egui::Pos2, press: Option<bool>| -> Vec<Command> {
+            let mut raw = egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            };
+            raw.events.push(egui::Event::PointerMoved(pos));
+            if let Some(p) = press {
+                raw.events.push(egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: p,
+                    modifiers: egui::Modifiers::default(),
+                });
+            }
+            let mut out = ctx.run_ui(raw, |ui| {
+                ui.scope_builder(
+                    egui::UiBuilder::new().max_rect(egui::Rect::from_min_size(
+                        egui::pos2(offset.x, offset.y),
+                        screen.size(),
+                    )),
+                    |ui| {
+                        canvas.draw(
+                            ui,
+                            &doc,
+                            &view,
+                            1.0,
+                            1.0,
+                            egui::Color32::BLACK,
+                            egui::Color32::BLACK,
+                            None,
+                            None,
+                            None,
+                            egui::Color32::TRANSPARENT,
+                            Tool::Select,
+                            ContentEdit::none(),
+                            &PageTextCache::new(),
+                            &annotations,
+                            Some(id),
+                        );
+                    },
+                );
+            });
+            out.textures_delta.clear();
+            canvas.take_edits()
+        };
+
+        // Layout frame with the annotation selected.
+        let _ = frame(&mut canvas, egui::pos2(5.0, 5.0), None);
+        let space = canvas.page_spaces()[0];
+        let sr = space.to_screen(ann.rect);
+        // The body centre: nowhere near a resize handle, so a press here starts
+        // a move.
+        let body = egui::pos2(sr.x + sr.w / 2.0 + offset.x, sr.y + sr.h / 2.0 + offset.y);
+
+        let mut edits = Vec::new();
+        edits.extend(frame(&mut canvas, body, Some(true)));
+        let wobbled = body + egui::vec2(2.4, -1.8);
+        edits.extend(frame(&mut canvas, wobbled, None));
+        edits.extend(frame(&mut canvas, wobbled, Some(false)));
+
+        assert!(
+            !edits
+                .iter()
+                .any(|c| matches!(c, Command::UpdateAnnotationBounds { .. })),
+            "a wobbly click on a mark must commit nothing: {edits:?}"
+        );
+    }
+
     /// Dragging the North (top) handle up must change the HEIGHT only: the top
     /// edge follows the pointer and the width is untouched. This is the vertical
     /// half of the resize contract — a drag that changed width instead (or moved
@@ -6258,6 +7881,7 @@ mod tests {
             rect: PdfSpaceRect::from_xywh(80.0, 700.0, 140.0, 80.0),
             contents: None,
             color: Some([255, 0, 0, 200]),
+            thickness: 0.45,
         };
         let annotations = vec![ann.clone()];
         let id = AnnotationId::new(0, 0);
@@ -6300,6 +7924,7 @@ mod tests {
                             None,
                             egui::Color32::TRANSPARENT,
                             Tool::Select,
+                            ContentEdit::none(),
                             &PageTextCache::new(),
                             &annotations,
                             selected,
@@ -6368,6 +7993,7 @@ mod tests {
             rect: PdfSpaceRect::from_xywh(80.0, 700.0, 140.0, 80.0),
             contents: None,
             color: Some([255, 0, 0, 200]),
+            thickness: 0.45,
         };
         let annotations = vec![ann.clone()];
         let id = AnnotationId::new(0, 0);
@@ -6402,6 +8028,7 @@ mod tests {
                     None,
                     egui::Color32::TRANSPARENT,
                     Tool::Highlight,
+                    ContentEdit::none(),
                     &PageTextCache::new(),
                     &annotations,
                     Some(id),
@@ -6439,7 +8066,9 @@ mod tests {
             "grabbing the handle with a tool armed must resize: {edits:?}"
         );
         assert!(
-            !edits.iter().any(|c| matches!(c, Command::AddAnnotation { .. })),
+            !edits
+                .iter()
+                .any(|c| matches!(c, Command::AddAnnotation { .. })),
             "grabbing a handle must not also draw a new mark: {edits:?}"
         );
     }
@@ -6469,6 +8098,7 @@ mod tests {
             rect: PdfSpaceRect::from_xywh(80.0, 700.0, 140.0, 80.0),
             contents: None,
             color: Some([255, 0, 0, 200]),
+            thickness: 0.45,
         };
         let annotations = vec![ann.clone()];
 
@@ -6508,6 +8138,7 @@ mod tests {
                     None,
                     egui::Color32::TRANSPARENT,
                     tool,
+                    ContentEdit::none(),
                     &PageTextCache::new(),
                     &annotations,
                     selected,
@@ -6526,7 +8157,14 @@ mod tests {
         };
 
         // Learn the layout, then pick a point inside the page.
-        let _ = frame(&mut canvas, egui::pos2(5.0, 5.0), None, Tool::Select, None, false);
+        let _ = frame(
+            &mut canvas,
+            egui::pos2(5.0, 5.0),
+            None,
+            Tool::Select,
+            None,
+            false,
+        );
         let space = canvas.page_spaces()[0];
         let sr = space.to_screen(ann.rect);
         let on_page = egui::pos2(sr.x + sr.w / 2.0, sr.y + sr.h / 2.0);
@@ -6540,22 +8178,71 @@ mod tests {
         let draw_gesture = |float: bool| -> Vec<Command> {
             let mut c = Canvas::new();
             for _ in 0..3 {
-                let _ = frame(&mut c, egui::pos2(5.0, 5.0), None, Tool::Select, None, float);
+                let _ = frame(
+                    &mut c,
+                    egui::pos2(5.0, 5.0),
+                    None,
+                    Tool::Select,
+                    None,
+                    float,
+                );
             }
             let mut edits = Vec::new();
-            edits.extend(frame(&mut c, on_page, Some(true), Tool::Underline, None, float));
-            edits.extend(frame(&mut c, dragged_to, None, Tool::Underline, None, float));
-            edits.extend(frame(&mut c, dragged_to, Some(false), Tool::Underline, None, float));
+            edits.extend(frame(
+                &mut c,
+                on_page,
+                Some(true),
+                Tool::Underline,
+                None,
+                float,
+            ));
+            edits.extend(frame(
+                &mut c,
+                dragged_to,
+                None,
+                Tool::Underline,
+                None,
+                float,
+            ));
+            edits.extend(frame(
+                &mut c,
+                dragged_to,
+                Some(false),
+                Tool::Underline,
+                None,
+                float,
+            ));
             edits
         };
         let press_select = |float: bool| -> Vec<Command> {
             let mut c = Canvas::new();
             for _ in 0..3 {
-                let _ = frame(&mut c, egui::pos2(5.0, 5.0), None, Tool::Select, None, float);
+                let _ = frame(
+                    &mut c,
+                    egui::pos2(5.0, 5.0),
+                    None,
+                    Tool::Select,
+                    None,
+                    float,
+                );
             }
             let mut edits = Vec::new();
-            edits.extend(frame(&mut c, on_page, Some(true), Tool::Select, None, float));
-            edits.extend(frame(&mut c, on_page, Some(false), Tool::Select, None, float));
+            edits.extend(frame(
+                &mut c,
+                on_page,
+                Some(true),
+                Tool::Select,
+                None,
+                float,
+            ));
+            edits.extend(frame(
+                &mut c,
+                on_page,
+                Some(false),
+                Tool::Select,
+                None,
+                float,
+            ));
             edits
         };
 
@@ -6613,6 +8300,7 @@ mod tests {
             rect: PdfSpaceRect::from_xywh(80.0, 700.0, 140.0, 80.0),
             contents: None,
             color: Some([255, 0, 0, 200]),
+            thickness: 0.45,
         };
         let annotations = vec![ann.clone()];
         let selected = Some(AnnotationId::new(0, 0));
@@ -6650,6 +8338,7 @@ mod tests {
                     None,
                     egui::Color32::TRANSPARENT,
                     tool,
+                    ContentEdit::none(),
                     &PageTextCache::new(),
                     &annotations,
                     selected,
@@ -6682,8 +8371,8 @@ mod tests {
         assert!(
             edits
                 .iter()
-                .any(|c| matches!(c, Command::SetPropertiesPanel { open: false })),
-            "a press on bare paper must dismiss the properties window: {edits:?}"
+                .any(|c| matches!(c, Command::SelectAnnotationInPlace(None))),
+            "a press on bare paper must leave adjustment: {edits:?}"
         );
 
         // The same press on the mark itself keeps the panel open: that is how
@@ -6699,23 +8388,1036 @@ mod tests {
         assert!(
             !edits
                 .iter()
-                .any(|c| matches!(c, Command::SetPropertiesPanel { open: false })),
-            "a press on the mark must not dismiss the panel it is showing: {edits:?}"
+                .any(|c| matches!(c, Command::SelectAnnotationInPlace(None))),
+            "a press on the mark must keep adjustment: {edits:?}"
         );
 
-        // An armed drawing tool pressing bare paper still dismisses it: the
-        // click is the user saying "elsewhere", not "keep editing this".
+        // An armed drawing tool pressing bare paper leaves adjustment and does
+        // not place another mark on that same click. The tool stays armed;
+        // the next press, once nothing is selected, draws.
         let mut canvas = Canvas::new();
         for _ in 0..3 {
-            let _ = frame(&mut canvas, egui::pos2(5.0, 5.0), None, Tool::Highlight);
+            let _ = frame(&mut canvas, egui::pos2(5.0, 5.0), None, Tool::Square);
         }
         let mut edits = Vec::new();
-        edits.extend(frame(&mut canvas, bare, Some(true), Tool::Highlight));
+        edits.extend(frame(&mut canvas, bare, Some(true), Tool::Square));
+        edits.extend(frame(&mut canvas, bare, Some(false), Tool::Square));
         assert!(
             edits
                 .iter()
-                .any(|c| matches!(c, Command::SetPropertiesPanel { open: false })),
-            "a press on bare paper must dismiss the panel with a tool armed too: {edits:?}"
+                .any(|c| matches!(c, Command::SelectAnnotationInPlace(None))),
+            "a press on bare paper must leave adjustment with a tool armed too: {edits:?}"
+        );
+        assert!(
+            !edits
+                .iter()
+                .any(|c| matches!(c, Command::AddAnnotation { .. })),
+            "leaving adjustment must not also place a mark: {edits:?}"
+        );
+
+        // The same tool, clicking the mark itself, keeps the selection and
+        // does not start a new shape on top of it.
+        let mut canvas = Canvas::new();
+        for _ in 0..3 {
+            let _ = frame(&mut canvas, egui::pos2(5.0, 5.0), None, Tool::Square);
+        }
+        let mut edits = Vec::new();
+        edits.extend(frame(&mut canvas, on_mark, Some(true), Tool::Square));
+        edits.extend(frame(&mut canvas, on_mark, Some(false), Tool::Square));
+        assert!(
+            !edits
+                .iter()
+                .any(|c| matches!(c, Command::SelectAnnotationInPlace(None))),
+            "a press on the mark must keep adjustment even with a tool armed: {edits:?}"
+        );
+        assert!(
+            !edits
+                .iter()
+                .any(|c| matches!(c, Command::AddAnnotation { .. })),
+            "a press on the mark being adjusted must not place another: {edits:?}"
+        );
+    }
+
+    // --- Content editing ---------------------------------------------------
+
+    /// The first click on a text run selects it and leaves it free to drag.
+    /// Opening the editor on that click would cover the glyphs, so the next
+    /// drag never reached the block. The second click, once it is selected,
+    /// opens the editor on the whole run with the caret where the pointer
+    /// landed and nothing pre-selected. Dragging still moves it.
+    #[test]
+    fn clicking_a_text_run_opens_the_block_editor() {
+        let ctx = egui::Context::default();
+        let mut canvas = Canvas::new();
+        let doc = doc(1);
+        let view = ViewState::default();
+        let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+        let annotations: Vec<AnnotationInfo> = Vec::new();
+        let id = PageObjectId { page: 0, index: 3 };
+
+        let mut objects = PageObjectCache::new();
+        objects.insert(
+            doc.id,
+            0,
+            vec![PageObjectInfo {
+                id,
+                kind: PageObjectKind::Text,
+                bounds: PdfSpaceRect::from_xywh(100.0, 700.0, 120.0, 14.0),
+                layout_bounds: PdfSpaceRect::from_xywh(100.0, 700.0, 120.0, 14.0),
+                text: Some("the quick fox".to_string()),
+                font_size: Some(12.0),
+                format: TextFormat::default(),
+            }],
+        );
+
+        let draw = |canvas: &mut Canvas,
+                    events: Vec<egui::Event>,
+                    selected: Option<PageObjectId>,
+                    time: Option<f64>| {
+            let mut raw = egui::RawInput {
+                screen_rect: Some(screen),
+                time,
+                ..Default::default()
+            };
+            raw.events = events;
+            let mut origin = egui::pos2(0.0, 0.0);
+            let mut out = ctx.run_ui(raw, |ui| {
+                canvas.draw(
+                    ui,
+                    &doc,
+                    &view,
+                    1.0,
+                    1.0,
+                    egui::Color32::BLACK,
+                    egui::Color32::BLACK,
+                    None,
+                    None,
+                    None,
+                    egui::Color32::TRANSPARENT,
+                    Tool::Select,
+                    ContentEdit {
+                        editing: true,
+                        objects: &objects,
+                        selected,
+                    },
+                    &PageTextCache::new(),
+                    &annotations,
+                    None,
+                );
+                origin = ui.min_rect().min;
+            });
+            out.textures_delta.clear();
+            (canvas.take_edits(), origin)
+        };
+
+        // Learn where the object landed on screen.
+        let (_, origin) = draw(&mut canvas, Vec::new(), None, None);
+        let space = canvas.page_spaces()[0];
+        // The object's centre; the page's text cache is empty in this harness,
+        // so no word is found and the editor falls back to the whole run.
+        let centre = space.to_screen_point((160.0, 707.0));
+        let target = egui::pos2(centre.0 + origin.x, centre.1 + origin.y);
+
+        let mut edits = draw(
+            &mut canvas,
+            vec![
+                egui::Event::PointerMoved(target),
+                egui::Event::PointerButton {
+                    pos: target,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::default(),
+                },
+            ],
+            None,
+            None,
+        )
+        .0;
+        let (release_edits, _) = draw(
+            &mut canvas,
+            vec![egui::Event::PointerButton {
+                pos: target,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::default(),
+            }],
+            None,
+            None,
+        );
+        edits.extend(release_edits);
+        assert!(
+            edits
+                .iter()
+                .any(|c| matches!(c, Command::SelectPageObject(Some(sel)) if *sel == id)),
+            "the click must still select the run: {edits:?}"
+        );
+        assert!(
+            canvas.obj_text_edit.is_none(),
+            "the first click selects, so the block stays free to drag"
+        );
+
+        // Second click, now that it is selected, opens the editor.
+        canvas = Canvas::new();
+        // Later than egui's double-click window, so this is a second click
+        // and not a double-click on the same context.
+        let _ = draw(&mut canvas, Vec::new(), Some(id), Some(5.0));
+        let _ = draw(
+            &mut canvas,
+            vec![
+                egui::Event::PointerMoved(target),
+                egui::Event::PointerButton {
+                    pos: target,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::default(),
+                },
+            ],
+            Some(id),
+            Some(5.0),
+        );
+        let _ = draw(
+            &mut canvas,
+            vec![egui::Event::PointerButton {
+                pos: target,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::default(),
+            }],
+            Some(id),
+            Some(5.0),
+        );
+        let edit = canvas
+            .obj_text_edit
+            .as_ref()
+            .expect("a second click on selected text must open the inline editor");
+        assert_eq!(
+            edit.text.as_str(),
+            "the quick fox",
+            "a click must open the entire block, not just the word under the pointer"
+        );
+        assert!(edit.word.is_none(), "a block edit must not splice one word");
+        assert!(
+            edit.cursor.is_some(),
+            "the caret must be placed, so typing inserts instead of replacing"
+        );
+
+        // And dragging the same run must still move it, not type.
+        let mut canvas = Canvas::new();
+        let moved_to = target + egui::vec2(40.0, 25.0);
+        for events in [
+            vec![
+                egui::Event::PointerMoved(target),
+                egui::Event::PointerButton {
+                    pos: target,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::default(),
+                },
+            ],
+            vec![egui::Event::PointerMoved(moved_to)],
+            vec![egui::Event::PointerButton {
+                pos: moved_to,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::default(),
+            }],
+        ] {
+            let _ = draw(&mut canvas, events, None, None);
+        }
+        assert!(
+            canvas.obj_text_edit.is_none(),
+            "a drag must move the run, not open the editor"
+        );
+    }
+
+    /// A committed text ghost retires only after both clocks have run: the
+    /// engine's confirmation (the fresh object list) and the re-render (a fresh
+    /// tile). Either alone proves nothing, and a refused edit drops the ghost
+    /// outright — it would otherwise show words that are not in the document.
+    #[test]
+    fn a_text_ghost_lives_until_confirmed_and_rendered() {
+        let mut canvas = Canvas::new();
+        let doc = doc(1);
+        let id = PageObjectId { page: 2, index: 5 };
+        canvas.stage_text_ghost(
+            doc.id,
+            id,
+            "new words".to_string(),
+            PdfSpaceRect::from_xywh(10.0, 20.0, 100.0, 12.0),
+            12.0,
+            None,
+        );
+        assert!(canvas.shows_text_ghost(doc.id, 2));
+
+        // A tile before confirmation proves nothing: it may predate the edit.
+        canvas.tile_rendered(doc.id, 2);
+        assert!(
+            canvas.shows_text_ghost(doc.id, 2),
+            "an unconfirmed ghost must survive a tile arrival"
+        );
+
+        // Confirmation alone is not enough either: the pixels are still stale.
+        canvas.page_objects_refreshed(doc.id, 2);
+        assert!(
+            canvas.shows_text_ghost(doc.id, 2),
+            "a confirmed ghost must survive until the page re-renders"
+        );
+
+        // Both together retire it.
+        canvas.tile_rendered(doc.id, 2);
+        assert!(!canvas.shows_text_ghost(doc.id, 2));
+
+        // A refused edit drops the ghost immediately, and a ghost from another
+        // page is untouched by either signal.
+        canvas.stage_text_ghost(
+            doc.id,
+            id,
+            "nope".to_string(),
+            PdfSpaceRect::from_xywh(0.0, 0.0, 10.0, 10.0),
+            12.0,
+            None,
+        );
+        canvas.page_objects_refreshed(doc.id, 3);
+        canvas.tile_rendered(doc.id, 3);
+        assert!(
+            canvas.shows_text_ghost(doc.id, 2),
+            "another page's signals must not retire this ghost"
+        );
+        canvas.page_object_edit_failed(doc.id, 2);
+        assert!(!canvas.shows_text_ghost(doc.id, 2));
+    }
+
+    /// The whole edit gesture, driven through the canvas: a press on a page
+    /// object selects it and a drag commits a new box.
+    ///
+    /// This is the test that catches edit mode being wired up but never
+    /// actually reacting to a click — the failure that looks like "the button
+    /// does nothing".
+    #[test]
+    fn a_press_selects_a_page_object_and_a_drag_moves_it() {
+        let ctx = egui::Context::default();
+        let mut canvas = Canvas::new();
+        let doc = doc(1);
+        let view = ViewState::default();
+        let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+        let annotations: Vec<AnnotationInfo> = Vec::new();
+        let text = PageTextCache::new();
+
+        let id = PageObjectId { page: 0, index: 3 };
+        let mut objects = PageObjectCache::new();
+        objects.insert(
+            doc.id,
+            0,
+            vec![PageObjectInfo {
+                id,
+                kind: PageObjectKind::Text,
+                // Near the top of the page, so it is certain to be on screen.
+                bounds: PdfSpaceRect::from_xywh(100.0, 700.0, 120.0, 14.0),
+                layout_bounds: PdfSpaceRect::from_xywh(100.0, 700.0, 120.0, 14.0),
+                text: Some("Hello".to_string()),
+                font_size: Some(12.0),
+                format: TextFormat::default(),
+            }],
+        );
+
+        // Returns the commands the canvas produced and the content origin, so
+        // the test can aim at the object without recomputing the layout.
+        let draw = |canvas: &mut Canvas, events: Vec<egui::Event>| {
+            let mut raw = egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            };
+            raw.events = events;
+            let mut origin = egui::pos2(0.0, 0.0);
+            let mut out = ctx.run_ui(raw, |ui| {
+                canvas.draw(
+                    ui,
+                    &doc,
+                    &view,
+                    1.0,
+                    1.0,
+                    egui::Color32::BLACK,
+                    egui::Color32::BLACK,
+                    None,
+                    None,
+                    None,
+                    egui::Color32::TRANSPARENT,
+                    Tool::Select,
+                    ContentEdit {
+                        editing: true,
+                        objects: &objects,
+                        selected: None,
+                    },
+                    &text,
+                    &annotations,
+                    None,
+                );
+                origin = ui.min_rect().min;
+            });
+            out.textures_delta.clear();
+            (canvas.take_edits(), origin)
+        };
+
+        // Frame 1: no input, only to learn where the page landed.
+        let (_, origin) = draw(&mut canvas, Vec::new());
+        let spaces = canvas.page_spaces().to_vec();
+        assert!(!spaces.is_empty(), "the page must be laid out");
+        let centre = spaces[0].to_screen_point((160.0, 707.0));
+        let target = egui::pos2(centre.0 + origin.x, centre.1 + origin.y);
+
+        // Frame 2: press on the object.
+        let (edits, _) = draw(
+            &mut canvas,
+            vec![
+                egui::Event::PointerMoved(target),
+                egui::Event::PointerButton {
+                    pos: target,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::default(),
+                },
+            ],
+        );
+        assert!(
+            edits
+                .iter()
+                .any(|c| matches!(c, Command::SelectPageObject(Some(sel)) if *sel == id)),
+            "a press on an object at {target:?} must select it: {edits:?}"
+        );
+
+        // Frame 3: drag, then release.
+        let moved = target + egui::vec2(40.0, 25.0);
+        draw(&mut canvas, vec![egui::Event::PointerMoved(moved)]);
+        let (edits, _) = draw(
+            &mut canvas,
+            vec![egui::Event::PointerButton {
+                pos: moved,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::default(),
+            }],
+        );
+        assert!(
+            edits.iter().any(
+                |c| matches!(c, Command::SetPageObjectBounds { id: moved_id, .. } if *moved_id == id)
+            ),
+            "a drag must commit a new box: {edits:?}"
+        );
+
+        // The commit must stage a bounds ghost holding the NEW rect, so the
+        // selection outline rides the committed position until the re-render
+        // lands instead of snapping back to the stale cached bounds — and the
+        // two-phase lifecycle must retire it exactly as for text.
+        let ghost = canvas
+            .ghost_bounds(doc.id, id)
+            .expect("a committed move must stage a bounds ghost");
+        assert!(
+            (ghost.min_x - (100.0 + 40.0)).abs() < 1.0,
+            "the ghost must hold the committed rect, not the stale one: {ghost:?}"
+        );
+        // Screen y grows downward; PDF y grows upward. A drag of +25 px at
+        // zoom 1 must move the box up by 25 pt, not down.
+        assert!(
+            (ghost.min_y - (700.0 - 25.0)).abs() < 1.0,
+            "a downward screen drag must raise the box in PDF space: {ghost:?}"
+        );
+        canvas.page_objects_refreshed(doc.id, 0);
+        assert!(
+            canvas.ghost_bounds(doc.id, id).is_some(),
+            "confirmation alone must not retire the ghost — the pixels are still stale"
+        );
+        canvas.tile_rendered(doc.id, 0);
+        assert!(
+            canvas.ghost_bounds(doc.id, id).is_none(),
+            "the fresh tile retires the ghost"
+        );
+    }
+
+    /// Zoom scales the PDF delta. A 40 px drag at zoom 2 is 20 pt, and the
+    /// downward screen move still raises the box.
+    #[test]
+    fn a_drag_at_double_zoom_moves_half_as_many_points() {
+        let ctx = egui::Context::default();
+        let mut canvas = Canvas::new();
+        let doc = doc(1);
+        let view = ViewState::default();
+        let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+        let annotations: Vec<AnnotationInfo> = Vec::new();
+        let text = PageTextCache::new();
+
+        let id = PageObjectId { page: 0, index: 3 };
+        let mut objects = PageObjectCache::new();
+        objects.insert(
+            doc.id,
+            0,
+            vec![PageObjectInfo {
+                id,
+                kind: PageObjectKind::Text,
+                bounds: PdfSpaceRect::from_xywh(100.0, 700.0, 120.0, 14.0),
+                layout_bounds: PdfSpaceRect::from_xywh(100.0, 700.0, 120.0, 14.0),
+                text: Some("Hello".to_string()),
+                font_size: Some(12.0),
+                format: TextFormat::default(),
+            }],
+        );
+
+        let draw = |canvas: &mut Canvas, events: Vec<egui::Event>| {
+            let mut raw = egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            };
+            raw.events = events;
+            let mut origin = egui::pos2(0.0, 0.0);
+            let mut out = ctx.run_ui(raw, |ui| {
+                canvas.draw(
+                    ui,
+                    &doc,
+                    &view,
+                    2.0,
+                    1.0,
+                    egui::Color32::BLACK,
+                    egui::Color32::BLACK,
+                    None,
+                    None,
+                    None,
+                    egui::Color32::TRANSPARENT,
+                    Tool::Select,
+                    ContentEdit {
+                        editing: true,
+                        objects: &objects,
+                        selected: None,
+                    },
+                    &text,
+                    &annotations,
+                    None,
+                );
+                origin = ui.min_rect().min;
+            });
+            out.textures_delta.clear();
+            (canvas.take_edits(), origin)
+        };
+
+        let (_, origin) = draw(&mut canvas, Vec::new());
+        let spaces = canvas.page_spaces().to_vec();
+        assert!(
+            (spaces[0].zoom - 2.0).abs() < f32::EPSILON,
+            "the page must be laid out at zoom 2"
+        );
+        let centre = spaces[0].to_screen_point((160.0, 707.0));
+        let target = egui::pos2(centre.0 + origin.x, centre.1 + origin.y);
+
+        draw(
+            &mut canvas,
+            vec![
+                egui::Event::PointerMoved(target),
+                egui::Event::PointerButton {
+                    pos: target,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::default(),
+                },
+            ],
+        );
+        let moved = target + egui::vec2(40.0, 25.0);
+        draw(&mut canvas, vec![egui::Event::PointerMoved(moved)]);
+        draw(
+            &mut canvas,
+            vec![egui::Event::PointerButton {
+                pos: moved,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::default(),
+            }],
+        );
+
+        let ghost = canvas
+            .ghost_bounds(doc.id, id)
+            .expect("a committed move must stage a bounds ghost");
+        assert!(
+            (ghost.min_x - (100.0 + 20.0)).abs() < 1.0,
+            "40 px at zoom 2 is 20 pt: {ghost:?}"
+        );
+        assert!(
+            (ghost.min_y - (700.0 - 12.5)).abs() < 1.0,
+            "a downward screen drag still raises the box, scaled by zoom: {ghost:?}"
+        );
+    }
+
+    /// A release that never crossed the drag threshold is a click, not a move:
+    /// a press that wobbles a couple of pixels must not commit a micro-move
+    /// (undo entry + full page re-render). The first click also leaves the
+    /// editor closed, so the block can still be dragged.
+    #[test]
+    fn a_subpixel_release_is_a_click_not_a_move() {
+        let ctx = egui::Context::default();
+        let mut canvas = Canvas::new();
+        let doc = doc(1);
+        let view = ViewState::default();
+        let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+        let annotations: Vec<AnnotationInfo> = Vec::new();
+        let id = PageObjectId { page: 0, index: 3 };
+
+        let mut objects = PageObjectCache::new();
+        objects.insert(
+            doc.id,
+            0,
+            vec![PageObjectInfo {
+                id,
+                kind: PageObjectKind::Text,
+                bounds: PdfSpaceRect::from_xywh(100.0, 700.0, 120.0, 14.0),
+                layout_bounds: PdfSpaceRect::from_xywh(100.0, 700.0, 120.0, 14.0),
+                text: Some("the quick fox".to_string()),
+                font_size: Some(12.0),
+                format: TextFormat::default(),
+            }],
+        );
+
+        let draw = |canvas: &mut Canvas, events: Vec<egui::Event>| {
+            let mut raw = egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            };
+            raw.events = events;
+            let mut origin = egui::pos2(0.0, 0.0);
+            let mut out = ctx.run_ui(raw, |ui| {
+                canvas.draw(
+                    ui,
+                    &doc,
+                    &view,
+                    1.0,
+                    1.0,
+                    egui::Color32::BLACK,
+                    egui::Color32::BLACK,
+                    None,
+                    None,
+                    None,
+                    egui::Color32::TRANSPARENT,
+                    Tool::Select,
+                    ContentEdit {
+                        editing: true,
+                        objects: &objects,
+                        selected: None,
+                    },
+                    &PageTextCache::new(),
+                    &annotations,
+                    None,
+                );
+                origin = ui.min_rect().min;
+            });
+            out.textures_delta.clear();
+            (canvas.take_edits(), origin)
+        };
+
+        let (_, origin) = draw(&mut canvas, Vec::new());
+        let space = canvas.page_spaces()[0];
+        let centre = space.to_screen_point((160.0, 707.0));
+        let target = egui::pos2(centre.0 + origin.x, centre.1 + origin.y);
+
+        let mut edits = draw(
+            &mut canvas,
+            vec![
+                egui::Event::PointerMoved(target),
+                egui::Event::PointerButton {
+                    pos: target,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::default(),
+                },
+            ],
+        )
+        .0;
+        // A sloppy click: the pointer drifts 3 px between press and release —
+        // real hand tremor, not a drag.
+        let wobbled = target + egui::vec2(2.4, 1.8);
+        draw(&mut canvas, vec![egui::Event::PointerMoved(wobbled)]);
+        let (release_edits, _) = draw(
+            &mut canvas,
+            vec![egui::Event::PointerButton {
+                pos: wobbled,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::default(),
+            }],
+        );
+        edits.extend(release_edits);
+        assert!(
+            edits
+                .iter()
+                .any(|c| matches!(c, Command::SelectPageObject(Some(sel)) if *sel == id)),
+            "the press must still select: {edits:?}"
+        );
+        assert!(
+            !edits
+                .iter()
+                .any(|c| matches!(c, Command::SetPageObjectBounds { .. })),
+            "a wobbly click must never commit a micro-move: {edits:?}"
+        );
+        assert!(
+            canvas.obj_text_edit.is_none(),
+            "a first click, even a wobbly one, selects without covering the block"
+        );
+        assert!(
+            canvas.ghost_bounds(doc.id, id).is_none(),
+            "nothing was committed, so no bounds ghost may exist"
+        );
+    }
+
+    /// A resize-handle press is deliberate, so it commits even when the pointer
+    /// barely moves — the threshold applies to body drags only.
+    #[test]
+    fn a_resize_handle_press_commits_even_a_tiny_move() {
+        let ctx = egui::Context::default();
+        let mut canvas = Canvas::new();
+        let doc = doc(1);
+        let view = ViewState::default();
+        let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+        let annotations: Vec<AnnotationInfo> = Vec::new();
+        let id = PageObjectId { page: 0, index: 3 };
+        let rect = PdfSpaceRect::from_xywh(100.0, 700.0, 120.0, 14.0);
+
+        let mut objects = PageObjectCache::new();
+        objects.insert(
+            doc.id,
+            0,
+            vec![PageObjectInfo {
+                id,
+                kind: PageObjectKind::Text,
+                bounds: rect,
+                layout_bounds: rect,
+                text: Some("Hello".to_string()),
+                font_size: Some(12.0),
+                format: TextFormat::default(),
+            }],
+        );
+
+        let draw = |canvas: &mut Canvas, events: Vec<egui::Event>| {
+            let mut raw = egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            };
+            raw.events = events;
+            let mut origin = egui::pos2(0.0, 0.0);
+            let mut out = ctx.run_ui(raw, |ui| {
+                canvas.draw(
+                    ui,
+                    &doc,
+                    &view,
+                    1.0,
+                    1.0,
+                    egui::Color32::BLACK,
+                    egui::Color32::BLACK,
+                    None,
+                    None,
+                    None,
+                    egui::Color32::TRANSPARENT,
+                    Tool::Select,
+                    ContentEdit {
+                        editing: true,
+                        objects: &objects,
+                        selected: Some(id),
+                    },
+                    &PageTextCache::new(),
+                    &annotations,
+                    None,
+                );
+                origin = ui.min_rect().min;
+            });
+            out.textures_delta.clear();
+            (canvas.take_edits(), origin)
+        };
+
+        let (_, origin) = draw(&mut canvas, Vec::new());
+        let space = canvas.page_spaces()[0];
+        let sr = space.to_screen(rect);
+        // The North-West handle as the user sees it.
+        let handle = egui::pos2(sr.x + origin.x, sr.y + origin.y);
+
+        draw(
+            &mut canvas,
+            vec![
+                egui::Event::PointerMoved(handle),
+                egui::Event::PointerButton {
+                    pos: handle,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::default(),
+                },
+            ],
+        );
+        // One pixel of drag — far below the body-drag threshold.
+        let nudged = handle + egui::vec2(-1.0, -1.0);
+        draw(&mut canvas, vec![egui::Event::PointerMoved(nudged)]);
+        let (edits, _) = draw(
+            &mut canvas,
+            vec![egui::Event::PointerButton {
+                pos: nudged,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::default(),
+            }],
+        );
+        assert!(
+            edits.iter().any(
+                |c| matches!(c, Command::SetPageObjectBounds { id: moved_id, .. } if *moved_id == id)
+            ),
+            "a resize-handle drag is deliberate and must commit even 1 px: {edits:?}"
+        );
+    }
+
+    /// The bounds-ghost lifecycle, driven directly: staged on commit,
+    /// confirmed by the engine's re-list, retired by the first fresh tile, and
+    /// dropped outright when the edit is refused.
+    #[test]
+    fn a_moved_object_outline_rides_a_bounds_ghost_until_rendered() {
+        let mut canvas = Canvas::new();
+        let doc = doc(1);
+        let id = PageObjectId { page: 2, index: 5 };
+        let committed = PdfSpaceRect::from_xywh(40.0, 50.0, 100.0, 12.0);
+
+        canvas.stage_bounds_ghost(doc.id, id, committed);
+        assert_eq!(canvas.ghost_bounds(doc.id, id), Some(committed));
+
+        // Confirmation alone is not enough: the pixels are still stale.
+        canvas.page_objects_refreshed(doc.id, 2);
+        assert_eq!(
+            canvas.ghost_bounds(doc.id, id),
+            Some(committed),
+            "a confirmed ghost must ride until the page re-renders"
+        );
+
+        // The first fresh tile retires it.
+        canvas.tile_rendered(doc.id, 2);
+        assert_eq!(canvas.ghost_bounds(doc.id, id), None);
+
+        // A refused edit drops the ghost outright — it would otherwise show
+        // the object somewhere it is not.
+        canvas.stage_bounds_ghost(doc.id, id, committed);
+        canvas.page_object_edit_failed(doc.id, 2);
+        assert_eq!(canvas.ghost_bounds(doc.id, id), None);
+
+        // Another document's signals leave the ghost alone.
+        let other = DocumentId::from_raw(doc.id.raw() + 1);
+        canvas.stage_bounds_ghost(doc.id, id, committed);
+        canvas.page_objects_refreshed(other, 2);
+        canvas.tile_rendered(other, 2);
+        assert_eq!(
+            canvas.ghost_bounds(doc.id, id),
+            Some(committed),
+            "another document's refresh must not retire this ghost"
+        );
+    }
+
+    /// Splicing replaces the character range and nothing else.
+    ///
+    /// Counted in characters rather than bytes: a run may hold any script, and a
+    /// byte offset would split a multi-byte character in half.
+    #[test]
+    fn splicing_replaces_only_the_range_it_is_given() {
+        assert_eq!(splice("the quick fox", 4, 9, "slow"), "the slow fox");
+        assert_eq!(splice("the quick fox", 4, 9, ""), "the  fox");
+        assert_eq!(splice("abc", 0, 3, "xyz"), "xyz");
+        // Multi-byte: "wörld" is 5 characters but 6 bytes.
+        assert_eq!(splice("héllo wörld", 6, 11, "there"), "héllo there");
+        // Out-of-range ends are clamped rather than panicking.
+        assert_eq!(splice("abc", 1, 99, "Z"), "aZ");
+        assert_eq!(splice("abc", 99, 99, "Z"), "abcZ");
+    }
+
+    /// A double-click edits the word it landed on, not the whole line.
+    ///
+    /// This is the difference between an editor and a text-replacement tool: a
+    /// text object is a line, so without this every keystroke would replace all
+    /// of it.
+    #[test]
+    fn a_click_finds_the_word_it_landed_on() {
+        let run = "the quick fox";
+        let bounds = PdfSpaceRect::from_xywh(0.0, 0.0, 100.0, 12.0);
+
+        // One line of characters, laid out left to right like a real run.
+        let mut chars = Vec::new();
+        let mut x = 2.0;
+        for ch in run.chars() {
+            chars.push(CharBox {
+                ch,
+                rect: PdfSpaceRect::from_xywh(x, 2.0, 5.0, 8.0),
+                line: 0,
+                word: 0,
+            });
+            x += 6.0;
+        }
+        let text = pdfreader_pdf::text::build(chars);
+
+        // A point inside "quick", which is characters 4..9.
+        let (start, end, word) =
+            word_span(run, bounds, &text, (30.0, 6.0)).expect("the point is over a word");
+        assert_eq!(word, "quick");
+        assert_eq!((start, end), (4, 9));
+        assert_eq!(splice(run, start, end, "slow"), "the slow fox");
+
+        // A point inside "fox", the last word.
+        let (_, _, word) = word_span(run, bounds, &text, (70.0, 6.0)).expect("over a word");
+        assert_eq!(word, "fox");
+
+        // A point nowhere near this run: no span, so the caller edits the run.
+        let elsewhere = PdfSpaceRect::from_xywh(500.0, 500.0, 50.0, 10.0);
+        assert!(word_span(run, elsewhere, &text, (30.0, 6.0)).is_none());
+    }
+
+    /// The content editor's hit test takes the **smallest** object under the
+    /// point, so a caption sitting on a picture selects the caption rather than
+    /// the picture behind it — the same rule annotation selection uses.
+    #[test]
+    fn the_smallest_page_object_under_the_pointer_wins() {
+        let geom = PageGeometry {
+            width_pt: 200.0,
+            height_pt: 100.0,
+            origin_x: 0.0,
+            origin_y: 0.0,
+        };
+        let space = PageSpace::new(
+            PageBox::new(0, 0.0, 0.0, 200.0, 100.0),
+            geom,
+            Rotation::None,
+            1.0,
+        );
+        let spaces = vec![space];
+        let doc = DocumentId::from_raw(9);
+
+        let picture = PageObjectInfo {
+            id: PageObjectId { page: 0, index: 0 },
+            kind: PageObjectKind::Image,
+            bounds: PdfSpaceRect::from_xywh(10.0, 10.0, 180.0, 80.0),
+            layout_bounds: PdfSpaceRect::from_xywh(10.0, 10.0, 180.0, 80.0),
+            text: None,
+            font_size: None,
+            format: TextFormat::default(),
+        };
+        let caption = PageObjectInfo {
+            id: PageObjectId { page: 0, index: 1 },
+            kind: PageObjectKind::Text,
+            bounds: PdfSpaceRect::from_xywh(40.0, 40.0, 60.0, 10.0),
+            layout_bounds: PdfSpaceRect::from_xywh(40.0, 40.0, 60.0, 10.0),
+            text: Some("A caption".to_string()),
+            font_size: Some(9.0),
+            format: TextFormat::default(),
+        };
+
+        let mut objects = PageObjectCache::new();
+        objects.insert(doc, 0, vec![picture.clone(), caption.clone()]);
+
+        // A point inside both: the smaller one wins.
+        let both = space.to_screen_point((50.0, 45.0));
+        assert_eq!(
+            object_hit(&objects, &spaces, doc, pos2(both.0, both.1)).map(|o| o.id),
+            Some(caption.id)
+        );
+
+        // A point inside only the picture.
+        let only_picture = space.to_screen_point((20.0, 20.0));
+        assert_eq!(
+            object_hit(&objects, &spaces, doc, pos2(only_picture.0, only_picture.1)).map(|o| o.id),
+            Some(picture.id)
+        );
+
+        // Bare page.
+        let bare = space.to_screen_point((5.0, 95.0));
+        assert!(object_hit(&objects, &spaces, doc, pos2(bare.0, bare.1)).is_none());
+
+        // A document whose list was never read has nothing to hit.
+        let unread = DocumentId::from_raw(10);
+        assert!(object_hit(&objects, &spaces, unread, pos2(both.0, both.1)).is_none());
+    }
+
+    /// While the content editor is on, a drag across the page must not start an
+    /// annotation. The toolbar dims the tools, but the canvas has to refuse the
+    /// gesture as well: an armed tool would otherwise draw a mark under the
+    /// pointer while the user is trying to move a heading.
+    #[test]
+    fn edit_mode_suppresses_annotation_drawing() {
+        let ctx = egui::Context::default();
+        let mut canvas = Canvas::new();
+        let doc = doc(1);
+        let view = ViewState::default();
+        let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+        let annotations: Vec<AnnotationInfo> = Vec::new();
+        let text = PageTextCache::new();
+
+        // Press, drag, release — the gesture that commits a highlight.
+        let gesture = || {
+            vec![
+                vec![
+                    egui::Event::PointerMoved(egui::pos2(200.0, 200.0)),
+                    egui::Event::PointerButton {
+                        pos: egui::pos2(200.0, 200.0),
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::default(),
+                    },
+                ],
+                vec![egui::Event::PointerMoved(egui::pos2(300.0, 250.0))],
+                vec![egui::Event::PointerButton {
+                    pos: egui::pos2(300.0, 250.0),
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::default(),
+                }],
+            ]
+        };
+
+        let draw_with_editor = |canvas: &mut Canvas, editing: bool| {
+            let mut produced = Vec::new();
+            for events in gesture() {
+                let mut raw = egui::RawInput {
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                };
+                raw.events = events;
+                let mut out = ctx.run_ui(raw, |ui| {
+                    canvas.draw(
+                        ui,
+                        &doc,
+                        &view,
+                        1.0,
+                        1.0,
+                        egui::Color32::BLACK,
+                        egui::Color32::BLACK,
+                        None,
+                        None,
+                        None,
+                        egui::Color32::TRANSPARENT,
+                        Tool::Highlight,
+                        ContentEdit {
+                            editing,
+                            objects: empty_object_cache(),
+                            selected: None,
+                        },
+                        &text,
+                        &annotations,
+                        None,
+                    );
+                });
+                out.textures_delta.clear();
+                produced.extend(canvas.take_edits());
+            }
+            produced
+        };
+
+        // With the editor off the same gesture draws a highlight.
+        let drawn = draw_with_editor(&mut canvas, false);
+        assert!(
+            drawn
+                .iter()
+                .any(|c| matches!(c, Command::AddAnnotation { .. })),
+            "the highlight tool must still draw when the editor is off: {drawn:?}"
+        );
+
+        // With it on, the identical gesture must produce no annotation at all.
+        let suppressed = draw_with_editor(&mut canvas, true);
+        assert!(
+            !suppressed
+                .iter()
+                .any(|c| matches!(c, Command::AddAnnotation { .. })),
+            "edit mode must not draw annotations: {suppressed:?}"
         );
     }
 }

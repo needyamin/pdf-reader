@@ -16,14 +16,19 @@
 //! readiness rules, the suggested file names — is a pure function on this type
 //! so it can be unit tested without a window or a document.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use egui::{Color32, Context, RichText, Vec2};
+use egui::{
+    Align2, Color32, Context, FontId, Id, Pos2, Rect, RichText, Sense, Shape, Stroke, StrokeKind,
+    Vec2,
+};
 use pdfreader_core::{
     Command, ExportDpi, ExportTask, ImageFormat, ImagePageSize, PageRange, Tab, pixel_size,
 };
 use pdfreader_ui::{
-    Palette, card_frame, disabled_button, field_frame, primary_button, secondary_button, section,
+    Icon, Palette, card_frame, disabled_button, draw_icon, field_frame, primary_button,
+    secondary_button, section,
 };
 
 /// Image extensions the reader can decode.
@@ -39,19 +44,67 @@ const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg"];
 /// feeling cramped.
 const WINDOW_WIDTH: f32 = 1140.0;
 
-/// Minimum height of the task-strip / settings row.
+/// Preferred height of the task-strip / settings row.
 ///
 /// The window is a modal sized by its content, so a short task (Page to image
 /// is two sections) used to produce a squat window next to a tall one (Merge
 /// PDFs, with the file list). Pinning the row's height keeps every task the
-/// same shape and gives the whole window real height.
-const BODY_HEIGHT: f32 = 600.0;
+/// same shape.
+///
+/// It is a *preference*, not a promise: [`show`](ExportWindow::show) shrinks the
+/// row when the viewport cannot hold it, so the header and the footer always
+/// stay on screen.
+const BODY_HEIGHT: f32 = 560.0;
+
+/// Smallest the body is ever squeezed to.
+///
+/// Below this the pane stops being usable, so on a very short viewport the
+/// window is allowed to reach the edge rather than collapse to nothing.
+const MIN_BODY_HEIGHT: f32 = 240.0;
+
+/// Margin kept between the window and the edge of the viewport, top and bottom.
+const MODAL_MARGIN: f32 = 24.0;
+
+/// Vertical room the footer block needs: the gap above it, its separator, the
+/// space under that, and the button row.
+const FOOTER_BLOCK: f32 = 16.0 + 1.0 + 12.0 + 40.0;
 
 /// Width of the task strip on the left.
-const STRIP_WIDTH: f32 = 210.0;
+///
+/// Wide enough for a two-line card — the task name over the sentence that says
+/// what it makes — because the chooser is the first thing a user reads and a
+/// bare name ("Pages to images") leaves them guessing what will come out.
+const STRIP_WIDTH: f32 = 268.0;
+
+/// Height of one card in the export chooser.
+///
+/// Fits the name plus two lines of description, which is what every task's
+/// sentence needs at this width, with a little air around them.
+const CARD_HEIGHT: f32 = 58.0;
+
+/// Width reserved at the left of a chooser card for its pictogram.
+const GLYPH_COLUMN: f32 = 40.0;
 
 /// Height of the scrollable file list for the composition tasks.
-const LIST_HEIGHT: f32 = 320.0;
+///
+/// Bounded rather than unbounded so a long stack cannot push the output
+/// preview, the destination and the result card out of reach.
+const LIST_HEIGHT: f32 = 240.0;
+
+/// Height of one row in the ordered file stack.
+const ROW_HEIGHT: f32 = 46.0;
+/// Size of the drag handle at the head of a row.
+const HANDLE_SIZE: f32 = 18.0;
+/// Size of a row's icon button.
+const BUTTON_SIZE: f32 = 22.0;
+/// Size of the square preview box on a row.
+const TILE_SIZE: f32 = 34.0;
+/// Padding inside a row, left and right.
+const ROW_PAD: f32 = 6.0;
+/// Size of one tile in the output-order strip.
+const PREVIEW_TILE_W: f32 = 34.0;
+/// Height of one tile in the output-order strip, number included.
+const PREVIEW_TILE_H: f32 = 44.0;
 
 /// Size of the square the page preview is fitted into.
 ///
@@ -367,6 +420,46 @@ impl ExportWindow {
         self.sources.clear();
     }
 
+    /// Move one entry to a new position, sliding the rest along.
+    ///
+    /// The destination is the index the entry ends up at, not the gap it is
+    /// dropped into: a drag from row 4 onto row 1 puts it first, which is what
+    /// the gesture looks like it should do.
+    pub fn move_source_to(&mut self, from: usize, to: usize) {
+        if from == to || from >= self.sources.len() || to >= self.sources.len() {
+            return;
+        }
+        let entry = self.sources.remove(from);
+        self.sources.insert(to, entry);
+    }
+
+    /// Flip the list end to end.
+    ///
+    /// The usual fix for a stack of scans that arrived in the wrong direction,
+    /// and the reason it is a button rather than something to do by hand.
+    pub fn reverse_sources(&mut self) {
+        self.sources.reverse();
+    }
+
+    /// Put the list in file-name order, case-insensitively.
+    pub fn sort_sources_by_name(&mut self) {
+        self.sources.sort_by_key(|entry| {
+            entry
+                .path
+                .file_name()
+                .map(|name| name.to_string_lossy().to_lowercase())
+                .unwrap_or_default()
+        });
+    }
+
+    /// The files in the list, in the order they will be used.
+    pub fn source_paths(&self) -> Vec<&Path> {
+        self.sources
+            .iter()
+            .map(|entry| entry.path.as_path())
+            .collect()
+    }
+
     /// The destination to pre-fill for the current task.
     ///
     /// `None` for a task that has no sensible guess, which leaves the Export
@@ -484,13 +577,122 @@ impl ExportWindow {
         })
     }
 
+    /// The plain-language result of pressing the action button.
+    ///
+    /// Two strings: a headline saying what comes out ("12 image files"), and a
+    /// detail line carrying the numbers that decide whether it is the *right*
+    /// result — the pixel size, the format, the page size. It is shown while the
+    /// options are still being set, so the outcome is known before the button is
+    /// pressed rather than discovered after.
+    fn outcome(&self, doc: &OpenDocument<'_>) -> (String, String) {
+        match self.task {
+            ExportTask::PageImage => {
+                let detail = doc.page_size.map_or_else(
+                    || format!("{} · {}", self.format.label(), self.dpi.label()),
+                    |(width, height)| {
+                        let (w, h) = pixel_size(width, height, self.dpi.scale());
+                        format!(
+                            "{w} × {h} px · {} · {}",
+                            self.format.label(),
+                            self.dpi.label()
+                        )
+                    },
+                );
+                (format!("1 {} image", self.format.label()), detail)
+            }
+            ExportTask::AllPageImages => {
+                let detail = doc.page_size.map_or_else(
+                    || format!("{} · {}", self.format.label(), self.dpi.label()),
+                    |(width, height)| {
+                        let (w, h) = pixel_size(width, height, self.dpi.scale());
+                        format!(
+                            "Each {w} × {h} px · {} · {}",
+                            self.format.label(),
+                            self.dpi.label()
+                        )
+                    },
+                );
+                let headline = if doc.pages == 1 {
+                    "1 image file".to_string()
+                } else {
+                    format!("{} image files", doc.pages)
+                };
+                (headline, detail)
+            }
+            ExportTask::PagePdf => {
+                let pages = self.typed_range(doc).map_or(0, PageRange::len);
+                (
+                    format!("A {pages}-page PDF"),
+                    "Contains only the pages you chose.".to_string(),
+                )
+            }
+            ExportTask::ImagesToPdf => (
+                format!("A {}-page PDF", self.sources.len()),
+                format!("One image per page · {}", self.page_size.label()),
+            ),
+            ExportTask::MergePdfs => (
+                format!("A PDF from {} files", self.sources.len()),
+                "Joined in the order shown above.".to_string(),
+            ),
+        }
+    }
+
+    /// The "what you'll get" card, drawn under the settings.
+    ///
+    /// A dot carries the ready / not-ready state, matching the status bar's own
+    /// dot, so the card reads as a live summary rather than a static label.
+    fn outcome_card(&self, ui: &mut egui::Ui, palette: &Palette, doc: &OpenDocument<'_>) {
+        let (headline, detail) = self.outcome(doc);
+        let ready = self.readiness(doc).is_ok();
+
+        card_frame(palette)
+            .inner_margin(egui::Margin::symmetric(12, 9))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    let (rect, _) = ui.allocate_exact_size(Vec2::splat(10.0), Sense::hover());
+                    ui.painter().circle_filled(
+                        rect.center(),
+                        3.5,
+                        if ready {
+                            palette.accent
+                        } else {
+                            palette.text_dim
+                        },
+                    );
+                    ui.add_space(2.0);
+                    ui.label(
+                        RichText::new("WHAT YOU'LL GET")
+                            .color(palette.text_dim)
+                            .size(10.0)
+                            .strong(),
+                    );
+                });
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(headline)
+                        .color(palette.text)
+                        .size(14.0)
+                        .strong(),
+                );
+                ui.add_space(2.0);
+                ui.label(RichText::new(detail).color(palette.text_dim).size(11.0));
+            });
+    }
+
     /// Draw the window and report what the user did.
+    ///
+    /// `thumbs` holds the previews the shell has decoded for the files in the
+    /// list, keyed by path. They arrive from outside because decoding is IO and
+    /// this module does none — a file with no preview yet simply draws its type
+    /// badge until one is ready.
     pub fn show(
         &mut self,
         ctx: &Context,
         palette: &Palette,
         doc: &OpenDocument<'_>,
         preview: Option<&egui::TextureHandle>,
+        thumbs: &HashMap<PathBuf, egui::TextureHandle>,
     ) -> Action {
         let mut action = Action::None;
 
@@ -503,23 +705,40 @@ impl ExportWindow {
             .backdrop_color(Color32::from_black_alpha(120))
             .show(ctx, |ui| {
                 ui.set_width(WINDOW_WIDTH);
+
+                // The header is measured as it is drawn rather than guessed at,
+                // so the body can be given exactly the room that is left.
+                let top = ui.min_rect().top();
                 self.header(ui, palette);
                 ui.add_space(14.0);
                 ui.separator();
                 ui.add_space(14.0);
+                let header_height = ui.min_rect().bottom() - top;
 
-                ui.horizontal_top(|ui| {
-                    ui.set_min_height(BODY_HEIGHT);
-                    ui.vertical(|ui| {
-                        ui.set_width(STRIP_WIDTH);
-                        self.task_strip(ui, palette, doc);
+                // Cap the body to what the viewport can actually show once the
+                // header, the footer and the window's own margin are accounted
+                // for. The pane scrolls inside that cap, so the window never
+                // grows past the screen and the header and footer never move.
+                let budget = body_budget(ctx.content_rect().height(), header_height);
+
+                egui::ScrollArea::vertical()
+                    .id_salt("export-body")
+                    .max_height(budget)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.horizontal_top(|ui| {
+                            ui.set_min_height(budget);
+                            ui.vertical(|ui| {
+                                ui.set_width(STRIP_WIDTH);
+                                self.task_strip(ui, palette, doc);
+                            });
+                            ui.add_space(18.0);
+                            ui.vertical(|ui| {
+                                ui.set_width(ui.available_width());
+                                self.body(ui, palette, doc, preview, thumbs);
+                            });
+                        });
                     });
-                    ui.add_space(18.0);
-                    ui.vertical(|ui| {
-                        ui.set_width(ui.available_width());
-                        self.body(ui, palette, doc, preview);
-                    });
-                });
 
                 ui.add_space(16.0);
                 ui.separator();
@@ -539,48 +758,71 @@ impl ExportWindow {
         action
     }
 
-    /// Title and the sentence that says what the task produces.
+    /// Title, the sentence that says what the whole window does, and the
+    /// banner for the task in view.
+    ///
+    /// The intro line is deliberately about the window rather than the task:
+    /// a first-time user has to learn that one pane covers all five jobs
+    /// before the task name under it means anything.
     fn header(&self, ui: &mut egui::Ui, palette: &Palette) {
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new("Export")
-                    .color(palette.text)
-                    .size(17.0)
-                    .strong(),
-            );
-            ui.add_space(6.0);
-            ui.label(RichText::new("·").color(palette.text_dim).size(15.0));
-            ui.add_space(6.0);
-            ui.label(
-                RichText::new(self.task.label())
-                    .color(palette.accent)
-                    .size(15.0),
-            );
-        });
-        ui.add_space(3.0);
         ui.label(
-            RichText::new(self.task.blurb())
-                .color(palette.text_dim)
-                .size(12.0),
+            RichText::new("Export")
+                .color(palette.text)
+                .size(19.0)
+                .strong(),
         );
+        ui.add_space(2.0);
+        ui.label(
+            RichText::new(
+                "Turn pages into pictures, build a PDF from pictures, or join PDFs into one.",
+            )
+            .color(palette.text_dim)
+            .size(12.0),
+        );
+
+        ui.add_space(12.0);
+
+        // The task banner: what is selected, and what it produces. Carried in a
+        // soft accent card so the current choice is unmistakable from the header
+        // alone, without reading down to the highlighted card.
+        card_frame(palette)
+            .inner_margin(egui::Margin::symmetric(12, 8))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(self.task.label())
+                            .color(palette.accent)
+                            .size(14.0)
+                            .strong(),
+                    );
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new(self.task.blurb())
+                            .color(palette.text_dim)
+                            .size(12.0),
+                    );
+                });
+            });
     }
 
-    /// The list of tasks down the left-hand side.
+    /// The chooser down the left-hand side: one card per export.
     fn task_strip(&mut self, ui: &mut egui::Ui, palette: &Palette, doc: &OpenDocument<'_>) {
-        section(ui, palette, "WHAT TO MAKE");
-        ui.add_space(6.0);
+        step_header(ui, palette, "1", "Choose an export");
+        ui.add_space(8.0);
 
         // Only one task can be switched to per frame, so the change is applied
         // after the loop rather than while the list is being drawn.
         let mut chosen = None;
         for task in ExportTask::ALL {
             // A task that reads the open document cannot be offered when there
-            // is none: a disabled row that explains itself beats a row that
-            // silently does nothing.
+            // is none: a disabled card that still shows what it would do beats
+            // one that silently does nothing.
             let usable = !task.needs_document() || doc.is_open();
-            if task_row(ui, palette, task.label(), task == self.task, usable) {
+            if task_card(ui, palette, task, task == self.task, usable) {
                 chosen = Some(task);
             }
+            ui.add_space(6.0);
         }
 
         if let Some(task) = chosen {
@@ -595,13 +837,16 @@ impl ExportWindow {
         palette: &Palette,
         doc: &OpenDocument<'_>,
         preview: Option<&egui::TextureHandle>,
+        thumbs: &HashMap<PathBuf, egui::TextureHandle>,
     ) {
+        step_header(ui, palette, "2", "Set the options");
+        ui.add_space(8.0);
         match self.task {
             ExportTask::PageImage => self.image_body(ui, palette, doc, preview, true),
             ExportTask::AllPageImages => self.image_body(ui, palette, doc, preview, false),
             ExportTask::PagePdf => self.pdf_body(ui, palette, doc, preview),
-            ExportTask::ImagesToPdf => self.images_body(ui, palette),
-            ExportTask::MergePdfs => self.merge_body(ui, palette),
+            ExportTask::ImagesToPdf => self.images_body(ui, palette, doc, thumbs),
+            ExportTask::MergePdfs => self.merge_body(ui, palette, doc, thumbs),
         }
     }
 
@@ -667,6 +912,8 @@ impl ExportWindow {
 
                 ui.add_space(16.0);
                 self.output_row(ui, palette, doc.title);
+                ui.add_space(14.0);
+                self.outcome_card(ui, palette, doc);
             });
         });
     }
@@ -732,12 +979,20 @@ impl ExportWindow {
 
                 ui.add_space(16.0);
                 self.output_row(ui, palette, doc.title);
+                ui.add_space(14.0);
+                self.outcome_card(ui, palette, doc);
             });
         });
     }
 
     /// Settings for "images become the pages of a new PDF".
-    fn images_body(&mut self, ui: &mut egui::Ui, palette: &Palette) {
+    fn images_body(
+        &mut self,
+        ui: &mut egui::Ui,
+        palette: &Palette,
+        doc: &OpenDocument<'_>,
+        thumbs: &HashMap<PathBuf, egui::TextureHandle>,
+    ) {
         section(ui, palette, "PAGE SIZE");
         ui.add_space(6.0);
         let labels: Vec<&str> = ImagePageSize::ALL.iter().map(|s| s.label()).collect();
@@ -758,40 +1013,79 @@ impl ExportWindow {
         ui.add_space(16.0);
         section(ui, palette, "IMAGES — ONE PAGE EACH, IN THIS ORDER");
         ui.add_space(6.0);
-        self.source_list(ui, palette, Field::AddImages, "Add images…", "image");
+        self.source_list(
+            ui,
+            palette,
+            thumbs,
+            Field::AddImages,
+            "Add images…",
+            "image",
+        );
         ui.add_space(16.0);
         self.output_row(ui, palette, None);
+        ui.add_space(14.0);
+        self.outcome_card(ui, palette, doc);
     }
 
     /// Settings for "join several PDFs into one".
-    fn merge_body(&mut self, ui: &mut egui::Ui, palette: &Palette) {
+    fn merge_body(
+        &mut self,
+        ui: &mut egui::Ui,
+        palette: &Palette,
+        doc: &OpenDocument<'_>,
+        thumbs: &HashMap<PathBuf, egui::TextureHandle>,
+    ) {
         section(ui, palette, "PDFS TO JOIN — IN THIS ORDER");
         ui.add_space(6.0);
-        self.source_list(ui, palette, Field::AddPdfs, "Add PDFs…", "document");
+        self.source_list(ui, palette, thumbs, Field::AddPdfs, "Add PDFs…", "document");
         ui.add_space(16.0);
         self.output_row(ui, palette, None);
+        ui.add_space(14.0);
+        self.outcome_card(ui, palette, doc);
     }
 
-    /// The ordered file list shared by the two composition tasks.
+    /// The ordered file stack shared by the two composition tasks.
+    ///
+    /// Order is the whole job here, so it gets three ways in: drag a row by its
+    /// handle, nudge it with the arrows, or set the whole list at once with
+    /// Reverse and Sort. The strip under the list shows the result of all three
+    /// instead of leaving the user to imagine it.
     fn source_list(
         &mut self,
         ui: &mut egui::Ui,
         palette: &Palette,
+        thumbs: &HashMap<PathBuf, egui::TextureHandle>,
         field: Field,
         add_label: &str,
         noun: &str,
     ) {
-        let mut browse = false;
-
         ui.horizontal(|ui| {
             if ui.add(primary_button(palette, add_label)).clicked() {
-                browse = true;
+                self.pending_browse = Some(field);
             }
-            ui.add_enabled_ui(!self.sources.is_empty(), |ui| {
-                if ui.add(secondary_button(palette, "Clear")).clicked() {
-                    self.clear_sources();
-                }
-            });
+
+            // The whole-list actions sit next to Add so they read as operations
+            // on the stack rather than on the row the pointer happens to be on.
+            let many = self.sources.len() > 1;
+            if icon_button(ui, palette, Icon::Reverse, many)
+                .on_hover_text("Reverse the order")
+                .clicked()
+            {
+                self.reverse_sources();
+            }
+            if icon_button(ui, palette, Icon::SortName, many)
+                .on_hover_text("Sort by file name")
+                .clicked()
+            {
+                self.sort_sources_by_name();
+            }
+            if icon_button(ui, palette, Icon::Remove, !self.sources.is_empty())
+                .on_hover_text("Remove every file")
+                .clicked()
+            {
+                self.clear_sources();
+            }
+
             ui.add_space(4.0);
             ui.label(
                 RichText::new(count_label(self.sources.len(), noun))
@@ -807,16 +1101,17 @@ impl ExportWindow {
         // around it.
         let mut actions = ListActions::default();
 
-        let frame = card_frame(palette).inner_margin(egui::Margin::same(6));
-
-        frame.show(ui, |ui| {
-            egui::ScrollArea::vertical()
-                .max_height(LIST_HEIGHT)
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    draw_source_rows(ui, palette, &self.sources, noun, &mut actions);
-                });
-        });
+        card_frame(palette)
+            .inner_margin(egui::Margin::same(6))
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("export-source-list")
+                    .max_height(LIST_HEIGHT)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        draw_source_rows(ui, palette, &self.sources, thumbs, noun, &mut actions);
+                    });
+            });
 
         if let Some(index) = actions.remove {
             self.remove_source(index);
@@ -827,9 +1122,24 @@ impl ExportWindow {
         if let Some(index) = actions.move_down {
             self.move_source(index, 1);
         }
-        if browse {
-            // Handled by the caller through the returned action.
-            self.pending_browse = Some(field);
+        if let Some((from, to)) = actions.reorder {
+            self.move_source_to(from, to);
+        }
+
+        if !self.sources.is_empty() {
+            ui.add_space(12.0);
+            let caption = if field == Field::AddImages {
+                format!(
+                    "{} — one page each",
+                    count_label(self.sources.len(), "image")
+                )
+            } else {
+                format!(
+                    "{} joined in this order",
+                    count_label(self.sources.len(), "document")
+                )
+            };
+            order_preview(ui, palette, &self.sources, thumbs, &caption);
         }
     }
 
@@ -1060,17 +1370,65 @@ fn segmented(
     picked
 }
 
-/// One row of the task strip.
-fn task_row(
+/// The vertical room the body may use, given the viewport and the measured
+/// header.
+///
+/// The whole point is that the window is a *modal sized by its content*, so a
+/// tall task would otherwise push the header and the footer off the screen —
+/// which is exactly what happened once the file stack, its preview and the
+/// result card were added to the same column. Capping the body and letting it
+/// scroll inside the cap keeps the two things a user always needs — what this
+/// window is, and the button that finishes it — pinned in place.
+///
+/// Split out as a pure function so the rule is testable without a window.
+fn body_budget(viewport_height: f32, header_height: f32) -> f32 {
+    (viewport_height - 2.0 * MODAL_MARGIN - header_height - FOOTER_BLOCK)
+        .clamp(MIN_BODY_HEIGHT, BODY_HEIGHT)
+}
+
+/// A numbered step heading: a filled badge with the step number and a title.
+///
+/// The export pane is a short flow — choose, set, save — so numbering the two
+/// halves tells a first-time user where to start and that the right-hand column
+/// is a consequence of the left, not a second, independent choice.
+fn step_header(ui: &mut egui::Ui, palette: &Palette, number: &str, title: &str) {
+    ui.horizontal(|ui| {
+        let (rect, _) = ui.allocate_exact_size(Vec2::splat(19.0), Sense::hover());
+        ui.painter()
+            .circle_filled(rect.center(), 9.5, palette.accent_soft);
+        ui.painter().text(
+            rect.center(),
+            Align2::CENTER_CENTER,
+            number,
+            FontId::proportional(11.0),
+            palette.accent,
+        );
+        ui.add_space(3.0);
+        ui.label(RichText::new(title).strong().color(palette.text).size(13.0));
+    });
+}
+
+/// One card in the export chooser: a pictogram, the task name, and the sentence
+/// saying what it makes.
+///
+/// Larger than the plain row it replaced because the chooser is the first thing
+/// a user reads: a name alone ("Pages to images") leaves them guessing, while
+/// the line under it says exactly what will come out. The whole card is the hit
+/// target, so there is no small label to aim at.
+fn task_card(
     ui: &mut egui::Ui,
     palette: &Palette,
-    label: &str,
+    task: ExportTask,
     selected: bool,
     enabled: bool,
 ) -> bool {
     let width = ui.available_width();
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 30.0), egui::Sense::click());
-    let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, CARD_HEIGHT), Sense::click());
+    let response = response.on_hover_cursor(if enabled {
+        egui::CursorIcon::PointingHand
+    } else {
+        egui::CursorIcon::Default
+    });
 
     let fill = if selected {
         palette.accent_soft
@@ -1079,31 +1437,198 @@ fn task_row(
     } else {
         palette.surface
     };
-    ui.painter()
-        .rect_filled(rect, pdfreader_ui::card_radius(palette), fill);
-
+    let radius = pdfreader_ui::card_radius(palette);
+    ui.painter().rect_filled(rect, radius, fill);
+    // A hairline keeps the card edge visible on themes where `surface` and
+    // `panel_bg` are close; it brightens to the accent on the chosen card.
+    ui.painter().rect_stroke(
+        rect,
+        radius,
+        Stroke::new(
+            1.0,
+            if selected {
+                palette.accent
+            } else {
+                palette.border
+            },
+        ),
+        StrokeKind::Inside,
+    );
     if selected {
-        let bar = egui::Rect::from_min_size(
-            rect.min + Vec2::new(0.0, 5.0),
-            Vec2::new(3.0, rect.height() - 10.0),
+        let bar = Rect::from_min_size(
+            rect.min + Vec2::new(0.0, 6.0),
+            Vec2::new(3.0, rect.height() - 12.0),
         );
         ui.painter().rect_filled(bar, 2.0, palette.accent);
     }
 
-    let colour = match (enabled, selected) {
-        (false, _) => palette.text_dim.gamma_multiply(0.55),
-        (true, true) => palette.text,
-        (true, false) => palette.text_dim,
+    let ink = match (enabled, selected) {
+        (false, _) => palette.text_dim.gamma_multiply(0.6),
+        (true, _) => palette.text,
     };
-    ui.painter().text(
-        rect.min + Vec2::new(13.0, rect.height() / 2.0),
-        egui::Align2::LEFT_CENTER,
-        label,
-        egui::FontId::proportional(12.5),
-        colour,
+
+    // Pictogram, centred in its own column.
+    task_glyph(
+        ui.painter(),
+        rect.min + Vec2::new(GLYPH_COLUMN / 2.0, rect.height() / 2.0),
+        task,
+        if enabled { palette.accent } else { ink },
     );
 
+    // Text column, laid out with wrapping so a long sentence stays inside the
+    // card instead of running under the next one.
+    let text_left = rect.min.x + GLYPH_COLUMN + 2.0;
+    let wrap = (rect.max.x - text_left - 12.0).max(48.0);
+    let title =
+        ui.painter()
+            .layout_no_wrap(task.label().to_owned(), FontId::proportional(12.5), ink);
+    let desc = ui.painter().layout(
+        task.blurb().to_owned(),
+        FontId::proportional(10.5),
+        palette
+            .text_dim
+            .gamma_multiply(if enabled { 1.0 } else { 0.6 }),
+        wrap,
+    );
+    let title_height = title.size().y;
+    let content_height = title_height + 2.0 + desc.size().y;
+    let mut y = rect.center().y - content_height / 2.0;
+    let painter = ui.painter().with_clip_rect(rect);
+    painter.galley(Pos2::new(text_left, y), title, ink);
+    y += title_height + 2.0;
+    painter.galley(Pos2::new(text_left, y), desc, palette.text_dim);
+
     enabled && response.clicked()
+}
+
+/// A small pictogram for one export task, drawn with the painter so it scales
+/// with the UI and needs no icon font.
+///
+/// Each glyph is the shape of the job — a page, several pages, a folded page, a
+/// photo becoming a page, two pages joining — and is only ever two or three
+/// primitives, so it stays legible at 20 px.
+fn task_glyph(painter: &egui::Painter, center: Pos2, task: ExportTask, color: Color32) {
+    let stroke = Stroke::new(1.3, color);
+    let page = |offset: Vec2| Rect::from_center_size(center + offset, Vec2::new(11.0, 15.0));
+
+    match task {
+        // One page with a picture on it.
+        ExportTask::PageImage => {
+            let sheet = page(Vec2::ZERO);
+            painter.rect_stroke(sheet, 2.0, stroke, StrokeKind::Inside);
+            photo_mark(painter, sheet, color);
+        }
+        // A page holding several pictures, stacked.
+        ExportTask::AllPageImages => {
+            let sheet = page(Vec2::ZERO);
+            painter.rect_stroke(sheet, 2.0, stroke, StrokeKind::Inside);
+            for offset in [0.0_f32, 4.6] {
+                let mark = Rect::from_min_size(
+                    sheet.min + Vec2::new(3.0, 3.5 + offset),
+                    Vec2::new(5.0, 3.4),
+                );
+                painter.rect_filled(mark, 0.8, color);
+            }
+        }
+        // A page with a folded corner and a text band: a document.
+        ExportTask::PagePdf => {
+            let sheet = page(Vec2::ZERO);
+            painter.rect_stroke(sheet, 2.0, stroke, StrokeKind::Inside);
+            let fold = 4.5;
+            painter.add(Shape::convex_polygon(
+                vec![
+                    Pos2::new(sheet.right() - fold, sheet.top()),
+                    Pos2::new(sheet.right(), sheet.top() + fold),
+                    Pos2::new(sheet.right() - fold, sheet.top() + fold),
+                ],
+                color,
+                Stroke::NONE,
+            ));
+            let band = Rect::from_min_size(
+                sheet.min + Vec2::new(2.5, sheet.height() * 0.58),
+                Vec2::new(sheet.width() - 5.0, 1.6),
+            );
+            painter.rect_filled(band, 0.8, color);
+        }
+        // A photo on the left turning into a page on the right.
+        ExportTask::ImagesToPdf => {
+            let photo = Rect::from_center_size(center + Vec2::new(-6.5, 1.0), Vec2::splat(7.0));
+            painter.rect_stroke(photo, 1.5, stroke, StrokeKind::Inside);
+            painter.circle_filled(photo.center() - Vec2::new(1.2, 1.2), 1.0, color);
+            let y = center.y + 1.0;
+            painter.line_segment(
+                [Pos2::new(center.x - 1.4, y), Pos2::new(center.x + 2.2, y)],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    Pos2::new(center.x + 2.2, y),
+                    Pos2::new(center.x + 0.7, y - 1.4),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    Pos2::new(center.x + 2.2, y),
+                    Pos2::new(center.x + 0.7, y + 1.4),
+                ],
+                stroke,
+            );
+            let sheet = Rect::from_center_size(center + Vec2::new(7.0, 0.0), Vec2::new(8.0, 11.0));
+            painter.rect_stroke(sheet, 1.5, stroke, StrokeKind::Inside);
+        }
+        // Two pages with a plus between them: joining.
+        ExportTask::MergePdfs => {
+            let left = Rect::from_center_size(center + Vec2::new(-6.5, 0.0), Vec2::new(8.0, 11.0));
+            let right = Rect::from_center_size(center + Vec2::new(6.5, 0.0), Vec2::new(8.0, 11.0));
+            painter.rect_stroke(left, 1.5, stroke, StrokeKind::Inside);
+            painter.rect_stroke(right, 1.5, stroke, StrokeKind::Inside);
+            let plus = Stroke::new(1.6, color);
+            let s = 2.0;
+            painter.line_segment(
+                [
+                    Pos2::new(center.x, center.y - s),
+                    Pos2::new(center.x, center.y + s),
+                ],
+                plus,
+            );
+            painter.line_segment(
+                [
+                    Pos2::new(center.x - s, center.y),
+                    Pos2::new(center.x + s, center.y),
+                ],
+                plus,
+            );
+        }
+    }
+}
+
+/// The little "photo" mark inside a page glyph: a sun and a hill.
+///
+/// Shared by the page glyphs so a picture reads the same wherever it appears,
+/// and drawn inside the sheet's lower half so it never collides with the fold.
+fn photo_mark(painter: &egui::Painter, sheet: Rect, color: Color32) {
+    let area = Rect::from_min_max(
+        sheet.min + Vec2::new(2.5, sheet.height() * 0.42),
+        sheet.max - Vec2::new(2.5, 2.5),
+    );
+    if area.width() <= 2.0 || area.height() <= 2.5 {
+        return;
+    }
+    painter.circle_filled(
+        area.left_top() + Vec2::new(area.width() * 0.26, area.height() * 0.26),
+        1.1,
+        color,
+    );
+    painter.add(Shape::convex_polygon(
+        vec![
+            Pos2::new(area.left(), area.bottom()),
+            Pos2::new(area.center().x, area.top() + area.height() * 0.34),
+            Pos2::new(area.right(), area.bottom()),
+        ],
+        color,
+        Stroke::NONE,
+    ));
 }
 
 /// The row controls the user pressed this frame.
@@ -1117,122 +1642,396 @@ struct ListActions {
     move_up: Option<usize>,
     /// Index of the row that asked to move down.
     move_down: Option<usize>,
+    /// A drag that was just released: the row it started on and where it landed.
+    reorder: Option<(usize, usize)>,
 }
 
-/// Draw the contents of the file list, empty state included.
+/// Draw the ordered stack, empty state included.
 fn draw_source_rows(
     ui: &mut egui::Ui,
     palette: &Palette,
     sources: &[SourceEntry],
+    thumbs: &HashMap<PathBuf, egui::TextureHandle>,
     noun: &str,
     actions: &mut ListActions,
 ) {
     if sources.is_empty() {
-        ui.add_space(18.0);
-        ui.vertical_centered(|ui| {
-            ui.label(
-                RichText::new(format!("No {noun}s yet."))
-                    .color(palette.text_dim)
-                    .size(12.0),
-            );
-            ui.add_space(3.0);
-            ui.label(
-                RichText::new("Use the button above to add some.")
-                    .color(palette.text_dim)
-                    .size(11.0),
-            );
-        });
-        ui.add_space(18.0);
+        empty_stack(ui, palette, noun);
         return;
     }
 
     let last = sources.len() - 1;
-    for (index, entry) in sources.iter().enumerate() {
-        let name = entry.path.file_name().map_or_else(
-            || entry.path.display().to_string(),
-            |name| name.to_string_lossy().into_owned(),
-        );
-        source_row(
-            ui,
-            palette,
-            index,
-            &name,
-            &entry.detail,
-            index > 0,
-            index < last,
-            actions,
-        );
+    let mut row_rects: Vec<Rect> = Vec::with_capacity(sources.len());
+
+    // One drop zone around the whole stack. The rows themselves are transparent
+    // until hovered, so this zone supplies the list surface and turns to the
+    // accent while a row is held over it — which is the whole "drop here" signal.
+    let (_, dropped) = ui.dnd_drop_zone::<usize, _>(egui::Frame::NONE, |ui| {
+        for (index, entry) in sources.iter().enumerate() {
+            row_rects.push(source_row(
+                ui,
+                palette,
+                index,
+                entry,
+                thumbs.get(&entry.path),
+                index > 0,
+                index < last,
+                actions,
+            ));
+        }
+    });
+
+    if let (Some(from), Some(pointer)) = (dropped, ui.ctx().pointer_interact_pos())
+        && let Some(to) = drop_target(&row_rects, pointer.y, *from)
+    {
+        actions.reorder = Some((*from, to));
     }
 }
 
-/// One row of the file list: position, name, detail, and the row controls.
+/// Where a row released at `pointer_y` should land.
+///
+/// The pointer is compared against row centres: releasing above a row's middle
+/// means "before it", below means "after it". The gap index that falls out is
+/// one too high for a downward move, because the entry is still occupying its
+/// old slot while the pointer is being measured.
+fn drop_target(rects: &[Rect], pointer_y: f32, from: usize) -> Option<usize> {
+    if rects.is_empty() {
+        return None;
+    }
+    let slot = rects
+        .iter()
+        .position(|rect| pointer_y < rect.center().y)
+        .unwrap_or(rects.len());
+    let to = if slot > from { slot - 1 } else { slot };
+    Some(to.min(rects.len() - 1))
+}
+
+/// The empty state: what the stack is for, and the one gesture it supports.
+fn empty_stack(ui: &mut egui::Ui, palette: &Palette, noun: &str) {
+    ui.add_space(16.0);
+    ui.vertical_centered(|ui| {
+        let (rect, _) = ui.allocate_exact_size(Vec2::splat(26.0), Sense::hover());
+        draw_icon(
+            ui.painter(),
+            rect.center(),
+            if noun == "image" {
+                Icon::ImageFile
+            } else {
+                Icon::PdfFile
+            },
+            palette.text_dim.gamma_multiply(0.75),
+        );
+        ui.add_space(6.0);
+        ui.label(
+            RichText::new(format!("No {noun}s yet."))
+                .color(palette.text_dim)
+                .size(12.0),
+        );
+        ui.add_space(3.0);
+        ui.label(
+            RichText::new("Add some above, then drag the rows to set the order.")
+                .color(palette.text_dim)
+                .size(11.0),
+        );
+    });
+    ui.add_space(16.0);
+}
+
+/// One row of the ordered stack: handle, position, preview, name, controls.
+///
+/// Returns the rect the row occupied, which the drop-zone hit test needs.
 fn source_row(
     ui: &mut egui::Ui,
     palette: &Palette,
     index: usize,
-    name: &str,
-    detail: &str,
+    entry: &SourceEntry,
+    thumb: Option<&egui::TextureHandle>,
     can_move_up: bool,
     can_move_down: bool,
     actions: &mut ListActions,
-) {
-    ui.horizontal(|ui| {
-        ui.label(
-            RichText::new(format!("{:>2}", index + 1))
-                .color(palette.text_dim)
-                .size(11.0)
-                .monospace(),
-        );
-        ui.add_space(2.0);
+) -> Rect {
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), ROW_HEIGHT), Sense::hover());
+    let radius = pdfreader_ui::card_radius(palette);
 
-        // The name is given whatever room is left after the controls, so a long
-        // path cannot push the buttons off the row.
-        let reserved = 108.0;
-        let width = (ui.available_width() - reserved).max(60.0);
-        ui.allocate_ui_with_layout(
-            Vec2::new(width, 20.0),
-            egui::Layout::left_to_right(egui::Align::Center),
-            |ui| {
-                ui.add(
-                    egui::Label::new(RichText::new(name).color(palette.text).size(12.0)).truncate(),
+    // Transparent until the pointer is on it, so the drop zone's own fill — and
+    // its drag-over highlight — shows through.
+    if response.hovered() {
+        ui.painter()
+            .rect_filled(rect, radius, palette.surface_hover);
+    }
+    ui.painter().rect_stroke(
+        rect,
+        radius,
+        Stroke::new(1.0, palette.border),
+        StrokeKind::Inside,
+    );
+
+    let content = rect.shrink2(Vec2::new(ROW_PAD, 0.0));
+    ui.scope_builder(egui::UiBuilder::new().max_rect(content), |ui| {
+        ui.horizontal_centered(|ui| {
+            // The handle is the only part of the row that starts a drag, so the
+            // buttons beside it keep their clicks.
+            ui.dnd_drag_source(Id::new(("export-source-drag", index)), index, |ui| {
+                let (grip, _) = ui.allocate_exact_size(Vec2::splat(HANDLE_SIZE), Sense::hover());
+                draw_icon(
+                    ui.painter(),
+                    grip.center(),
+                    Icon::DragHandle,
+                    palette.text_dim,
                 );
-            },
-        );
-        ui.label(RichText::new(detail).color(palette.text_dim).size(11.0));
+            })
+            .response
+            .on_hover_text("Drag to reorder");
 
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui
-                .add_enabled(
-                    true,
-                    egui::Button::new(RichText::new("✕").size(11.0)).frame(false),
-                )
-                .on_hover_text("Remove from the list")
-                .clicked()
-            {
-                actions.remove = Some(index);
-            }
-            if ui
-                .add_enabled(
-                    can_move_down,
-                    egui::Button::new(RichText::new("▼").size(9.0)).frame(false),
-                )
-                .on_hover_text("Move down")
-                .clicked()
-            {
-                actions.move_down = Some(index);
-            }
-            if ui
-                .add_enabled(
-                    can_move_up,
-                    egui::Button::new(RichText::new("▲").size(9.0)).frame(false),
-                )
-                .on_hover_text("Move up")
-                .clicked()
-            {
-                actions.move_up = Some(index);
-            }
+            ui.add_space(3.0);
+
+            let (badge, _) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::hover());
+            ui.painter()
+                .circle_filled(badge.center(), 9.0, palette.accent_soft);
+            ui.painter().text(
+                badge.center(),
+                Align2::CENTER_CENTER,
+                (index + 1).to_string(),
+                FontId::proportional(10.5),
+                palette.accent,
+            );
+
+            ui.add_space(7.0);
+            preview_tile(ui, palette, entry, thumb);
+            ui.add_space(9.0);
+
+            // The name is given whatever room the controls leave, so a long file
+            // name cannot push the buttons off the row.
+            let reserved = 3.0 * (BUTTON_SIZE + 2.0) + 8.0;
+            let text_width = (ui.available_width() - reserved).max(80.0);
+            ui.allocate_ui_with_layout(
+                Vec2::new(text_width, ROW_HEIGHT),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    ui.add_space(7.0);
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(file_name(&entry.path))
+                                .color(palette.text)
+                                .size(12.0),
+                        )
+                        .truncate(),
+                    );
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(&entry.detail)
+                                .color(palette.text_dim)
+                                .size(10.5),
+                        )
+                        .truncate(),
+                    );
+                },
+            );
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if icon_button(ui, palette, Icon::Remove, true)
+                    .on_hover_text("Remove from the list")
+                    .clicked()
+                {
+                    actions.remove = Some(index);
+                }
+                if icon_button(ui, palette, Icon::MoveDown, can_move_down)
+                    .on_hover_text("Move down")
+                    .clicked()
+                {
+                    actions.move_down = Some(index);
+                }
+                if icon_button(ui, palette, Icon::MoveUp, can_move_up)
+                    .on_hover_text("Move up")
+                    .clicked()
+                {
+                    actions.move_up = Some(index);
+                }
+            });
         });
     });
+
+    rect
+}
+
+/// A compact icon button.
+///
+/// `enabled` is passed in rather than handled with `add_enabled_ui` because the
+/// icon is painted straight onto the frame, not drawn from a label.
+fn icon_button(ui: &mut egui::Ui, palette: &Palette, icon: Icon, enabled: bool) -> egui::Response {
+    let sense = if enabled {
+        Sense::click()
+    } else {
+        Sense::hover()
+    };
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(BUTTON_SIZE), sense);
+
+    if enabled && response.hovered() {
+        ui.painter().rect_filled(
+            rect,
+            pdfreader_ui::card_radius(palette),
+            palette.surface_hover,
+        );
+    }
+    let ink = if enabled {
+        palette.text
+    } else {
+        palette.text_dim.gamma_multiply(0.45)
+    };
+    draw_icon(ui.painter(), rect.center(), icon, ink);
+    response
+}
+
+/// The preview box on a row: the decoded thumbnail when there is one, and the
+/// file's type badge until then — or for ever, for a file that cannot be read.
+fn preview_tile(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    entry: &SourceEntry,
+    thumb: Option<&egui::TextureHandle>,
+) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(TILE_SIZE), Sense::hover());
+    tile_background(ui, palette, rect);
+
+    if let Some(texture) = thumb {
+        let size = fit_into(texture.size_vec2(), TILE_SIZE - 4.0);
+        ui.painter().image(
+            texture.id(),
+            Rect::from_center_size(rect.center(), size),
+            uv_full(),
+            Color32::WHITE,
+        );
+    } else {
+        draw_icon(
+            ui.painter(),
+            rect.center(),
+            type_icon(entry),
+            palette.text_dim,
+        );
+    }
+}
+
+/// The rounded, recessed box a preview sits in.
+fn tile_background(ui: &mut egui::Ui, palette: &Palette, rect: Rect) {
+    ui.painter().rect_filled(rect, 3.0, palette.window_bg);
+    ui.painter().rect_stroke(
+        rect,
+        3.0,
+        Stroke::new(1.0, palette.border),
+        StrokeKind::Inside,
+    );
+}
+
+/// The badge for a file: a picture or a document.
+fn type_icon(entry: &SourceEntry) -> Icon {
+    if is_image(&entry.path) {
+        Icon::ImageFile
+    } else {
+        Icon::PdfFile
+    }
+}
+
+/// The whole of a texture, for `Painter::image`.
+fn uv_full() -> Rect {
+    Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0))
+}
+
+/// The file's own name, falling back to the whole path.
+fn file_name(path: &Path) -> String {
+    path.file_name().map_or_else(
+        || path.display().to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    )
+}
+
+/// The strip under the list showing the pages the job will produce, in order.
+///
+/// The list already carries the thumbnails; this is the *result* view — the
+/// whole order at a glance, without scrolling, which is what makes a long stack
+/// of scans checkable before it is written.
+fn order_preview(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    sources: &[SourceEntry],
+    thumbs: &HashMap<PathBuf, egui::TextureHandle>,
+    caption: &str,
+) {
+    card_frame(palette)
+        .inner_margin(egui::Margin::symmetric(12, 9))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                let (dot, _) = ui.allocate_exact_size(Vec2::splat(10.0), Sense::hover());
+                ui.painter()
+                    .circle_filled(dot.center(), 3.5, palette.accent);
+                ui.add_space(2.0);
+                ui.label(
+                    RichText::new("OUTPUT ORDER")
+                        .color(palette.text_dim)
+                        .size(10.0)
+                        .strong(),
+                );
+                ui.add_space(6.0);
+                ui.label(RichText::new(caption).color(palette.text_dim).size(10.0));
+            });
+            ui.add_space(6.0);
+            egui::ScrollArea::horizontal()
+                .id_salt("export-order-preview")
+                .max_height(PREVIEW_TILE_H + 6.0)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        for (index, entry) in sources.iter().enumerate() {
+                            preview_page_tile(ui, palette, index, entry, thumbs.get(&entry.path));
+                            ui.add_space(4.0);
+                        }
+                    });
+                });
+        });
+}
+
+/// One numbered page in the output-order strip.
+fn preview_page_tile(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    index: usize,
+    entry: &SourceEntry,
+    thumb: Option<&egui::TextureHandle>,
+) {
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(PREVIEW_TILE_W, PREVIEW_TILE_H), Sense::hover());
+    tile_background(ui, palette, rect);
+
+    let art = Rect::from_min_max(
+        rect.min + Vec2::new(3.0, 3.0),
+        Pos2::new(rect.max.x - 3.0, rect.max.y - 13.0),
+    );
+    if let Some(texture) = thumb {
+        let size = fit_into(texture.size_vec2(), art.width().min(art.height()));
+        ui.painter().image(
+            texture.id(),
+            Rect::from_center_size(art.center(), size),
+            uv_full(),
+            Color32::WHITE,
+        );
+    } else {
+        draw_icon(
+            ui.painter(),
+            art.center(),
+            type_icon(entry),
+            palette.text_dim,
+        );
+    }
+
+    ui.painter().text(
+        Pos2::new(rect.center().x, rect.max.y - 7.0),
+        Align2::CENTER_CENTER,
+        (index + 1).to_string(),
+        FontId::proportional(10.0),
+        palette.text_dim,
+    );
+    response.on_hover_text(file_name(&entry.path));
 }
 
 /// The destination field: a read-only path that elides from the middle.
@@ -1618,6 +2417,113 @@ mod tests {
         assert!((small.y - 20.0).abs() < f32::EPSILON);
     }
 
+    /// The summary card must name the result in plain words and carry the
+    /// numbers a user checks it against — the pixel size for images, the page
+    /// count for PDFs, the input count for the composition tasks.
+    #[test]
+    fn the_outcome_says_what_will_be_written() {
+        // One page: the format, and A4 at the default 300 dpi.
+        let (headline, detail) = window(ExportTask::PageImage).outcome(&doc(10, 4));
+        assert_eq!(headline, "1 PNG image");
+        assert!(detail.contains("2480 × 3508"), "got {detail}");
+        assert!(detail.contains("300 dpi"), "got {detail}");
+
+        // Every page: the count, pluralised both ways.
+        let every = window(ExportTask::AllPageImages);
+        assert_eq!(every.outcome(&doc(3, 0)).0, "3 image files");
+        assert_eq!(every.outcome(&doc(1, 0)).0, "1 image file");
+
+        // A range PDF: the length of the range, not the document.
+        let mut range = window(ExportTask::PagePdf);
+        range.range_first = "3".to_string();
+        range.range_last = "5".to_string();
+        assert_eq!(range.outcome(&doc(10, 0)).0, "A 3-page PDF");
+
+        // A composition task: the number of inputs it will use.
+        let mut merge = ExportWindow::new(ExportTask::MergePdfs, &no_doc());
+        merge.add_sources(vec![PathBuf::from("/a.pdf"), PathBuf::from("/b.pdf")]);
+        assert_eq!(merge.outcome(&no_doc()).0, "A PDF from 2 files");
+
+        // Nothing chosen yet must still describe the empty result honestly.
+        let empty = ExportWindow::new(ExportTask::ImagesToPdf, &no_doc());
+        assert_eq!(empty.outcome(&no_doc()).0, "A 0-page PDF");
+    }
+
+    /// Order is the whole job on the composition tasks, so every way of changing
+    /// it has to move the right file to the right place.
+    #[test]
+    fn the_stack_can_be_reordered_reversed_and_sorted() {
+        let mut stack = ExportWindow::new(ExportTask::MergePdfs, &no_doc());
+        stack.add_sources(vec![
+            PathBuf::from("/a/c.pdf"),
+            PathBuf::from("/a/a.pdf"),
+            PathBuf::from("/a/b.pdf"),
+        ]);
+
+        // Drag the third row onto the first.
+        stack.move_source_to(2, 0);
+        assert_eq!(
+            stack.source_paths(),
+            vec![
+                Path::new("/a/b.pdf"),
+                Path::new("/a/c.pdf"),
+                Path::new("/a/a.pdf")
+            ]
+        );
+
+        // A move onto itself, or off either end, is a no-op rather than a panic
+        // and rather than silently doing something else.
+        stack.move_source_to(1, 1);
+        stack.move_source_to(9, 0);
+        stack.move_source_to(0, 9);
+        assert_eq!(stack.source_paths().len(), 3);
+        assert_eq!(stack.source_paths()[0], Path::new("/a/b.pdf"));
+
+        // Reverse flips the whole list end to end.
+        stack.reverse_sources();
+        assert_eq!(
+            stack.source_paths(),
+            vec![
+                Path::new("/a/a.pdf"),
+                Path::new("/a/c.pdf"),
+                Path::new("/a/b.pdf")
+            ]
+        );
+
+        // Sort is by file name, not by the directories that contain it.
+        stack.sort_sources_by_name();
+        assert_eq!(
+            stack.source_paths(),
+            vec![
+                Path::new("/a/a.pdf"),
+                Path::new("/a/b.pdf"),
+                Path::new("/a/c.pdf")
+            ]
+        );
+    }
+
+    /// The drop hit-test turns a pointer position into a destination index, and
+    /// has to allow for the dragged row still occupying its old slot.
+    #[test]
+    fn a_drop_lands_where_the_pointer_points() {
+        let rows = vec![
+            Rect::from_min_size(Pos2::new(0.0, 0.0), Vec2::new(100.0, 46.0)),
+            Rect::from_min_size(Pos2::new(0.0, 46.0), Vec2::new(100.0, 46.0)),
+            Rect::from_min_size(Pos2::new(0.0, 92.0), Vec2::new(100.0, 46.0)),
+        ];
+
+        // Above the first row's middle: the top of the list.
+        assert_eq!(drop_target(&rows, 5.0, 2), Some(0));
+        // Below the last row's middle: the end of the list.
+        assert_eq!(drop_target(&rows, 200.0, 0), Some(2));
+        // Just past the second row's middle: down one slot.
+        assert_eq!(drop_target(&rows, 80.0, 0), Some(1));
+        // Just above the second row's middle: no move at all.
+        assert_eq!(drop_target(&rows, 30.0, 0), Some(0));
+        // Nothing to land on.
+        assert_eq!(drop_target(&[], 10.0, 0), None);
+    }
+
     #[test]
     fn an_image_is_described_by_its_pixel_size_and_a_pdf_by_its_size_on_disk() {
         assert!(is_image(Path::new("a.PNG")));
@@ -1652,6 +2558,7 @@ mod tests {
                     title: "report".to_string(),
                     pages: vec![PageGeometry::A4; 4],
                     encrypted: false,
+                    can_edit_content: true,
                     outline: Outline::default(),
                 },
             });
@@ -1747,7 +2654,7 @@ mod tests {
                         ..egui::RawInput::default()
                     };
                     let output = ctx.run_ui(input, |ui| {
-                        window.show(ui.ctx(), &palette, &open, shown);
+                        window.show(ui.ctx(), &palette, &open, shown, &HashMap::new());
                     });
 
                     // The window is a whole pane — strip, body and footer — so a
@@ -1767,6 +2674,37 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The window must fit the viewport. The reported bug was the opposite: the
+    /// pane grew past the screen, so the header and the footer could not be
+    /// reached. Either the window fits, or the body hit its floor — and that is
+    /// only allowed on a viewport too short to hold a usable pane at all.
+    #[test]
+    fn the_body_budget_keeps_the_window_on_screen() {
+        for viewport in [600.0_f32, 700.0, 800.0, 900.0, 1080.0, 1440.0] {
+            for header in [80.0_f32, 100.0, 140.0] {
+                let budget = body_budget(viewport, header);
+                let window_height = header + budget + FOOTER_BLOCK + 2.0 * MODAL_MARGIN;
+
+                assert!(
+                    budget <= BODY_HEIGHT,
+                    "the body never exceeds its preference"
+                );
+                assert!(budget >= MIN_BODY_HEIGHT, "the body never collapses");
+                assert!(
+                    window_height <= viewport + 0.5 || budget <= MIN_BODY_HEIGHT + 0.5,
+                    "viewport {viewport}, header {header}: the window is {window_height} px tall"
+                );
+            }
+        }
+    }
+
+    /// A generous viewport must still get the whole preferred height, or the cap
+    /// would quietly make every window small.
+    #[test]
+    fn a_tall_viewport_gets_the_full_preferred_body() {
+        assert!((body_budget(1440.0, 100.0) - BODY_HEIGHT).abs() < f32::EPSILON);
     }
 
     /// The export window is a big pane: a task strip, per-task settings, a
@@ -1789,7 +2727,7 @@ mod tests {
                     ..egui::RawInput::default()
                 };
                 let output = ctx.run_ui(input, |ui| {
-                    window.show(ui.ctx(), &palette, &open, None);
+                    window.show(ui.ctx(), &palette, &open, None, &HashMap::new());
                 });
                 if frame == 0 {
                     output.drop_without_applying_deltas();

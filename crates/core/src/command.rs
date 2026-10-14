@@ -46,6 +46,50 @@ pub enum SidebarTab {
     Forms,
 }
 
+/// One page of the Help user guide.
+///
+/// The shell draws the page. The command only names which one to open, so a
+/// Help menu entry and the guide's own list stay the same set of topics.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GuideTopic {
+    /// Open a file, move around, and use the sidebar.
+    Start,
+    /// Zoom, page display, rotation, and full screen.
+    Reading,
+    /// Highlight, notes, shapes, and leaving adjustment.
+    Annotate,
+    /// Retype and move the PDF's own text.
+    Editing,
+    /// Offline lookup, speak, and Google Translate.
+    Language,
+    /// Save, print, and export.
+    Share,
+}
+
+impl GuideTopic {
+    /// Every topic, in Help-menu order.
+    pub const ALL: [GuideTopic; 6] = [
+        GuideTopic::Start,
+        GuideTopic::Reading,
+        GuideTopic::Annotate,
+        GuideTopic::Editing,
+        GuideTopic::Language,
+        GuideTopic::Share,
+    ];
+
+    /// The label used in the Help menu and in the guide's own list.
+    pub const fn label(self) -> &'static str {
+        match self {
+            GuideTopic::Start => "Getting Started",
+            GuideTopic::Reading => "Reading",
+            GuideTopic::Annotate => "Annotating",
+            GuideTopic::Editing => "Editing Text",
+            GuideTopic::Language => "Translate & Speak",
+            GuideTopic::Share => "Save, Print & Export",
+        }
+    }
+}
+
 /// A user or system intent. Handling one produces new state and effects.
 #[derive(Clone, PartialEq, Debug)]
 pub enum Command {
@@ -290,6 +334,18 @@ pub enum Command {
         color: [u8; 4],
     },
 
+    /// Change an annotation's stroke weight, in PDF points.
+    ///
+    /// Applies to line markups and rectangles. The reducer grows a line
+    /// markup's box when the stroke would otherwise be clipped, and records
+    /// both the weight and the box so undo restores the mark that was there.
+    SetAnnotationThickness {
+        /// Which annotation.
+        id: crate::annotation::AnnotationId,
+        /// The new stroke weight, in PDF points.
+        thickness: f32,
+    },
+
     /// Open or close the floating properties window for the selected
     /// annotation, without changing the selection itself.
     ///
@@ -298,6 +354,168 @@ pub enum Command {
     SetPropertiesPanel {
         /// Whether the window should be open.
         open: bool,
+    },
+
+    /// Enter or leave content-edit mode.
+    ///
+    /// Entering is refused for a document that has no pages or is encrypted,
+    /// and forces the tool back to Select so no half-drawn mark is armed while
+    /// the pointer is editing the page itself.
+    SetEditingContent {
+        /// Whether editing should be on.
+        on: bool,
+    },
+
+    /// Select a page-content object, or clear the selection with `None`.
+    SelectPageObject(Option<crate::pageobj::PageObjectId>),
+
+    /// Open the inline editor on a text object that is already selected.
+    ///
+    /// The shell owns the editor widget, so the reducer has nothing to apply.
+    /// A click only selects; this is the second click, the Edit button, or a
+    /// double-click asking to type.
+    BeginObjectTextEdit {
+        /// The text object to edit.
+        info: crate::pageobj::PageObjectInfo,
+    },
+
+    /// Add a copy of a text object, offset slightly so it does not sit on the
+    /// original. Images are not duplicated: their pixels are not kept.
+    DuplicatePageObject {
+        /// The object to copy.
+        info: crate::pageobj::PageObjectInfo,
+    },
+
+    /// Move or resize a page-content object.
+    ///
+    /// `previous` is carried rather than looked up: the object list lives in
+    /// the engine, not in the store, so the reducer has no other way to know
+    /// what the bounds were before the edit — and undo needs both.
+    SetPageObjectBounds {
+        /// Which object.
+        id: crate::pageobj::PageObjectId,
+        /// The bounds before the edit; undo restores this.
+        previous: crate::rect::Rect,
+        /// The bounds after the edit.
+        rect: crate::rect::Rect,
+    },
+
+    /// Delete a page-content object.
+    ///
+    /// Carries the whole record so a deleted **text** object can be rebuilt on
+    /// undo. Deleting an image is not undoable and pushes no history — see
+    /// [`crate::store::UndoAction`].
+    DeletePageObject {
+        /// What to remove.
+        info: crate::pageobj::PageObjectInfo,
+    },
+
+    /// Move a page-content object within the page's paint order — the panel's
+    /// "bring to front" / "send to back". The record (not the id) addresses the
+    /// object, because removing it renumbers the page; undo restores the exact
+    /// index the object occupied before.
+    RestackPageObject {
+        /// What to move.
+        info: crate::pageobj::PageObjectInfo,
+        /// Where it lands in the paint order.
+        target: crate::pageobj::RestackTarget,
+    },
+
+    /// Replace the text a page-content text object holds.
+    SetPageObjectText {
+        /// Which object.
+        id: crate::pageobj::PageObjectId,
+        /// The text before the edit; undo restores this.
+        previous: String,
+        /// The text after the edit.
+        text: String,
+        /// The original text area. The engine tries to fit the edited string
+        /// inside it and lets it overflow when that is not possible at a
+        /// legible size — an edit is never refused.
+        layout_bounds: crate::rect::Rect,
+        /// The effective size the original line was set at. Undo restores this
+        /// size; longer text may be shrunk to keep the page layout intact.
+        base_font_size: f32,
+        /// The styling the object had before the edit; undo restores this.
+        previous_format: crate::pageobj::TextFormat,
+        /// The styling to apply to the result.
+        format: crate::pageobj::TextFormat,
+    },
+
+    /// Restyle a page-content text object without changing its string.
+    ///
+    /// Bold, colour and size are synthetic (PDFium has no style property on a
+    /// text run), so this is what the formatting panel toggles. The reducer
+    /// emits the effect and records an undo entry carrying both the old and new
+    /// format, so a toggle can be undone.
+    SetPageObjectFormat {
+        /// Which object.
+        id: crate::pageobj::PageObjectId,
+        /// The object's text area, kept for undo symmetry; a format change
+        /// applies the size as asked and does not fit it into this area.
+        layout_bounds: crate::rect::Rect,
+        /// The effective size the line was set at; the shear scales with it.
+        base_font_size: f32,
+        /// The styling the object had before; undo restores this.
+        previous_format: crate::pageobj::TextFormat,
+        /// The styling to apply.
+        format: crate::pageobj::TextFormat,
+    },
+
+    /// Ask the user for a picture to put in an image object.
+    ///
+    /// Shell-only, like `ShowOpenDialog`: the picker is native and the answer
+    /// comes back as [`Command::ReplacePageObjectImage`].
+    PickReplacementImage(crate::pageobj::PageObjectId),
+
+    /// Swap the pixels of an image object for a file on disk.
+    ///
+    /// Not undoable: the previous pixels would have to be kept, and a page of
+    /// images would cost more memory than the undo stack is worth.
+    ReplacePageObjectImage {
+        /// Which object.
+        id: crate::pageobj::PageObjectId,
+        /// Picture to put in it.
+        path: PathBuf,
+    },
+
+    /// Add a new text object to a page.
+    InsertPageObjectText {
+        /// Page to add it to.
+        page: u32,
+        /// Where the click landed, in PDF page space.
+        point: (f32, f32),
+        /// What it says.
+        text: String,
+    },
+
+    /// The engine finished listing a page's objects.
+    ///
+    /// The list itself is cached by the shell; the reducer only needs it to
+    /// resolve the positional ids recorded by undo and to drop a selection that
+    /// no longer exists.
+    PageObjectsLoaded {
+        /// Document the page belongs to.
+        doc: crate::document::DocumentId,
+        /// Which page.
+        page: u32,
+        /// Every editable object on it, in object order.
+        objects: Vec<crate::pageobj::PageObjectInfo>,
+    },
+
+    /// The engine created a page object, so its id is now known.
+    ///
+    /// The positional analogue of [`Command::AnnotationsLoaded`]'s `created`:
+    /// an insert records its undo entry before the index exists.
+    PageObjectInserted {
+        /// Document it was added to.
+        doc: crate::document::DocumentId,
+        /// Which page.
+        page: u32,
+        /// Where it landed.
+        id: crate::pageobj::PageObjectId,
+        /// The refreshed object list.
+        objects: Vec<crate::pageobj::PageObjectInfo>,
     },
 
     /// Undo the last annotation operation on the active document.
@@ -429,6 +647,10 @@ pub enum Command {
 
     /// Open the keyboard-shortcuts reference (Help → Keyboard Shortcuts).
     ShowShortcuts,
+
+    /// Open the user guide on one topic (Help → Getting Started, and the
+    /// other guide entries). Shell-only.
+    ShowGuide(GuideTopic),
 
     /// Move focus to the find box. Shell-only: focus is a view concern, so the
     /// reducer has nothing to say about it.
@@ -585,6 +807,124 @@ pub enum Effect {
         id: crate::annotation::AnnotationId,
         /// RGBA bytes; the alpha byte is the rendered opacity.
         color: [u8; 4],
+    },
+
+    /// Change an annotation's stroke weight on the engine thread.
+    ///
+    /// `rect` is the box the stroke needs. For a line markup that is the box
+    /// grown to fit `thickness`; for a rectangle it is the box unchanged.
+    SetAnnotationThickness {
+        /// Document to edit.
+        doc: crate::document::DocumentId,
+        /// Which annotation.
+        id: crate::annotation::AnnotationId,
+        /// The new stroke weight, in PDF points.
+        thickness: f32,
+        /// The bounds the stroke should occupy, in PDF page space.
+        rect: crate::rect::Rect,
+    },
+
+    /// Move or resize a page-content object on the engine thread.
+    SetPageObjectBounds {
+        /// Document to edit.
+        doc: crate::document::DocumentId,
+        /// Which object.
+        id: crate::pageobj::PageObjectId,
+        /// The new bounds, in PDF page space.
+        rect: crate::rect::Rect,
+    },
+
+    /// Delete a page-content object on the engine thread.
+    DeletePageObject {
+        /// Document to edit.
+        doc: crate::document::DocumentId,
+        /// Which object.
+        id: crate::pageobj::PageObjectId,
+    },
+
+    /// Delete the page-content object that matches a record.
+    ///
+    /// Redo of a delete cannot trust the positional id it recorded: undoing
+    /// re-created the object, which renumbered the page. The engine re-matches
+    /// on the parts of the record a renumbering cannot change.
+    DeletePageObjectMatching {
+        /// Document to edit.
+        doc: crate::document::DocumentId,
+        /// The record to match.
+        info: crate::pageobj::PageObjectInfo,
+    },
+
+    /// Move a page-content object within the page's paint order.
+    ///
+    /// The record addresses the object: removing it to re-insert renumbers the
+    /// page, so undo's restore-to-index re-matches the same way.
+    RestackPageObject {
+        /// Document to edit.
+        doc: crate::document::DocumentId,
+        /// The record to match.
+        info: crate::pageobj::PageObjectInfo,
+        /// Where the object lands in the paint order.
+        target: crate::pageobj::RestackTarget,
+    },
+
+    /// Rewrite a page-content text object on the engine thread.
+    SetPageObjectText {
+        /// Document to edit.
+        doc: crate::document::DocumentId,
+        /// Which object.
+        id: crate::pageobj::PageObjectId,
+        /// The text undo writes back.
+        previous: String,
+        /// The new text.
+        text: String,
+        /// The run's ink box when the edit was made. The font and size are kept.
+        layout_bounds: crate::rect::Rect,
+        /// The original point size. A retype keeps it unless the user set another.
+        base_font_size: f32,
+        /// The styling the object had before the edit; restored if the new text will not fit.
+        previous_format: crate::pageobj::TextFormat,
+        /// The styling to apply to the result.
+        format: crate::pageobj::TextFormat,
+    },
+
+    /// Restyle a page-content text object on the engine thread.
+    SetPageObjectFormat {
+        /// Document to edit.
+        doc: crate::document::DocumentId,
+        /// Which object.
+        id: crate::pageobj::PageObjectId,
+        /// The original text area; a style that overflows it is refused.
+        layout_bounds: crate::rect::Rect,
+        /// The effective size the line was set at; the shear scales with it.
+        base_font_size: f32,
+        /// The styling the object had before; undo restores this.
+        previous_format: crate::pageobj::TextFormat,
+        /// The styling to apply.
+        format: crate::pageobj::TextFormat,
+    },
+
+    /// Swap an image object's pixels for a file on disk.
+    ReplacePageObjectImage {
+        /// Document to edit.
+        doc: crate::document::DocumentId,
+        /// Which object.
+        id: crate::pageobj::PageObjectId,
+        /// Picture to put in it.
+        path: PathBuf,
+    },
+
+    /// Add a new text object to a page on the engine thread.
+    InsertPageObjectText {
+        /// Document to edit.
+        doc: crate::document::DocumentId,
+        /// Page to add it to.
+        page: u32,
+        /// Where the click landed, in PDF page space.
+        point: (f32, f32),
+        /// What it says.
+        text: String,
+        /// Size to draw it at, in points.
+        font_size: f32,
     },
 
     /// Rasterize one page and write it out as an image file.

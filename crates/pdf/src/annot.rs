@@ -17,7 +17,9 @@ use pdfium_render::prelude::{
     PdfPoints, PdfQuadPoints,
 };
 
-use pdfreader_core::{AnnotationId, AnnotationInfo, AnnotationKind, NewAnnotation, Rect};
+use pdfreader_core::{
+    AnnotationId, AnnotationInfo, AnnotationKind, NewAnnotation, Rect, fitted_line_rect,
+};
 
 /// Read every non-widget annotation in the document, in page order.
 ///
@@ -68,6 +70,7 @@ pub(crate) fn list_annotations(document: &PdfDocument<'_>) -> Vec<AnnotationInfo
                 ),
                 contents: annotation.contents().filter(|c| !c.is_empty()),
                 color,
+                thickness: stored_thickness(&annotation),
             });
         }
     }
@@ -726,9 +729,7 @@ fn line_markup_appearance(
             // the wave with the weight would flatten a hairline squiggle into a
             // straight line. Only the stroke itself follows the drag.
             let floor = rect.min_y + thickness / 2.0;
-            let rise = SQUIGGLY_RISE_PT
-                .min((height - thickness).max(0.0))
-                .max(0.0);
+            let rise = SQUIGGLY_RISE_PT.min((height - thickness).max(0.0)).max(0.0);
             let step = SQUIGGLY_STEP_PT;
             let mut x = rect.min_x;
             let mut crest = true;
@@ -828,7 +829,11 @@ pub(crate) fn set_annotation_color(
             Err(error) => Err(error),
         }
     } else {
-        apply_stroke_colour(&mut annotation, kind, PdfColor::new(color[0], color[1], color[2], color[3]))
+        apply_stroke_colour(
+            &mut annotation,
+            kind,
+            PdfColor::new(color[0], color[1], color[2], color[3]),
+        )
     };
     match applied {
         Ok(()) => {
@@ -839,6 +844,69 @@ pub(crate) fn set_annotation_color(
         // imported /AP-only annotations can reject FPDFAnnot_SetColor; return
         // false so the engine thread re-lists the real state instead of
         // surfacing a scary "Annotation failed" error or crashing.
+        Err(_) => Ok(false),
+    }
+}
+
+/// Change one annotation's stroke weight.
+///
+/// `rect` is the box the caller wants the mark to occupy. Line markups are
+/// redrawn from an appearance stream at `thickness` — Pdfium's own generator
+/// ignores `/Border` — and the box is written first so a thicker stroke is not
+/// clipped. A rectangle's weight is its border; the border write clears the
+/// cached appearance, so the colour is put back afterwards.
+///
+/// Returns `Ok(false)` for a stale id or a kind that has no stroke to thicken.
+pub(crate) fn set_annotation_thickness(
+    document: &mut PdfDocument<'_>,
+    id: AnnotationId,
+    thickness: f32,
+    rect: Rect,
+) -> Result<bool, pdfium_render::prelude::PdfiumError> {
+    let mut page = document.pages_mut().get(id.page as i32)?;
+    let Ok(mut annotation) = page.annotations_mut().get(id.annot_index as usize) else {
+        return Ok(false);
+    };
+    let kind = classify(annotation.annotation_type());
+    if !kind.has_line_weight() {
+        return Ok(false);
+    }
+    let thickness = thickness.clamp(MIN_MARKUP_THICKNESS, pdfreader_core::MAX_LINE_WEIGHT);
+    let rect = fitted_line_rect(kind, rect, thickness);
+    let applied = if kind.is_line_markup() {
+        annotation.set_bounds(pdf_rect(rect))?;
+        match kind {
+            AnnotationKind::Underline => {
+                if let Some(mark) = annotation.as_underline_annotation_mut() {
+                    rewrite_first_quad(mark, rect)?;
+                }
+            }
+            AnnotationKind::StrikeOut => {
+                if let Some(mark) = annotation.as_strikeout_annotation_mut() {
+                    rewrite_first_quad(mark, rect)?;
+                }
+            }
+            AnnotationKind::Squiggly => {
+                if let Some(mark) = annotation.as_squiggly_annotation_mut() {
+                    rewrite_first_quad(mark, rect)?;
+                }
+            }
+            _ => {}
+        }
+        apply_line_markup_appearance(&mut annotation, kind, rect, None, thickness)
+    } else {
+        // `SetBorder` clears the appearance stream. The colour is readable
+        // only once that stream is gone, and has to be written back or the
+        // rectangle comes back uncoloured.
+        annotation.set_border_width(thickness)?;
+        let color = annotation.stroke_color().unwrap_or(PdfColor::RED);
+        apply_stroke_colour(&mut annotation, kind, color)
+    };
+    match applied {
+        Ok(()) => {
+            page.regenerate_content()?;
+            Ok(true)
+        }
         Err(_) => Ok(false),
     }
 }
@@ -1210,16 +1278,22 @@ mod tests {
 
         let before = list_annotations(&document);
         let before = before.iter().find(|a| a.id == id).expect("square present");
-        eprintln!("before colour = {:?} bounds = {:?}", before.color, before.rect);
+        eprintln!(
+            "before colour = {:?} bounds = {:?}",
+            before.color, before.rect
+        );
         // The default square colour is red (see create_annotation).
         assert_eq!(before.color, Some([255, 0, 0, 255]), "square starts red");
 
         // Recolour to blue.
-        let applied = set_annotation_color(&mut document, id, [33, 150, 243, 255])
-            .expect("no PDFium error");
+        let applied =
+            set_annotation_color(&mut document, id, [33, 150, 243, 255]).expect("no PDFium error");
         eprintln!("set_annotation_color applied = {applied}");
         let after_color = list_annotations(&document);
-        let after_color = after_color.iter().find(|a| a.id == id).expect("square present");
+        let after_color = after_color
+            .iter()
+            .find(|a| a.id == id)
+            .expect("square present");
         eprintln!("after colour = {:?}", after_color.color);
         assert_eq!(
             after_color.color,
@@ -1232,21 +1306,114 @@ mod tests {
         let bounds_applied = update_annotation_bounds(&mut document, id, moved).expect("no error");
         eprintln!("update_annotation_bounds applied = {bounds_applied}");
         let after_bounds = list_annotations(&document);
-        let after_bounds = after_bounds.iter().find(|a| a.id == id).expect("square present");
+        let after_bounds = after_bounds
+            .iter()
+            .find(|a| a.id == id)
+            .expect("square present");
         eprintln!("after bounds = {:?}", after_bounds.rect);
         assert_eq!(after_bounds.rect, moved, "bounds must round-trip");
 
         // Opacity is carried as the colour alpha in this design; confirm the
         // alpha survives a re-list too.
-        set_annotation_color(&mut document, id, [33, 150, 243, 128])
-            .expect("no PDFium error");
+        set_annotation_color(&mut document, id, [33, 150, 243, 128]).expect("no PDFium error");
         let after_alpha = list_annotations(&document);
-        let after_alpha = after_alpha.iter().find(|a| a.id == id).expect("square present");
+        let after_alpha = after_alpha
+            .iter()
+            .find(|a| a.id == id)
+            .expect("square present");
         eprintln!("after alpha colour = {:?}", after_alpha.color);
         assert_eq!(
             after_alpha.color,
             Some([33, 150, 243, 128]),
             "alpha (opacity) must round-trip through /C"
+        );
+    }
+
+    /// The properties panel's line weight has to survive a re-list and change
+    /// the ink. A rectangle keeps its colour when the border is rewritten,
+    /// because that write clears the appearance stream. A box shorter than the
+    /// stroke grows, or the thicker line would be clipped to the old height.
+    #[test]
+    fn line_weight_round_trips_and_thickens_the_ink() {
+        let Some(pdfium) = pdfium() else {
+            eprintln!("SKIP: no PDFium library staged under target/native");
+            return;
+        };
+
+        let mut document = blank_document(&pdfium);
+        let rect = Rect::from_xywh(80.0, 400.0, 180.0, 16.0);
+        let id = create_annotation(&mut document, 0, &NewAnnotation::Underline(rect))
+            .expect("create an underline");
+        let before = ink_bbox_at(&mut document, 4.0);
+        let before_h = before.3.saturating_sub(before.1);
+
+        assert!(
+            set_annotation_thickness(&mut document, id, 5.0, rect).expect("no PDFium error"),
+            "the underline weight must apply"
+        );
+        let listed = list_annotations(&document);
+        let mark = listed
+            .iter()
+            .find(|a| a.id == id)
+            .expect("underline present");
+        assert!(
+            (mark.thickness - 5.0).abs() < 0.15,
+            "underline weight must round-trip, got {}",
+            mark.thickness
+        );
+        let after = ink_bbox_at(&mut document, 4.0);
+        let after_h = after.3.saturating_sub(after.1);
+        assert!(
+            after_h > before_h + 8,
+            "a 5pt stroke must be visibly taller than the hairline: {before_h}px -> {after_h}px"
+        );
+
+        let short = Rect::from_xywh(80.0, 200.0, 180.0, 2.0);
+        let short_id = create_annotation(&mut document, 0, &NewAnnotation::Underline(short))
+            .expect("create a short underline");
+        assert!(set_annotation_thickness(&mut document, short_id, 5.0, short).expect("grow"));
+        let grown = list_annotations(&document);
+        let grown = grown
+            .iter()
+            .find(|a| a.id == short_id)
+            .expect("short underline present");
+        assert!(
+            grown.rect.height() >= 4.5,
+            "the box must grow to fit a 5pt stroke, got {}",
+            grown.rect.height()
+        );
+
+        let square = Rect::from_xywh(300.0, 400.0, 80.0, 50.0);
+        let square_id =
+            create_annotation(&mut document, 0, &NewAnnotation::Square(square)).expect("square");
+        let before_color = list_annotations(&document)
+            .into_iter()
+            .find(|a| a.id == square_id)
+            .expect("square present")
+            .color;
+        assert!(set_annotation_thickness(&mut document, square_id, 2.0, square).expect("border"));
+        let square_after = list_annotations(&document);
+        let square_after = square_after
+            .iter()
+            .find(|a| a.id == square_id)
+            .expect("square present");
+        assert!(
+            (square_after.thickness - 2.0).abs() < 0.15,
+            "rectangle weight must round-trip, got {}",
+            square_after.thickness
+        );
+        assert_eq!(
+            square_after.color, before_color,
+            "a thicker border must keep its colour"
+        );
+        assert_eq!(square_after.rect, square);
+
+        let band = Rect::from_xywh(80.0, 100.0, 40.0, 12.0);
+        let highlight = create_annotation(&mut document, 0, &NewAnnotation::Highlight(band))
+            .expect("highlight");
+        assert!(
+            !set_annotation_thickness(&mut document, highlight, 5.0, band).expect("no error"),
+            "a highlight has no stroke to thicken"
         );
     }
 
@@ -1293,7 +1460,12 @@ mod tests {
             let width = bitmap.width() as usize;
             let height = bitmap.height() as usize;
             let index = ((height - 620) * width + 200) * 4;
-            [data[index], data[index + 1], data[index + 2], data[index + 3]]
+            [
+                data[index],
+                data[index + 1],
+                data[index + 2],
+                data[index + 3],
+            ]
         }
 
         // The highlight is born the yellow the canvas previews: B,G,R,A with
@@ -1331,7 +1503,6 @@ mod tests {
         );
         let _ = id;
     }
-
 
     /// PROBE: what a Highlight actually *renders*, measured with the engine's
     /// own render config so the byte order is the BGRA the app assumes.
@@ -1392,7 +1563,6 @@ mod tests {
         set_annotation_color(&mut document, id, [255, 0, 0, 90]).expect("recolour faded");
         show("after recolour red @27%", sample(&document, &config));
     }
-
 
     /// Bind PDFium, or `None` when the native library has not been staged.
     fn pdfium() -> Option<Pdfium> {
@@ -1780,7 +1950,10 @@ mod tests {
         };
 
         for (name, make) in [
-            ("underline", NewAnnotation::Underline as fn(Rect) -> NewAnnotation),
+            (
+                "underline",
+                NewAnnotation::Underline as fn(Rect) -> NewAnnotation,
+            ),
             ("strikeout", NewAnnotation::StrikeOut),
             ("squiggly", NewAnnotation::Squiggly),
         ] {
@@ -2037,6 +2210,4 @@ mod tests {
         }
         (ink, redness, greenness)
     }
-
 }
-

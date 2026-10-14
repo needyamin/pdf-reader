@@ -13,13 +13,18 @@ mod canvas;
 mod engine_thread;
 mod export_window;
 mod fonts;
+mod guide;
 mod lens;
+mod objects;
 mod print;
 mod print_window;
 mod session;
 mod settings;
+#[cfg(test)]
+mod smoke;
+mod thumb_worker;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -34,12 +39,12 @@ use pdfreader_pdf::engine::{DocumentHandle, PdfiumEngine};
 use pdfreader_search::SearchMatch;
 use pdfreader_ui::{
     MENUBAR_HEIGHT, STATUSBAR_HEIGHT, TABBAR_HEIGHT, TOOLBAR_HEIGHT, TOOLS_RAIL_WIDTH, TextStyle,
-    annotation_bar, annotation_properties_window, comments_panel, forms_panel, menu_bar, outline_tree, sidebar_tabs, status_bar,
-    tab_bar, toolbar, tools_rail,
+    annotation_bar, annotation_properties_window, comments_panel, forms_panel, menu_bar,
+    object_actions_window, outline_tree, sidebar_tabs, status_bar, tab_bar, toolbar, tools_rail,
 };
 use serde::{Deserialize, Serialize};
 
-use canvas::{Canvas, MARGIN, PendingThumb, PendingTile, SCROLLBAR_ALLOWANCE};
+use canvas::{Canvas, ContentEdit, MARGIN, PendingThumb, PendingTile, SCROLLBAR_ALLOWANCE};
 use engine_thread::{EngineRequest, EngineResponse, EngineThread};
 use export_window::{ExportWindow, Field, OpenDocument};
 
@@ -352,6 +357,8 @@ enum DialogIntent {
     ExportAddImages,
     /// Pick PDFs to add to the export window's list.
     ExportAddPdfs,
+    /// Pick a picture to put in one page-content image object.
+    ReplaceObjectImage(pdfreader_core::PageObjectId),
 }
 
 /// What a native dialog came back with.
@@ -421,6 +428,12 @@ fn run_dialog(intent: DialogIntent, default_name: Option<String>) -> DialogResul
             .set_title("Choose PDFs to merge, in order")
             .pick_files()
             .map_or(DialogResult::Cancelled, DialogResult::Paths),
+
+        DialogIntent::ReplaceObjectImage(_) => rfd::FileDialog::new()
+            .add_filter("Images", IMAGE_EXTENSIONS)
+            .set_title("Choose a picture for this image")
+            .pick_file()
+            .map_or(DialogResult::Cancelled, DialogResult::Path),
     }
 }
 
@@ -433,6 +446,9 @@ fn dialog_intent_for(command: &Command) -> Option<DialogIntent> {
     match command {
         Command::ShowOpenDialog => Some(DialogIntent::OpenPdf),
         Command::SaveDocumentAs => Some(DialogIntent::SavePdf),
+        // The replacement picker carries the object it is for, because the
+        // answer has to be routed back to that object and nothing else.
+        Command::PickReplacementImage(id) => Some(DialogIntent::ReplaceObjectImage(*id)),
         _ => None,
     }
 }
@@ -543,6 +559,15 @@ struct App {
     /// At most one at a time: it is a modal, so a second one could only ever be
     /// behind the first.
     export_window: Option<ExportWindow>,
+    /// Decoded previews for the files in the export window's list, keyed by
+    /// path. Held here rather than in the window because they are GPU textures
+    /// and because decoding is IO, which the window does none of.
+    export_thumbs: HashMap<PathBuf, egui::TextureHandle>,
+    /// Files already asked of the decoder, so a path in flight is not requested
+    /// again every frame.
+    thumbs_requested: HashSet<PathBuf>,
+    /// The thread that decodes those previews.
+    thumb_worker: thumb_worker::ThumbnailWorker,
     /// The print window, open while the user is choosing what to print.
     print_window: Option<print_window::PrintWindow>,
     /// The export task the window was last opened on, so reopening it returns
@@ -603,6 +628,9 @@ struct App {
     lens_error: Option<String>,
     /// Extracted text for the pages that have been on screen.
     page_text: lens::PageTextCache,
+    /// Editable page objects for the pages on screen, read only while the
+    /// content editor is on.
+    page_objects: objects::PageObjectCache,
     /// The floating card that answers a selected word.
     lens_popup: lens::LensPopup,
     /// Language the Google Translate button links to.
@@ -648,6 +676,8 @@ struct App {
     demo_popup: Option<String>,
     /// Whether the keyboard-shortcuts reference window is open.
     shortcuts_open: bool,
+    /// The Help user guide.
+    guide: guide::GuideWindow,
     /// Whether the "About Us" window is open.
     about_open: bool,
     /// The profile photo, decoded once on first use.
@@ -747,6 +777,9 @@ impl App {
             dialog_tx,
             dialog_intent: None,
             export_window: None,
+            export_thumbs: HashMap::new(),
+            thumbs_requested: HashSet::new(),
+            thumb_worker: thumb_worker::ThumbnailWorker::new(),
             print_window: None,
             last_export_task: ExportTask::default(),
             pending_close: None,
@@ -765,6 +798,7 @@ impl App {
             )),
             lens_error: None,
             page_text: lens::PageTextCache::new(),
+            page_objects: objects::PageObjectCache::new(),
             lens_popup: lens::LensPopup::new(),
             lens_target: settings
                 .lens_target
@@ -797,6 +831,7 @@ impl App {
             focus_search: false,
             demo_popup: std::env::var("PDFREADER_DEMO_POPUP").ok(),
             shortcuts_open: false,
+            guide: guide::GuideWindow::new(),
             about_open: std::env::var_os("PDFREADER_ABOUT").is_some(),
             profile_texture: None,
             search_query: seeded_query.unwrap_or_default(),
@@ -1015,6 +1050,7 @@ impl App {
                 }
                 Effect::CloseDocument { doc } => {
                     self.page_text.drop_document(doc);
+                    self.page_objects.drop_document(doc);
                     if let Some(handle) = self.handles.remove(&doc) {
                         self.engine.send(EngineRequest::Close { handle });
                     }
@@ -1127,10 +1163,158 @@ impl App {
                     }
                     self.canvas.invalidate_page(doc, id.page);
                 }
-                Effect::SetAnnotationColor { doc, id, color } => {
+                Effect::SetPageObjectBounds { doc, id, rect } => {
+                    if let Some(handle) = self.handles.get(&doc).copied() {
+                        self.engine.send(EngineRequest::SetPageObjectBounds {
+                            doc,
+                            handle,
+                            id,
+                            rect,
+                        });
+                    }
+                    // A content edit changes the page itself, so the cached
+                    // tiles have to be dropped: their keys are unchanged, which
+                    // means nothing else would ever re-render them.
+                    self.canvas.invalidate_page(doc, id.page);
+                }
+                Effect::DeletePageObject { doc, id } => {
                     if let Some(handle) = self.handles.get(&doc).copied() {
                         self.engine
-                            .send(EngineRequest::SetAnnotationColor { doc, handle, id, color });
+                            .send(EngineRequest::DeletePageObject { doc, handle, id });
+                    }
+                    self.canvas.invalidate_page(doc, id.page);
+                }
+                Effect::DeletePageObjectMatching { doc, info } => {
+                    let page = info.id.page;
+                    if let Some(handle) = self.handles.get(&doc).copied() {
+                        self.engine.send(EngineRequest::DeletePageObjectMatching {
+                            doc,
+                            handle,
+                            info,
+                        });
+                    }
+                    self.canvas.invalidate_page(doc, page);
+                }
+                Effect::RestackPageObject { doc, info, target } => {
+                    let page = info.id.page;
+                    if let Some(handle) = self.handles.get(&doc).copied() {
+                        self.engine.send(EngineRequest::RestackPageObject {
+                            doc,
+                            handle,
+                            info,
+                            target,
+                        });
+                    }
+                    self.canvas.invalidate_page(doc, page);
+                }
+                Effect::SetPageObjectText {
+                    doc,
+                    id,
+                    previous,
+                    text,
+                    layout_bounds,
+                    base_font_size,
+                    previous_format,
+                    format,
+                } => {
+                    // The shell is the authority for a text object's style; record
+                    // it now so the engine's re-list (which cannot report colour)
+                    // preserves it.
+                    self.page_objects.set_format(doc, id, format);
+                    if let Some(handle) = self.handles.get(&doc).copied() {
+                        self.engine.send(EngineRequest::SetPageObjectText {
+                            doc,
+                            handle,
+                            id,
+                            previous,
+                            text,
+                            layout_bounds,
+                            base_font_size,
+                            previous_format,
+                            format,
+                        });
+                    }
+                    self.canvas.invalidate_page(doc, id.page);
+                }
+                Effect::SetPageObjectFormat {
+                    doc,
+                    id,
+                    layout_bounds,
+                    base_font_size,
+                    previous_format,
+                    format,
+                } => {
+                    // Record the new style before the engine re-lists the page;
+                    // `insert` then keeps the colour the engine cannot report.
+                    self.page_objects.set_format(doc, id, format);
+                    if let Some(handle) = self.handles.get(&doc).copied() {
+                        self.engine.send(EngineRequest::SetPageObjectFormat {
+                            doc,
+                            handle,
+                            id,
+                            layout_bounds,
+                            base_font_size,
+                            previous_format,
+                            format,
+                        });
+                    }
+                    self.canvas.invalidate_page(doc, id.page);
+                }
+                Effect::ReplacePageObjectImage { doc, id, path } => {
+                    if let Some(handle) = self.handles.get(&doc).copied() {
+                        self.engine.send(EngineRequest::ReplacePageObjectImage {
+                            doc,
+                            handle,
+                            id,
+                            path,
+                        });
+                    }
+                    self.canvas.invalidate_page(doc, id.page);
+                }
+                Effect::InsertPageObjectText {
+                    doc,
+                    page,
+                    point,
+                    text,
+                    font_size,
+                } => {
+                    if let Some(handle) = self.handles.get(&doc).copied() {
+                        self.engine.send(EngineRequest::InsertPageObjectText {
+                            doc,
+                            handle,
+                            page,
+                            point,
+                            text,
+                            font_size,
+                        });
+                    }
+                    self.canvas.invalidate_page(doc, page);
+                }
+                Effect::SetAnnotationColor { doc, id, color } => {
+                    if let Some(handle) = self.handles.get(&doc).copied() {
+                        self.engine.send(EngineRequest::SetAnnotationColor {
+                            doc,
+                            handle,
+                            id,
+                            color,
+                        });
+                    }
+                    self.canvas.invalidate_page(doc, id.page);
+                }
+                Effect::SetAnnotationThickness {
+                    doc,
+                    id,
+                    thickness,
+                    rect,
+                } => {
+                    if let Some(handle) = self.handles.get(&doc).copied() {
+                        self.engine.send(EngineRequest::SetAnnotationThickness {
+                            doc,
+                            handle,
+                            id,
+                            thickness,
+                            rect,
+                        });
                     }
                     self.canvas.invalidate_page(doc, id.page);
                 }
@@ -1650,9 +1834,17 @@ impl App {
                 } => {
                     self.tiles_delivered += 1;
                     self.canvas.insert_tile(ctx, doc, rotation, key, &pixels);
+                    // A fresh render for the page can retire a confirmed text
+                    // ghost: the real pixels now show the committed words.
+                    self.canvas.tile_rendered(doc, key.page);
                 }
                 EngineResponse::TileFailed { doc, rotation, key } => {
                     self.canvas.tile_failed(doc, rotation, key);
+                    // A failed render can never deliver the pixels a confirmed
+                    // ghost is waiting for; without this the ghost would strand
+                    // on screen. The page re-requests tiles, so a later success
+                    // still retires ghosts normally.
+                    self.canvas.tile_rendered(doc, key.page);
                 }
                 EngineResponse::Thumbnail {
                     doc,
@@ -1678,6 +1870,55 @@ impl App {
                     // asked for again every frame.
                     self.page_text.failed(doc, page);
                     tracing::warn!("text extraction failed for page {page} ({reason})");
+                }
+                EngineResponse::PageObjects { doc, page, objects } => {
+                    self.page_objects.insert(doc, page, objects);
+                    self.canvas.page_objects_refreshed(doc, page);
+                }
+                EngineResponse::PageObjectsFailed { doc, page, reason } => {
+                    // Stored empty, so the page reads as "nothing to edit here"
+                    // rather than being asked for again every frame.
+                    self.page_objects.failed(doc, page);
+                    tracing::warn!("object listing failed for page {page} ({reason})");
+                }
+                EngineResponse::PageObjectsChanged { doc, page, objects } => {
+                    // The list is cached here and handed to the reducer at the
+                    // same time: the cache is what the canvas hit-tests against,
+                    // and the reducer needs it to settle what undo is holding.
+                    self.page_objects.insert(doc, page, objects.clone());
+                    // The edit was accepted, so a staged text ghost may now be
+                    // confirmed; the next fresh tile retires it.
+                    self.canvas.page_objects_refreshed(doc, page);
+                    let effects =
+                        self.store
+                            .dispatch(Command::PageObjectsLoaded { doc, page, objects });
+                    self.execute(effects);
+                }
+                EngineResponse::PageObjectInserted {
+                    doc,
+                    page,
+                    id,
+                    objects,
+                } => {
+                    self.page_objects.insert(doc, page, objects.clone());
+                    self.canvas.page_objects_refreshed(doc, page);
+                    let effects = self.store.dispatch(Command::PageObjectInserted {
+                        doc,
+                        page,
+                        id,
+                        objects,
+                    });
+                    self.execute(effects);
+                }
+                EngineResponse::PageObjectFailed { doc, page, reason } => {
+                    tracing::warn!("page object edit failed on page {page} ({reason})");
+                    self.save_error = Some(format!("Page edit failed: {reason}"));
+                    // The edit never reached the document, so a staged ghost
+                    // would show words that are not there.
+                    self.canvas.page_object_edit_failed(doc, page);
+                    // Drop the cached list so the canvas re-reads what is really
+                    // there, rather than carrying on with what was asked for.
+                    self.page_objects.invalidate(doc, page);
                 }
                 EngineResponse::SearchResults {
                     doc,
@@ -1795,6 +2036,29 @@ impl App {
         // NOTE: read outside `ctx.input` — that closure holds the context
         // write lock, and a nested `ctx.memory` would deadlock on it.
         let free_focus = !ctx.memory(|m| m.focused().is_some());
+        // The inline editor stays open between keystrokes even when egui does
+        // not report it as the focused widget. Space, arrows, Delete, and the
+        // single-letter tool keys must not turn those keystrokes into page or
+        // tool commands.
+        let editing_inline = self.canvas.has_inline_editor();
+        // A selected page object owns the arrow keys: they nudge it in PDF
+        // points instead of scrolling the page. Shift nudges by a larger step.
+        // Delete removes it. Neither applies while the inline editor is open,
+        // because those keys then belong to the text being typed.
+        let nudge_object = if !editing_inline && self.store.state().editing_content {
+            let state = self.store.state();
+            state.active().and_then(|tab| {
+                let id = tab.view.selected_object?;
+                let doc = tab.document.as_ref()?.id;
+                self.page_objects
+                    .get(doc, id.page)?
+                    .iter()
+                    .find(|object| object.id == id)
+                    .cloned()
+            })
+        } else {
+            None
+        };
 
         ctx.input(|input| {
             let ctrl = input.modifiers.ctrl || input.modifiers.command;
@@ -1832,13 +2096,57 @@ impl App {
             if free_focus && input.key_pressed(egui::Key::PageUp) {
                 commands.push(Command::PrevPage);
             }
-            if free_focus && input.key_pressed(egui::Key::ArrowDown) {
+            if free_focus
+                && !editing_inline
+                && nudge_object.is_none()
+                && input.key_pressed(egui::Key::ArrowDown)
+            {
                 commands.push(Command::ScrollBy { dx: 0.0, dy: 96.0 });
             }
-            if free_focus && input.key_pressed(egui::Key::ArrowUp) {
+            if free_focus
+                && !editing_inline
+                && nudge_object.is_none()
+                && input.key_pressed(egui::Key::ArrowUp)
+            {
                 commands.push(Command::ScrollBy { dx: 0.0, dy: -96.0 });
             }
-            if free_focus && input.key_pressed(egui::Key::Space) {
+            // Arrow keys move the selected object by 1 pt, or 10 pt with
+            // Shift. Screen up is PDF up. This is how a block is placed
+            // exactly, without fighting the pointer.
+            if free_focus && let Some(info) = nudge_object.as_ref() {
+                let step = if input.modifiers.shift { 10.0 } else { 1.0 };
+                let mut dx = 0.0;
+                let mut dy = 0.0;
+                if input.key_pressed(egui::Key::ArrowLeft) {
+                    dx -= step;
+                }
+                if input.key_pressed(egui::Key::ArrowRight) {
+                    dx += step;
+                }
+                if input.key_pressed(egui::Key::ArrowUp) {
+                    dy += step;
+                }
+                if input.key_pressed(egui::Key::ArrowDown) {
+                    dy -= step;
+                }
+                if dx != 0.0 || dy != 0.0 {
+                    let previous = info.bounds;
+                    commands.push(Command::SetPageObjectBounds {
+                        id: info.id,
+                        previous,
+                        rect: pdfreader_core::Rect {
+                            min_x: previous.min_x + dx,
+                            min_y: previous.min_y + dy,
+                            max_x: previous.max_x + dx,
+                            max_y: previous.max_y + dy,
+                        },
+                    });
+                }
+                if input.key_pressed(egui::Key::Delete) || input.key_pressed(egui::Key::Backspace) {
+                    commands.push(Command::DeletePageObject { info: info.clone() });
+                }
+            }
+            if free_focus && !editing_inline && input.key_pressed(egui::Key::Space) {
                 if input.modifiers.shift {
                     commands.push(Command::PrevPage);
                 } else {
@@ -1852,7 +2160,7 @@ impl App {
                 .state()
                 .active()
                 .is_some_and(|t| matches!(t.view.mode, ViewMode::Single));
-            if single && free_focus {
+            if single && free_focus && !editing_inline && nudge_object.is_none() {
                 if input.key_pressed(egui::Key::ArrowRight) {
                     commands.push(Command::NextPage);
                 }
@@ -1871,7 +2179,16 @@ impl App {
                     commands.push(Command::RequestCloseTab(id));
                 }
             }
-            if input.key_pressed(egui::Key::Z) && input.modifiers.command {
+            // Undo/redo are gated on focus like the navigation keys: while a
+            // text field has focus, Ctrl+Z must undo *typing*, not the last
+            // document edit — the focused TextEdit handles its own history.
+            // The inline content editor counts even between keystrokes, when
+            // egui does not report it as the focused widget.
+            if free_focus
+                && !editing_inline
+                && input.key_pressed(egui::Key::Z)
+                && input.modifiers.command
+            {
                 // Ctrl+Shift+Z is redo on every platform; Ctrl+Y is the
                 // Windows spelling of the same thing.
                 let can_undo = self
@@ -1892,7 +2209,7 @@ impl App {
                     commands.push(Command::Undo);
                 }
             }
-            if ctrl && input.key_pressed(egui::Key::Y) {
+            if free_focus && !editing_inline && ctrl && input.key_pressed(egui::Key::Y) {
                 if self
                     .store
                     .state()
@@ -1902,7 +2219,10 @@ impl App {
                     commands.push(Command::Redo);
                 }
             }
-            if input.key_pressed(egui::Key::Escape) {
+            // The inline editor reads Escape itself (discard the draft); the
+            // shell must not also treat it as "leave fullscreen / drop tool"
+            // in the same keystroke.
+            if free_focus && !editing_inline && input.key_pressed(egui::Key::Escape) {
                 if self.store.state().fullscreen {
                     commands.push(Command::ToggleFullscreen);
                 } else if self.store.state().tool.annotation_kind().is_some() {
@@ -1912,8 +2232,9 @@ impl App {
             // Delete/Backspace removes the selected annotation — the expected
             // "select an annotation, then Delete" path while an annotation tool
             // is active. Gated on `free_focus` so it never fires while typing in
-            // a note or form field, and on there actually being a selection.
-            if free_focus {
+            // a note or form field, and on the inline editor so a keystroke
+            // there is not also a delete.
+            if free_focus && !editing_inline && nudge_object.is_none() {
                 if let Some(id) = self
                     .store
                     .state()
@@ -1931,7 +2252,7 @@ impl App {
             // editors use (V select, H highlight, R rectangle, …). Gated on
             // `free_focus` so typing in a note or form field never arms a tool,
             // and on `!ctrl` so they never shadow Ctrl+S / Ctrl+E / Ctrl+Y.
-            if free_focus && !ctrl {
+            if free_focus && !editing_inline && !ctrl {
                 for tool in Tool::ALL {
                     if let Some(key) = egui::Key::from_name(tool.shortcut()) {
                         if input.key_pressed(key) {
@@ -2025,7 +2346,8 @@ impl App {
             | DialogIntent::ExportOutputFile
             | DialogIntent::ExportOutputFolder
             | DialogIntent::ExportAddImages
-            | DialogIntent::ExportAddPdfs => None,
+            | DialogIntent::ExportAddPdfs
+            | DialogIntent::ReplaceObjectImage(_) => None,
         }
     }
 
@@ -2074,6 +2396,14 @@ impl App {
             (DialogIntent::SavePdf, DialogResult::Path(path)) => {
                 self.apply(ctx, vec![Command::SaveDocumentTo(path)]);
             }
+            (DialogIntent::ReplaceObjectImage(id), DialogResult::Path(path)) => {
+                // Said here rather than after the engine answers: replacing an
+                // image is not undoable whatever the outcome, and a warning
+                // that only appeared on success would leave the failure case
+                // silent.
+                self.job_notice = Some("Replacing an image cannot be undone".to_string());
+                self.apply(ctx, vec![Command::ReplacePageObjectImage { id, path }]);
+            }
             // A cancelled dialog, or an intent/result pairing that cannot
             // happen: nothing to do.
             _ => {}
@@ -2099,7 +2429,10 @@ impl App {
     fn handle_export_action(&mut self, ctx: &egui::Context, action: export_window::Action) {
         match action {
             export_window::Action::None => {}
-            export_window::Action::Cancel => self.export_window = None,
+            export_window::Action::Cancel => {
+                self.export_window = None;
+                self.clear_export_thumbs();
+            }
             export_window::Action::Browse(field) => {
                 // A picker needs the window still open to fill in, so it is not
                 // closed here; `handle_dialog_result` puts the answer back.
@@ -2107,8 +2440,60 @@ impl App {
             }
             export_window::Action::Start(request) => {
                 self.export_window = None;
+                self.clear_export_thumbs();
                 self.apply(ctx, vec![request.into_command()]);
             }
+        }
+    }
+
+    /// Drop the decoded previews for the export window's files.
+    ///
+    /// Called whenever the window closes. The textures are keyed by path, so
+    /// without this they would be held for the life of the process, keeping GPU
+    /// memory for files the user has finished with.
+    fn clear_export_thumbs(&mut self) {
+        self.export_thumbs.clear();
+        self.thumbs_requested.clear();
+    }
+
+    /// Ask the decoder for the previews the export window's file list needs.
+    ///
+    /// Requests are issued and answered across frames — the decode thread does
+    /// the work, the next frame uploads what is ready — so the window draws a
+    /// type badge until a thumbnail arrives rather than blocking on a decoder.
+    fn ensure_export_thumbnails(&mut self, ctx: &egui::Context) {
+        let wanted: Vec<PathBuf> = match self.export_window.as_ref() {
+            Some(window) if window.task().needs_sources() => window
+                .source_paths()
+                .iter()
+                .map(|path| path.to_path_buf())
+                .collect(),
+            _ => Vec::new(),
+        };
+
+        // Anything no longer in the list is dropped, in flight or not.
+        self.export_thumbs.retain(|path, _| wanted.contains(path));
+        self.thumbs_requested.retain(|path| wanted.contains(path));
+
+        for path in &wanted {
+            if self.export_thumbs.contains_key(path) || self.thumbs_requested.contains(path) {
+                continue;
+            }
+            self.thumbs_requested.insert(path.clone());
+            self.thumb_worker.request(path.clone());
+        }
+
+        while let Some(result) = self.thumb_worker.try_recv() {
+            let Some(image) = result.image else {
+                continue;
+            };
+            let colour = egui::ColorImage::from_rgba_unmultiplied(image.size, &image.rgba);
+            let texture = ctx.load_texture(
+                format!("export-thumb-{}", result.path.display()),
+                colour,
+                egui::TextureOptions::LINEAR,
+            );
+            self.export_thumbs.insert(result.path, texture);
         }
     }
 
@@ -2344,6 +2729,12 @@ impl App {
                 self.show_dialog(intent);
                 continue;
             }
+            // The inline editor is canvas state. The reducer has no widget to
+            // open, so the shell does it here.
+            if let Command::BeginObjectTextEdit { info } = command {
+                self.canvas.begin_text_edit(&info);
+                continue;
+            }
             // The helper-tool toggles and the translate target are app-local
             // preferences, like the dictionaries path: the reducer has nothing
             // to decide, so the shell flips the flag and persists it here.
@@ -2413,6 +2804,10 @@ impl App {
                 }
                 Command::ShowShortcuts => {
                     self.shortcuts_open = true;
+                    continue;
+                }
+                Command::ShowGuide(topic) => {
+                    self.guide.open_on(topic);
                     continue;
                 }
                 Command::FocusSearch => {
@@ -2605,6 +3000,7 @@ impl eframe::App for App {
                 store,
                 canvas,
                 page_text,
+                page_objects,
                 lens_popup,
                 handles,
                 engine,
@@ -2701,6 +3097,7 @@ impl eframe::App for App {
                                         *search_in_progress,
                                         *search_doc == Some(doc.id),
                                         search_error.as_deref(),
+                                        doc.page_count(),
                                         &mut commands,
                                     );
                                 }
@@ -2843,6 +3240,11 @@ impl eframe::App for App {
                                     tab.view.selected_field,
                                     palette.accent,
                                     store.state().tool,
+                                    ContentEdit {
+                                        editing: store.state().editing_content,
+                                        objects: page_objects,
+                                        selected: tab.view.selected_object,
+                                    },
                                     page_text,
                                     tab.annotations.as_deref().unwrap_or(&[]),
                                     tab.view.selected_annotation,
@@ -2863,6 +3265,27 @@ impl eframe::App for App {
                                     ));
                                 }
 
+                                // The selected page object's actions, while the
+                                // content editor is on. Drawn from the cached
+                                // record, so it costs no engine round trip.
+                                if store.state().editing_content
+                                    && let Some(selected) = tab.view.selected_object
+                                    && let Some(info) =
+                                        page_objects.get(doc.id, selected.page).and_then(|list| {
+                                            list.iter().find(|o| o.id == selected).cloned()
+                                        })
+                                {
+                                    let original = page_objects
+                                        .original_format(doc.id, info.id)
+                                        .unwrap_or(info.format);
+                                    commands.extend(object_actions_window(
+                                        ui.ctx(),
+                                        &palette,
+                                        &info,
+                                        original,
+                                    ));
+                                }
+
                                 // Text for every page on screen, so a click can
                                 // be hit-tested to a character. Extraction is
                                 // the cheap part of PDFium's work and the cache
@@ -2875,6 +3298,29 @@ impl eframe::App for App {
                                                 doc: doc.id,
                                                 handle,
                                                 page: space.index,
+                                            });
+                                        }
+                                    }
+                                }
+
+                                // Editable objects for the same pages, but only
+                                // while the content editor is on: the walk is a
+                                // per-object text read, and a reader who is not
+                                // editing never needs it.
+                                if store.state().editing_content
+                                    && let Some(handle) = handles.get(&doc.id).copied()
+                                {
+                                    // Only the pages on screen: `page_spaces`
+                                    // covers the whole document, and walking a
+                                    // long file's object list to answer a
+                                    // question about two pages would stall the
+                                    // engine for no reason.
+                                    for page in canvas.visible_pages() {
+                                        if page_objects.request(doc.id, *page) {
+                                            engine.send(EngineRequest::PageObjects {
+                                                doc: doc.id,
+                                                handle,
+                                                page: *page,
                                             });
                                         }
                                     }
@@ -3092,6 +3538,7 @@ impl eframe::App for App {
         // replaced by the page.
         if self.export_window.is_some() {
             self.ensure_export_preview(dpr);
+            self.ensure_export_thumbnails(&ctx);
 
             let doc = OpenDocument::snapshot(self.store.state().active());
             let rotation = self
@@ -3107,7 +3554,7 @@ impl eframe::App for App {
                 .and_then(|id| self.canvas.thumbnail(id, rotation, doc.current_page));
 
             let action = match self.export_window.as_mut() {
-                Some(window) => window.show(&ctx, &palette, &doc, preview),
+                Some(window) => window.show(&ctx, &palette, &doc, preview, &self.export_thumbs),
                 None => export_window::Action::None,
             };
             self.handle_export_action(&ctx, action);
@@ -3270,6 +3717,7 @@ impl eframe::App for App {
         // panels.
         self.draw_settings_window(&ctx, &palette);
         self.draw_shortcuts_window(&ctx, &palette);
+        self.guide.draw(&ctx, &palette);
         self.draw_about_window(&ctx, &palette);
         if self.show_stats {
             self.draw_stats_overlay(&ctx, &palette);
@@ -3279,6 +3727,21 @@ impl eframe::App for App {
 
         self.request_tiles(tiles);
         self.request_thumbnails(thumbs);
+        // Undo and Redo are clicks on the toolbar. The same click blurs the
+        // inline editor, which would commit the draft after the history step
+        // and wipe it out. Drop that commit and close the draft instead.
+        if commands
+            .iter()
+            .any(|command| matches!(command, Command::Undo | Command::Redo))
+        {
+            self.canvas.discard_text_edit();
+            commands.retain(|command| {
+                !matches!(
+                    command,
+                    Command::SetPageObjectText { .. } | Command::SetPageObjectFormat { .. }
+                )
+            });
+        }
         self.apply(&ctx, commands);
 
         // Remember the open tabs and where each is left. Scrolling changes this
@@ -3521,6 +3984,7 @@ fn draw_search_results(
     in_progress: bool,
     current_document: bool,
     error: Option<&str>,
+    page_count: u32,
     commands: &mut Vec<Command>,
 ) {
     // Every line in this panel sits in the same content margin, so the query
@@ -3550,6 +4014,13 @@ fn draw_search_results(
             }
             if outcome.cleared {
                 commands.push(Command::Search(String::new()));
+            }
+        });
+    egui::Frame::new()
+        .inner_margin(pdfreader_ui::sidebar_margin())
+        .show(ui, |ui| {
+            if let Some(page) = pdfreader_ui::page_jump(ui, palette, page_count) {
+                commands.push(Command::GoToPage(page));
             }
         });
     ui.add_space(pdfreader_ui::SIDEBAR_GAP);
@@ -4052,6 +4523,10 @@ mod tests {
         let count = keys.len();
         keys.sort_unstable_by_key(|k| k.name());
         keys.dedup();
-        assert_eq!(keys.len(), count, "tool shortcuts must map to distinct keys");
+        assert_eq!(
+            keys.len(),
+            count,
+            "tool shortcuts must map to distinct keys"
+        );
     }
 }

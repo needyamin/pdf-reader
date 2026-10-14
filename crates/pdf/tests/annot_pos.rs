@@ -145,11 +145,7 @@ fn rotated_annotation_lands_where_to_page_predicts() {
     // A rectangle well inside the page, in unrotated PDF space.
     let drawn = Rect::from_xywh(120.0, 300.0, 160.0, 40.0);
 
-    for rotation in [
-        Rotation::Cw90,
-        Rotation::Cw180,
-        Rotation::Cw270,
-    ] {
+    for rotation in [Rotation::Cw90, Rotation::Cw180, Rotation::Cw270] {
         // Render the (already-turned) page, drop the annotation on it, render
         // again so the committed mark is visible.
         let _before = engine
@@ -177,7 +173,8 @@ fn rotated_annotation_lands_where_to_page_predicts() {
             here > 0,
             "rotation {:?}: annotation ink missing at the position the UI \
              transform predicts ({:?}) — the mark would land elsewhere",
-            rotation, expected
+            rotation,
+            expected
         );
     }
 }
@@ -311,13 +308,17 @@ fn every_tool_applies_repeatedly_and_together() {
     let mut expected: Vec<Rect> = Vec::new();
     for (new, rect) in kinds.iter().take(4) {
         for _ in 0..3 {
-            engine.add_annotation(handle, 0, new.clone()).expect("create");
+            engine
+                .add_annotation(handle, 0, new.clone())
+                .expect("create");
             expected.push(*rect);
         }
     }
     // Then one of every kind: tools combined on one page.
     for (new, rect) in &kinds {
-        engine.add_annotation(handle, 0, new.clone()).expect("create");
+        engine
+            .add_annotation(handle, 0, new.clone())
+            .expect("create");
         if *rect != RECT_ZERO {
             expected.push(*rect);
         }
@@ -372,10 +373,14 @@ fn update_bounds_moves_and_resizes_every_kind() {
         NewAnnotation::FreeText(Rect::from_xywh(200.0, 550.0, 120.0, 30.0), "t".into()),
     ];
     for new in &cases {
-        let id = engine.add_annotation(handle, 0, new.clone()).expect("create");
+        let id = engine
+            .add_annotation(handle, 0, new.clone())
+            .expect("create");
         let moved = Rect::from_xywh(300.0, 300.0, 200.0, 40.0);
         assert!(
-            engine.update_annotation_bounds(handle, id, moved).expect("update"),
+            engine
+                .update_annotation_bounds(handle, id, moved)
+                .expect("update"),
             "the id must resolve"
         );
         let list = engine.annotations(handle).expect("list");
@@ -425,13 +430,17 @@ fn update_bounds_grows_and_shrinks_in_place() {
         NewAnnotation::Square(Rect::from_xywh(40.0, 500.0, 120.0, 60.0)),
     ];
     for new in &cases {
-        let id = engine.add_annotation(handle, 0, new.clone()).expect("create");
+        let id = engine
+            .add_annotation(handle, 0, new.clone())
+            .expect("create");
         let base = new.rect().expect("geometry");
 
         // Grow: keep the left/top edge, widen by 80.
         let grown = Rect::from_xywh(base.min_x, base.min_y, base.width() + 80.0, base.height());
         assert!(
-            engine.update_annotation_bounds(handle, id, grown).expect("grow"),
+            engine
+                .update_annotation_bounds(handle, id, grown)
+                .expect("grow"),
             "the id must resolve"
         );
         let list = engine.annotations(handle).expect("list");
@@ -442,10 +451,16 @@ fn update_bounds_grows_and_shrinks_in_place() {
         );
 
         // Shrink: keep the left/top edge, narrow back below the original.
-        let shrunk =
-            Rect::from_xywh(base.min_x, base.min_y, (base.width() - 60.0).max(20.0), base.height());
+        let shrunk = Rect::from_xywh(
+            base.min_x,
+            base.min_y,
+            (base.width() - 60.0).max(20.0),
+            base.height(),
+        );
         assert!(
-            engine.update_annotation_bounds(handle, id, shrunk).expect("shrink"),
+            engine
+                .update_annotation_bounds(handle, id, shrunk)
+                .expect("shrink"),
             "the id must resolve"
         );
         let list = engine.annotations(handle).expect("list");
@@ -485,7 +500,9 @@ fn set_color_changes_reported_color_and_alpha() {
 
     let wanted: [u8; 4] = [33, 150, 243, 128];
     assert!(
-        engine.set_annotation_color(handle, id, wanted).expect("recolor"),
+        engine
+            .set_annotation_color(handle, id, wanted)
+            .expect("recolor"),
         "the id must resolve"
     );
     let list = engine.annotations(handle).expect("list");
@@ -498,7 +515,11 @@ fn set_color_changes_reported_color_and_alpha() {
 
     // A stale id reports false rather than erroring.
     let stale = pdfreader_core::AnnotationId::new(0, 999);
-    assert!(!engine.set_annotation_color(handle, stale, wanted).expect("stale"));
+    assert!(
+        !engine
+            .set_annotation_color(handle, stale, wanted)
+            .expect("stale")
+    );
 }
 
 /// A document whose annotations carry NO colour entries — a Link (never has
@@ -529,7 +550,11 @@ fn foreign_annotations_without_colour_list_safely() {
     let list = engine.annotations(handle).expect("list");
     let page: Vec<&pdfreader_core::AnnotationInfo> =
         list.iter().filter(|a| a.id.page == 0).collect();
-    assert_eq!(page.len(), 2, "the link and the colourless highlight both list");
+    assert_eq!(
+        page.len(),
+        2,
+        "the link and the colourless highlight both list"
+    );
 
     let link_id = page
         .iter()

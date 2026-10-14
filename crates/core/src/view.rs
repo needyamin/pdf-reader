@@ -75,6 +75,17 @@ pub struct ViewState {
     /// every annotation.
     #[serde(default)]
     pub properties_panel_open: bool,
+    /// The page-content object the user last selected, if any.
+    ///
+    /// Lives in state rather than in the canvas for the same reason
+    /// `selected_annotation` does: the reducer has to clear it when the object
+    /// is deleted and when undo removes it, and the toolbar needs to know
+    /// whether anything is selected.
+    ///
+    /// Not persisted: the id is positional, so a selection restored into a
+    /// later session could point at a different object entirely.
+    #[serde(default, skip)]
+    pub selected_object: Option<crate::pageobj::PageObjectId>,
 }
 
 impl Default for ViewState {
@@ -90,6 +101,7 @@ impl Default for ViewState {
             selected_field: None,
             selected_annotation: None,
             properties_panel_open: false,
+            selected_object: None,
         }
     }
 }

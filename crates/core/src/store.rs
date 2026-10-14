@@ -71,6 +71,104 @@ pub enum UndoAction {
         /// The colour after the edit; redo restores this.
         next: [u8; 4],
     },
+    /// An annotation's stroke weight changed. The rect is stored with it
+    /// because a thicker line markup grows its box so the stroke is not clipped.
+    Thickness {
+        /// Which annotation.
+        id: crate::annotation::AnnotationId,
+        /// The weight before the edit, in PDF points.
+        previous: f32,
+        /// The weight after the edit, in PDF points.
+        next: f32,
+        /// The bounds before the edit.
+        previous_rect: crate::rect::Rect,
+        /// The bounds after the edit.
+        next_rect: crate::rect::Rect,
+    },
+    /// A page-content object was moved or resized.
+    ///
+    /// Unlike the annotation variants this one is acted on by re-emitting an
+    /// effect rather than by updating a list: page objects live in the engine,
+    /// not in the store, so there is nothing here to keep in step.
+    ObjectGeometry {
+        /// Which object.
+        id: crate::pageobj::PageObjectId,
+        /// The bounds before the edit; undo restores this.
+        previous: crate::rect::Rect,
+        /// The bounds after the edit; redo restores this.
+        next: crate::rect::Rect,
+    },
+    /// A page-content text object's string was rewritten.
+    ObjectText {
+        /// Which object.
+        id: crate::pageobj::PageObjectId,
+        /// The text before the edit; undo restores this.
+        previous: String,
+        /// The text after the edit; redo restores this.
+        next: String,
+        /// The fixed text area the edit was constrained to.
+        layout_bounds: crate::rect::Rect,
+        /// The size before the edit, used to fit and to restore on undo.
+        base_font_size: f32,
+        /// The styling the object had before the edit; undo restores this.
+        previous_format: crate::pageobj::TextFormat,
+        /// The styling applied to the result.
+        format: crate::pageobj::TextFormat,
+    },
+    /// A page-content text object's styling was changed without touching its
+    /// string.
+    ///
+    /// Synthetic bold / colour / size — PDFium has no style property, so the
+    /// panel toggles a render mode and a colour and the engine fakes them.
+    ObjectFormat {
+        /// Which object.
+        id: crate::pageobj::PageObjectId,
+        /// The fixed text area the object sits in; a style that overflows it is
+        /// refused.
+        layout_bounds: crate::rect::Rect,
+        /// The effective size the line was set at; the shear scales with it.
+        base_font_size: f32,
+        /// The styling before the edit; undo restores this.
+        previous_format: crate::pageobj::TextFormat,
+        /// The styling after the edit; redo restores this.
+        format: crate::pageobj::TextFormat,
+    },
+    /// A page-content **text** object was deleted.
+    ///
+    /// Carries the whole record so the object can be re-created verbatim on
+    /// undo. Deleting an *image* pushes no entry at all: rebuilding it would
+    /// need its pixels, which is more memory than an undo stack can hold.
+    ObjectDelete {
+        /// Everything needed to rebuild it.
+        info: crate::pageobj::PageObjectInfo,
+    },
+    /// A page-content object was moved within the page's paint order.
+    ///
+    /// The record re-matches the object after the renumbering a remove +
+    /// re-insert causes; undo restores the exact index it occupied before.
+    ObjectRestack {
+        /// The object that moved.
+        info: crate::pageobj::PageObjectInfo,
+        /// The paint-order index it came from.
+        previous_index: u32,
+        /// Where it was sent; redo re-applies this.
+        target: crate::pageobj::RestackTarget,
+    },
+    /// A text object was inserted: undo deletes it, redo inserts it again.
+    ObjectAdd {
+        /// Page it was added to.
+        page: u32,
+        /// Where it was placed, in PDF page space.
+        point: (f32, f32),
+        /// What it says.
+        text: String,
+        /// Size it was drawn at.
+        font_size: f32,
+        /// Resolved once the engine reports the created object; cleared again
+        /// after a redo re-creates it, because PDFium hands out a new
+        /// positional id every time.
+        id: Option<crate::pageobj::PageObjectId>,
+    },
 }
 
 /// A single open document and how it is being viewed.
@@ -151,6 +249,13 @@ pub struct AppState {
     /// The active annotation tool. Not persisted: a reader opens in select
     /// mode, and a tool chosen last session means nothing this session.
     pub tool: crate::annotation::Tool,
+    /// Whether the canvas is in content-edit mode.
+    ///
+    /// A mode rather than a [`crate::annotation::Tool`] because it is not a
+    /// mark being drawn: while it is on, the annotate tools are unavailable and
+    /// the pointer edits the page's own objects instead. Global and not
+    /// persisted, like `tool`.
+    pub editing_content: bool,
 }
 
 impl AppState {
@@ -228,6 +333,10 @@ impl Store {
             | Command::ShowSettings
             | Command::ShowAbout
             | Command::ShowShortcuts
+            | Command::ShowGuide(_)
+            // The replacement-image picker is native and its answer comes back
+            // as `ReplacePageObjectImage`, so there is nothing to reduce here.
+            | Command::PickReplacementImage(_)
             | Command::FocusSearch => Vec::new(),
 
             Command::FormFieldsLoaded { doc, form } => {
@@ -355,9 +464,9 @@ impl Store {
                         resolve_created(&mut tab.undo_stack, created_id);
                         resolve_created(&mut tab.redo_stack, created_id);
                         // Select the mark that was just created so its resize
-                        // handles appear at once: the user can adjust it
-                        // straight away instead of hunting for it, and the
-                        // armed tool keeps drawing when they click empty paper.
+                        // handles appear at once. A click on empty paper then
+                        // leaves that adjustment; the armed tool draws again
+                        // on the next press, once nothing is selected.
                         if annotations.iter().any(|a| a.id == created_id) {
                             tab.view.selected_annotation = Some(created_id);
                         }
@@ -601,11 +710,428 @@ impl Store {
                 ]
             }
 
+            Command::SetAnnotationThickness { id, thickness } => {
+                let Some(tab) = self.state.active_mut() else {
+                    return Vec::new();
+                };
+                let Some(doc) = tab.document.as_ref().map(|d| d.id) else {
+                    return Vec::new();
+                };
+                let Some(a) = tab
+                    .annotations
+                    .as_mut()
+                    .and_then(|list| list.iter_mut().find(|a| a.id == id))
+                else {
+                    return Vec::new();
+                };
+                if !a.kind.has_line_weight() {
+                    return Vec::new();
+                }
+                let thickness = crate::annotation::clamp_line_weight(thickness);
+                if (a.thickness - thickness).abs() < 0.05 {
+                    return Vec::new();
+                }
+                let previous = a.thickness;
+                let previous_rect = a.rect;
+                let rect = crate::annotation::fitted_line_rect(a.kind, a.rect, thickness);
+                a.thickness = thickness;
+                a.rect = rect;
+                tab.dirty = true;
+                push_history(
+                    &mut tab.undo_stack,
+                    UndoAction::Thickness {
+                        id,
+                        previous,
+                        next: thickness,
+                        previous_rect,
+                        next_rect: rect,
+                    },
+                );
+                tab.redo_stack.clear();
+                vec![
+                    Effect::SetAnnotationThickness {
+                        doc,
+                        id,
+                        thickness,
+                        rect,
+                    },
+                    Effect::InvalidateTiles,
+                ]
+            }
+
             Command::SetPropertiesPanel { open } => {
                 let Some(tab) = self.state.active_mut() else {
                     return Vec::new();
                 };
                 tab.view.properties_panel_open = open;
+                Vec::new()
+            }
+
+            Command::SetEditingContent { on } => {
+                // Editing needs a document with pages to edit, and one whose
+                // permissions allow writing. Refused here rather than only in
+                // the toolbar, so the mode cannot be entered by a route that
+                // forgot to check.
+                let editable = self
+                    .state
+                    .active()
+                    .and_then(|tab| tab.document.as_ref())
+                    .is_some_and(|doc| doc.can_edit_content);
+                if on && !editable {
+                    return Vec::new();
+                }
+                self.state.editing_content = on;
+                if on {
+                    // Back to Select, so no half-armed mark competes with the
+                    // pointer for the same click.
+                    self.state.tool = crate::annotation::Tool::Select;
+                } else if let Some(tab) = self.state.active_mut() {
+                    tab.view.selected_object = None;
+                }
+                Vec::new()
+            }
+
+            // The store cannot check the id: the object list lives in the
+            // engine. A stale id is harmless — the canvas reads the selection
+            // back out of the list it drew, so one that resolves to nothing
+            // simply shows no handles.
+            Command::SelectPageObject(id) => {
+                let Some(tab) = self.state.active_mut() else {
+                    return Vec::new();
+                };
+                tab.view.selected_object = id;
+                Vec::new()
+            }
+
+            // The editor widget lives on the canvas. Selecting is the store's
+            // job; opening the field is the shell's, which intercepts this
+            // before it arrives here.
+            Command::BeginObjectTextEdit { .. } => Vec::new(),
+
+            Command::DuplicatePageObject { info } => {
+                if info.kind != crate::pageobj::PageObjectKind::Text {
+                    return Vec::new();
+                }
+                let Some(text) = info.text.clone().filter(|text| !text.trim().is_empty()) else {
+                    return Vec::new();
+                };
+                let Some(tab) = self.state.active_mut() else {
+                    return Vec::new();
+                };
+                let Some(doc) = tab.document.as_ref().map(|document| document.id) else {
+                    return Vec::new();
+                };
+                let font_size = info
+                    .font_size
+                    .unwrap_or(crate::pageobj::DEFAULT_INSERT_FONT_SIZE);
+                // A short step to the right, on the same baseline, so the copy
+                // is visible instead of painted exactly over the original.
+                let point = (
+                    info.bounds.min_x + 12.0,
+                    info.bounds.min_y + 0.2 * font_size,
+                );
+                let page = info.id.page;
+                tab.dirty = true;
+                push_history(
+                    &mut tab.undo_stack,
+                    UndoAction::ObjectAdd {
+                        page,
+                        point,
+                        text: text.clone(),
+                        font_size,
+                        id: None,
+                    },
+                );
+                tab.redo_stack.clear();
+                vec![
+                    Effect::InsertPageObjectText {
+                        doc,
+                        page,
+                        point,
+                        text,
+                        font_size,
+                    },
+                    Effect::InvalidateTiles,
+                ]
+            }
+
+            Command::SetPageObjectBounds {
+                id,
+                previous,
+                rect,
+            } => {
+                let Some(tab) = self.state.active_mut() else {
+                    return Vec::new();
+                };
+                let Some(doc) = tab.document.as_ref().map(|d| d.id) else {
+                    return Vec::new();
+                };
+                // A drag that ended where it started is a click, not an edit;
+                // recording it would put a no-op on the undo stack.
+                if (previous.min_x - rect.min_x).abs() < f32::EPSILON
+                    && (previous.min_y - rect.min_y).abs() < f32::EPSILON
+                    && (previous.max_x - rect.max_x).abs() < f32::EPSILON
+                    && (previous.max_y - rect.max_y).abs() < f32::EPSILON
+                {
+                    return Vec::new();
+                }
+                tab.dirty = true;
+                push_history(
+                    &mut tab.undo_stack,
+                    UndoAction::ObjectGeometry {
+                        id,
+                        previous,
+                        next: rect,
+                    },
+                );
+                tab.redo_stack.clear();
+                vec![
+                    Effect::SetPageObjectBounds { doc, id, rect },
+                    Effect::InvalidateTiles,
+                ]
+            }
+
+            Command::DeletePageObject { info } => {
+                let Some(tab) = self.state.active_mut() else {
+                    return Vec::new();
+                };
+                let Some(doc) = tab.document.as_ref().map(|d| d.id) else {
+                    return Vec::new();
+                };
+                tab.dirty = true;
+                if tab.view.selected_object == Some(info.id) {
+                    tab.view.selected_object = None;
+                }
+                // Only a text object can be rebuilt on undo. An image would need
+                // its pixels back, which is more memory than the undo stack can
+                // hold, so an image delete is permanent — and the UI says so
+                // rather than offering a step that cannot work.
+                if info.kind == crate::pageobj::PageObjectKind::Text {
+                    push_history(
+                        &mut tab.undo_stack,
+                        UndoAction::ObjectDelete { info: info.clone() },
+                    );
+                }
+                // Any change to the document invalidates the redo history, even
+                // one that records no step of its own.
+                tab.redo_stack.clear();
+                vec![
+                    Effect::DeletePageObject { doc, id: info.id },
+                    Effect::InvalidateTiles,
+                ]
+            }
+
+            Command::RestackPageObject { info, target } => {
+                let Some(tab) = self.state.active_mut() else {
+                    return Vec::new();
+                };
+                let Some(doc) = tab.document.as_ref().map(|d| d.id) else {
+                    return Vec::new();
+                };
+                tab.dirty = true;
+                // Undo restores the exact index the object occupies now; redo
+                // re-applies the requested end of the paint order.
+                push_history(
+                    &mut tab.undo_stack,
+                    UndoAction::ObjectRestack {
+                        info: info.clone(),
+                        previous_index: info.id.index,
+                        target,
+                    },
+                );
+                tab.redo_stack.clear();
+                vec![
+                    Effect::RestackPageObject {
+                        doc,
+                        info: info.clone(),
+                        target,
+                    },
+                    Effect::InvalidateTiles,
+                ]
+            }
+
+            Command::SetPageObjectText {
+                id,
+                previous,
+                text,
+                layout_bounds,
+                base_font_size,
+                previous_format,
+                format,
+            } => {
+                let Some(tab) = self.state.active_mut() else {
+                    return Vec::new();
+                };
+                let Some(doc) = tab.document.as_ref().map(|d| d.id) else {
+                    return Vec::new();
+                };
+                if previous == text && previous_format == format {
+                    return Vec::new();
+                }
+                tab.dirty = true;
+                push_history(
+                    &mut tab.undo_stack,
+                    UndoAction::ObjectText {
+                        id,
+                        previous: previous.clone(),
+                        next: text.clone(),
+                        layout_bounds,
+                        base_font_size,
+                        previous_format,
+                        format,
+                    },
+                );
+                tab.redo_stack.clear();
+                vec![
+                    Effect::SetPageObjectText {
+                        doc,
+                        id,
+                        previous,
+                        text,
+                        layout_bounds,
+                        base_font_size,
+                        previous_format,
+                        format,
+                    },
+                    Effect::InvalidateTiles,
+                ]
+            }
+
+            Command::SetPageObjectFormat {
+                id,
+                layout_bounds,
+                base_font_size,
+                previous_format,
+                format,
+            } => {
+                let Some(tab) = self.state.active_mut() else {
+                    return Vec::new();
+                };
+                let Some(doc) = tab.document.as_ref().map(|d| d.id) else {
+                    return Vec::new();
+                };
+                if previous_format == format {
+                    return Vec::new();
+                }
+                tab.dirty = true;
+                push_history(
+                    &mut tab.undo_stack,
+                    UndoAction::ObjectFormat {
+                        id,
+                        layout_bounds,
+                        base_font_size,
+                        previous_format,
+                        format,
+                    },
+                );
+                tab.redo_stack.clear();
+                vec![
+                    Effect::SetPageObjectFormat {
+                        doc,
+                        id,
+                        layout_bounds,
+                        base_font_size,
+                        previous_format,
+                        format,
+                    },
+                    Effect::InvalidateTiles,
+                ]
+            }
+
+            Command::ReplacePageObjectImage { id, path } => {
+                let Some(tab) = self.state.active_mut() else {
+                    return Vec::new();
+                };
+                let Some(doc) = tab.document.as_ref().map(|d| d.id) else {
+                    return Vec::new();
+                };
+                tab.dirty = true;
+                // No history: the previous pixels are not kept. See
+                // `DeletePageObject`.
+                tab.redo_stack.clear();
+                vec![
+                    Effect::ReplacePageObjectImage { doc, id, path },
+                    Effect::InvalidateTiles,
+                ]
+            }
+
+            // Creation is not optimistic about the id: the engine answers with
+            // the object it made, and that answer is where the index comes from.
+            Command::InsertPageObjectText { page, point, text } => {
+                let Some(tab) = self.state.active_mut() else {
+                    return Vec::new();
+                };
+                let Some(doc) = tab.document.as_ref().map(|d| d.id) else {
+                    return Vec::new();
+                };
+                tab.dirty = true;
+                push_history(
+                    &mut tab.undo_stack,
+                    UndoAction::ObjectAdd {
+                        page,
+                        point,
+                        text: text.clone(),
+                        font_size: crate::pageobj::DEFAULT_INSERT_FONT_SIZE,
+                        id: None,
+                    },
+                );
+                tab.redo_stack.clear();
+                vec![
+                    Effect::InsertPageObjectText {
+                        doc,
+                        page,
+                        point,
+                        text,
+                        font_size: crate::pageobj::DEFAULT_INSERT_FONT_SIZE,
+                    },
+                    Effect::InvalidateTiles,
+                ]
+            }
+
+            // The list itself is the shell's to cache. Here it settles what the
+            // store is holding: a selection whose object is gone — deleted, or
+            // renumbered out from under it — is stale, not an error.
+            Command::PageObjectsLoaded { doc, page, objects } => {
+                let Some(tab) = self
+                    .state
+                    .tabs
+                    .iter_mut()
+                    .find(|t| t.document.as_ref().is_some_and(|d| d.id == doc))
+                else {
+                    return Vec::new();
+                };
+                let still_there = tab
+                    .view
+                    .selected_object
+                    .is_none_or(|sel| sel.page != page || objects.iter().any(|o| o.id == sel));
+                if !still_there {
+                    tab.view.selected_object = None;
+                }
+                Vec::new()
+            }
+
+            Command::PageObjectInserted {
+                doc,
+                page,
+                id,
+                objects,
+            } => {
+                if let Some(tab) = self
+                    .state
+                    .tabs
+                    .iter_mut()
+                    .find(|t| t.document.as_ref().is_some_and(|d| d.id == doc))
+                {
+                    // Both stacks: a redo that re-creates an object leaves the
+                    // same kind of unresolved entry as the original insert.
+                    resolve_created_object(&mut tab.undo_stack, id);
+                    resolve_created_object(&mut tab.redo_stack, id);
+                    // Select what was just added, so its handles appear at once
+                    // and the user can position it without hunting for it.
+                    if id.page == page && objects.iter().any(|o| o.id == id) {
+                        tab.view.selected_object = Some(id);
+                    }
+                }
                 Vec::new()
             }
 
@@ -1252,6 +1778,266 @@ impl Store {
                 };
                 Some((effects, entry.clone()))
             }
+            UndoAction::Thickness {
+                id,
+                previous,
+                next,
+                previous_rect,
+                next_rect,
+            } => {
+                let (thickness, rect) = match direction {
+                    HistoryDirection::Back => (*previous, *previous_rect),
+                    HistoryDirection::Forward => (*next, *next_rect),
+                };
+                let tab = self.state.active_mut()?;
+                let found = tab
+                    .annotations
+                    .as_mut()
+                    .and_then(|list| list.iter_mut().find(|a| a.id == *id));
+                let annotation = found?;
+                annotation.thickness = thickness;
+                annotation.rect = rect;
+                tab.dirty = true;
+                Some((
+                    cons(
+                        Effect::SetAnnotationThickness {
+                            doc,
+                            id: *id,
+                            thickness,
+                            rect,
+                        },
+                        invalidate,
+                    ),
+                    entry.clone(),
+                ))
+            }
+            // Page-content objects live in the engine, not in the store, so
+            // these arms re-emit an effect rather than updating a list. That is
+            // also why they cannot validate the id: the engine checks the kind
+            // at that index and refuses if it is not what the step expects.
+            UndoAction::ObjectGeometry { id, previous, next } => {
+                let target = match direction {
+                    HistoryDirection::Back => *previous,
+                    HistoryDirection::Forward => *next,
+                };
+                let tab = self.state.active_mut()?;
+                tab.dirty = true;
+                Some((
+                    cons(
+                        Effect::SetPageObjectBounds {
+                            doc,
+                            id: *id,
+                            rect: target,
+                        },
+                        invalidate,
+                    ),
+                    entry.clone(),
+                ))
+            }
+            UndoAction::ObjectText {
+                id,
+                previous,
+                next,
+                layout_bounds,
+                base_font_size,
+                previous_format,
+                format,
+            } => {
+                let (target, rollback, rollback_format, forward_format) = match direction {
+                    HistoryDirection::Back => {
+                        (previous.clone(), next.clone(), *format, *previous_format)
+                    }
+                    HistoryDirection::Forward => {
+                        (next.clone(), previous.clone(), *previous_format, *format)
+                    }
+                };
+                let tab = self.state.active_mut()?;
+                tab.dirty = true;
+                Some((
+                    cons(
+                        Effect::SetPageObjectText {
+                            doc,
+                            id: *id,
+                            previous: rollback,
+                            text: target,
+                            layout_bounds: *layout_bounds,
+                            base_font_size: *base_font_size,
+                            previous_format: rollback_format,
+                            format: forward_format,
+                        },
+                        invalidate,
+                    ),
+                    entry.clone(),
+                ))
+            }
+            UndoAction::ObjectFormat {
+                id,
+                layout_bounds,
+                base_font_size,
+                previous_format,
+                format,
+            } => {
+                let (rollback, forward) = match direction {
+                    HistoryDirection::Back => (*format, *previous_format),
+                    HistoryDirection::Forward => (*previous_format, *format),
+                };
+                let tab = self.state.active_mut()?;
+                tab.dirty = true;
+                Some((
+                    cons(
+                        Effect::SetPageObjectFormat {
+                            doc,
+                            id: *id,
+                            layout_bounds: *layout_bounds,
+                            base_font_size: *base_font_size,
+                            previous_format: rollback,
+                            format: forward,
+                        },
+                        invalidate,
+                    ),
+                    entry.clone(),
+                ))
+            }
+            UndoAction::ObjectRestack {
+                info,
+                previous_index,
+                target,
+            } => match direction {
+                // Undo of a restack: put the object back at the exact index it
+                // occupied. The record re-matches it — the restack itself
+                // renumbered the page.
+                HistoryDirection::Back => {
+                    let tab = self.state.active_mut()?;
+                    tab.dirty = true;
+                    Some((
+                        cons(
+                            Effect::RestackPageObject {
+                                doc,
+                                info: info.clone(),
+                                target: crate::pageobj::RestackTarget::At(*previous_index),
+                            },
+                            invalidate,
+                        ),
+                        entry.clone(),
+                    ))
+                }
+                // Redo: re-apply the requested end of the paint order.
+                HistoryDirection::Forward => {
+                    let tab = self.state.active_mut()?;
+                    tab.dirty = true;
+                    Some((
+                        cons(
+                            Effect::RestackPageObject {
+                                doc,
+                                info: info.clone(),
+                                target: *target,
+                            },
+                            invalidate,
+                        ),
+                        entry.clone(),
+                    ))
+                }
+            },
+            UndoAction::ObjectDelete { info } => match direction {
+                // Undo of a delete: put the text object back where it was. Only
+                // text objects record a delete, so there is always something to
+                // rebuild it from.
+                HistoryDirection::Back => {
+                    let text = info.text.clone().unwrap_or_default();
+                    // `insert_text` places from the baseline. The ink bottom
+                    // sits about a descender below that, so using `min_y`
+                    // drops the restored glyphs.
+                    let font_size = info
+                        .font_size
+                        .unwrap_or(crate::pageobj::DEFAULT_INSERT_FONT_SIZE);
+                    let tab = self.state.active_mut()?;
+                    tab.dirty = true;
+                    tab.view.selected_object = None;
+                    Some((
+                        cons(
+                            Effect::InsertPageObjectText {
+                                doc,
+                                page: info.id.page,
+                                point: (info.bounds.min_x, info.bounds.min_y + 0.2 * font_size),
+                                text,
+                                font_size,
+                            },
+                            invalidate,
+                        ),
+                        entry.clone(),
+                    ))
+                }
+                // Redo of a delete: remove it again. Its recorded index is only
+                // a hint — undoing re-created the object, which renumbered the
+                // page — so the engine re-matches on the record itself.
+                HistoryDirection::Forward => {
+                    let tab = self.state.active_mut()?;
+                    tab.view.selected_object = None;
+                    Some((
+                        cons(
+                            Effect::DeletePageObjectMatching {
+                                doc,
+                                info: info.clone(),
+                            },
+                            invalidate,
+                        ),
+                        entry.clone(),
+                    ))
+                }
+            },
+            UndoAction::ObjectAdd {
+                page,
+                point,
+                text,
+                font_size,
+                id,
+            } => match direction {
+                // Undo of an insert: delete the object it created.
+                HistoryDirection::Back => {
+                    let id = (*id)?;
+                    let tab = self.state.active_mut()?;
+                    if tab.view.selected_object == Some(id) {
+                        tab.view.selected_object = None;
+                    }
+                    Some((
+                        cons(Effect::DeletePageObject { doc, id }, invalidate),
+                        UndoAction::ObjectAdd {
+                            page: *page,
+                            point: *point,
+                            text: text.clone(),
+                            font_size: *font_size,
+                            id: None,
+                        },
+                    ))
+                }
+                // Redo: draw it again, at the size it was first made. The id is
+                // cleared because the engine assigns a fresh index on every
+                // create; `PageObjectInserted` resolves it once more.
+                HistoryDirection::Forward => {
+                    let tab = self.state.active_mut()?;
+                    tab.dirty = true;
+                    tab.view.selected_object = None;
+                    Some((
+                        cons(
+                            Effect::InsertPageObjectText {
+                                doc,
+                                page: *page,
+                                point: *point,
+                                text: text.clone(),
+                                font_size: *font_size,
+                            },
+                            invalidate,
+                        ),
+                        UndoAction::ObjectAdd {
+                            page: *page,
+                            point: *point,
+                            text: text.clone(),
+                            font_size: *font_size,
+                            id: None,
+                        },
+                    ))
+                }
+            },
         }
     }
 
@@ -1310,6 +2096,22 @@ fn resolve_created(stack: &mut [UndoAction], created: AnnotationId) {
     }
 }
 
+/// Attach the engine's id to the newest unresolved text-insert.
+///
+/// The page-object counterpart of [`resolve_created`]. Only the newest entry is
+/// settled, and only one whose page matches: with several inserts in flight,
+/// each fresh answer carries exactly the object it produced.
+fn resolve_created_object(stack: &mut [UndoAction], created: crate::pageobj::PageObjectId) {
+    for entry in stack.iter_mut().rev() {
+        if let UndoAction::ObjectAdd { page, id, .. } = entry {
+            if *page == created.page && id.is_none() {
+                *id = Some(created);
+                break;
+            }
+        }
+    }
+}
+
 /// Record the shape of every resolved add that does not have one yet.
 ///
 /// A redo needs the rectangle, kind and text of the annotation it re-creates,
@@ -1360,6 +2162,7 @@ mod tests {
     use crate::document::{Document, Outline, PageGeometry, Rotation};
     use crate::export::{ExportDpi, ExportTask, ImageFormat, ImagePageSize, PageRange};
     use crate::form::{FieldId, FieldValue, FormFieldInfo, FormFieldType, FormKind};
+    use crate::pageobj::{PageObjectId, PageObjectInfo, PageObjectKind, TextFormat};
     use crate::rect::Rect;
     use crate::view::{ViewMode, ViewState, ZoomMode};
     use std::path::PathBuf;
@@ -1371,6 +2174,7 @@ mod tests {
             title: "x".into(),
             pages: vec![PageGeometry::A4; pages as usize],
             encrypted: false,
+            can_edit_content: true,
             outline: Outline::default(),
         }
     }
@@ -1848,8 +2652,9 @@ mod tests {
             kind: crate::annotation::AnnotationKind::Highlight,
             rect: Rect::from_xywh(0.0, 0.0, 10.0, 10.0),
             contents: None,
-                color: None,
-}]);
+            color: None,
+            thickness: 0.45,
+        }]);
         let effects = s.dispatch(Command::SetAnnotationContents {
             id: crate::annotation::AnnotationId::new(0, 0),
             contents: "hello".into(),
@@ -1880,15 +2685,17 @@ mod tests {
                 kind: crate::annotation::AnnotationKind::Highlight,
                 rect: Rect::from_xywh(0.0, 0.0, 10.0, 10.0),
                 contents: None,
-                        color: None,
-},
+                color: None,
+                thickness: 0.45,
+            },
             crate::annotation::AnnotationInfo {
                 id: crate::annotation::AnnotationId::new(0, 1),
                 kind: crate::annotation::AnnotationKind::StickyNote,
                 rect: Rect::from_xywh(20.0, 20.0, 30.0, 30.0),
                 contents: Some("note".into()),
-                        color: None,
-},
+                color: None,
+                thickness: 0.45,
+            },
         ];
         s.state.tabs[0].annotations = Some(annotations);
 
@@ -1928,8 +2735,9 @@ mod tests {
             kind: crate::annotation::AnnotationKind::StickyNote,
             rect: Rect::from_xywh(20.0, 20.0, 30.0, 30.0),
             contents: Some("note".into()),
-                color: None,
-}];
+            color: None,
+            thickness: 0.45,
+        }];
         s.dispatch(Command::AnnotationsLoaded {
             doc,
             annotations: shifted,
@@ -1959,8 +2767,9 @@ mod tests {
             kind: crate::annotation::AnnotationKind::Highlight,
             rect: Rect::from_xywh(0.0, 0.0, 10.0, 10.0),
             contents: None,
-                color: None,
-}]);
+            color: None,
+            thickness: 0.45,
+        }]);
         s.dispatch(Command::AnnotationsLoadFailed { doc });
         assert_eq!(
             s.state
@@ -2003,8 +2812,9 @@ mod tests {
             kind: crate::annotation::AnnotationKind::Highlight,
             rect: Rect::from_xywh(0.0, 0.0, 10.0, 10.0),
             contents: None,
-                color: None,
-}];
+            color: None,
+            thickness: 0.45,
+        }];
         s.dispatch(Command::AnnotationsLoaded {
             doc,
             annotations: annotations.clone(),
@@ -2071,6 +2881,7 @@ mod tests {
                 rect: Rect::from_xywh(0.0, 0.0, 10.0, 10.0),
                 contents: None,
                 color: None,
+                thickness: 0.45,
             }],
             created: Some(id),
         });
@@ -2100,8 +2911,9 @@ mod tests {
                 kind: crate::annotation::AnnotationKind::Highlight,
                 rect: Rect::from_xywh(0.0, 0.0, 10.0, 10.0),
                 contents: None,
-                        color: None,
-}],
+                color: None,
+                thickness: 0.45,
+            }],
             created: Some(crate::annotation::AnnotationId::new(0, 0)),
         });
         s.dispatch(Command::Undo);
@@ -2136,8 +2948,9 @@ mod tests {
             kind: crate::annotation::AnnotationKind::Square,
             rect: Rect::from_xywh(30.0, 40.0, 48.0, 48.0),
             contents: None,
-                color: None,
-}]);
+            color: None,
+            thickness: 0.45,
+        }]);
 
         s.dispatch(Command::DeleteAnnotation(
             crate::annotation::AnnotationId::new(0, 3),
@@ -2160,15 +2973,17 @@ mod tests {
                     kind: crate::annotation::AnnotationKind::Highlight,
                     rect: Rect::from_xywh(0.0, 0.0, 5.0, 5.0),
                     contents: None,
-                                color: None,
-},
+                    color: None,
+                    thickness: 0.45,
+                },
                 crate::annotation::AnnotationInfo {
                     id: crate::annotation::AnnotationId::new(0, 1),
                     kind: crate::annotation::AnnotationKind::Square,
                     rect: Rect::from_xywh(30.0, 40.0, 48.0, 48.0),
                     contents: None,
-                                color: None,
-},
+                    color: None,
+                    thickness: 0.45,
+                },
             ],
             created: Some(crate::annotation::AnnotationId::new(0, 1)),
         });
@@ -2194,8 +3009,9 @@ mod tests {
             kind: crate::annotation::AnnotationKind::FreeText,
             rect: Rect::from_xywh(0.0, 0.0, 100.0, 20.0),
             contents: Some("before".into()),
-                color: None,
-}]);
+            color: None,
+            thickness: 0.45,
+        }]);
 
         s.dispatch(Command::SetAnnotationContents {
             id: crate::annotation::AnnotationId::new(0, 0),
@@ -2230,8 +3046,9 @@ mod tests {
             kind: crate::annotation::AnnotationKind::FreeText,
             rect: Rect::from_xywh(0.0, 0.0, 100.0, 20.0),
             contents: Some("before".into()),
-                color: None,
-}]);
+            color: None,
+            thickness: 0.45,
+        }]);
 
         s.dispatch(Command::SetAnnotationContents {
             id: crate::annotation::AnnotationId::new(0, 0),
@@ -2263,8 +3080,9 @@ mod tests {
             kind: crate::annotation::AnnotationKind::StickyNote,
             rect: Rect::from_xywh(30.0, 40.0, 48.0, 48.0),
             contents: Some("kept text".into()),
-                color: None,
-}]);
+            color: None,
+            thickness: 0.45,
+        }]);
 
         s.dispatch(Command::DeleteAnnotation(
             crate::annotation::AnnotationId::new(0, 3),
@@ -2303,8 +3121,9 @@ mod tests {
             kind: crate::annotation::AnnotationKind::FreeText,
             rect: Rect::from_xywh(0.0, 0.0, 100.0, 20.0),
             contents: Some("before".into()),
-                color: None,
-}]);
+            color: None,
+            thickness: 0.45,
+        }]);
 
         s.dispatch(Command::SetAnnotationContents {
             id: crate::annotation::AnnotationId::new(0, 0),
@@ -2527,6 +3346,7 @@ mod tests {
             rect: Rect::from_xywh(10.0, 20.0, 40.0, 10.0),
             contents: None,
             color: Some([255, 202, 40, 255]),
+            thickness: 0.45,
         }]);
         // The selection must survive a geometry edit: the user drags the mark
         // they selected, and the handles must not vanish mid-gesture.
@@ -2584,6 +3404,7 @@ mod tests {
             rect: Rect::from_xywh(0.0, 0.0, 40.0, 40.0),
             contents: None,
             color: Some([244, 67, 54, 255]),
+            thickness: 0.45,
         }]);
 
         let effects = s.dispatch(Command::SetAnnotationColor {
@@ -2617,6 +3438,76 @@ mod tests {
         assert_eq!(s.state.active().unwrap().undo_stack.len(), before);
     }
 
+    /// A line weight is staged by the properties panel and written here: the
+    /// list updates, a line markup's box grows so the stroke is not clipped,
+    /// and undo restores both the weight and the box.
+    #[test]
+    fn annotation_line_weight_updates_list_and_is_undoable() {
+        let (mut s, _tab) = opened_store(1);
+        let id = crate::annotation::AnnotationId::new(0, 0);
+        let rect = Rect::from_xywh(10.0, 20.0, 80.0, 2.0);
+        s.state.tabs[0].annotations = Some(vec![crate::annotation::AnnotationInfo {
+            id,
+            kind: crate::annotation::AnnotationKind::Underline,
+            rect,
+            contents: None,
+            color: Some([0, 0, 0, 255]),
+            thickness: 0.45,
+        }]);
+
+        let effects = s.dispatch(Command::SetAnnotationThickness { id, thickness: 5.0 });
+        let list = s.state.active().unwrap().annotations.clone().unwrap();
+        assert!((list[0].thickness - 5.0).abs() < 0.01);
+        assert!(
+            list[0].rect.height() >= 5.0 - 0.01,
+            "a 5pt stroke on a 2pt box must grow the box, got {}",
+            list[0].rect.height()
+        );
+        assert!(
+            effects.iter().any(|e| matches!(
+                e,
+                Effect::SetAnnotationThickness { thickness, rect, .. }
+                    if (*thickness - 5.0).abs() < 0.01 && rect.height() >= 5.0 - 0.01
+            )),
+            "the weight must reach the engine with the grown box"
+        );
+
+        // The same weight again is not a second edit.
+        assert!(
+            s.dispatch(Command::SetAnnotationThickness { id, thickness: 5.0 })
+                .is_empty()
+        );
+
+        let effects = s.dispatch(Command::Undo);
+        let list = s.state.active().unwrap().annotations.clone().unwrap();
+        assert!((list[0].thickness - 0.45).abs() < 0.01);
+        assert_eq!(list[0].rect, rect);
+        assert!(effects.iter().any(|e| matches!(
+            e,
+            Effect::SetAnnotationThickness { thickness, rect: restored, .. }
+                if (*thickness - 0.45).abs() < 0.01 && *restored == rect
+        )));
+
+        s.dispatch(Command::Redo);
+        let list = s.state.active().unwrap().annotations.clone().unwrap();
+        assert!((list[0].thickness - 5.0).abs() < 0.01);
+        assert!(list[0].rect.height() >= 5.0 - 0.01);
+
+        // A highlight has no stroke, so the command changes nothing.
+        s.state.tabs[0].annotations = Some(vec![crate::annotation::AnnotationInfo {
+            id,
+            kind: crate::annotation::AnnotationKind::Highlight,
+            rect,
+            contents: None,
+            color: Some([255, 202, 40, 255]),
+            thickness: 0.45,
+        }]);
+        assert!(
+            s.dispatch(Command::SetAnnotationThickness { id, thickness: 5.0 })
+                .is_empty()
+        );
+    }
+
     /// Regression: a colourless annotation (no `/C` entry — links, imported
     /// marks) must still be recolourable. The old handler bailed out when
     /// `a.color` was `None`, so clicking a swatch did nothing and the edit
@@ -2632,6 +3523,7 @@ mod tests {
             rect: Rect::from_xywh(0.0, 0.0, 40.0, 40.0),
             contents: None,
             color: None,
+            thickness: 0.45,
         }]);
 
         let effects = s.dispatch(Command::SetAnnotationColor {
@@ -2670,6 +3562,7 @@ mod tests {
             rect: Rect::from_xywh(0.0, 0.0, 40.0, 40.0),
             contents: None,
             color: Some([255, 0, 0, 255]),
+            thickness: 0.45,
         }]);
 
         // Off by default — selecting an annotation does not open it.
@@ -2698,6 +3591,7 @@ mod tests {
             rect: Rect::from_xywh(10.0, 20.0, 40.0, 10.0),
             contents: None,
             color: None,
+            thickness: 0.45,
         }]);
 
         let effects = s.dispatch(Command::UpdateAnnotationBounds {
@@ -2724,6 +3618,7 @@ mod tests {
             rect: Rect::from_xywh(10.0, 20.0, 40.0, 10.0),
             contents: None,
             color: Some([255, 0, 0, 200]),
+            thickness: 0.45,
         }]);
 
         s.dispatch(Command::UpdateAnnotationBounds {
@@ -2780,5 +3675,447 @@ mod tests {
             Some([33, 150, 243, 128]),
             "redo restores colour"
         );
+    }
+
+    // --- Content editing ---------------------------------------------------
+
+    /// A record of one page object, for the tests below.
+    fn object_info(id: PageObjectId, kind: PageObjectKind) -> PageObjectInfo {
+        PageObjectInfo {
+            id,
+            kind,
+            bounds: Rect::from_xywh(10.0, 10.0, 40.0, 12.0),
+            layout_bounds: Rect::from_xywh(10.0, 10.0, 40.0, 12.0),
+            text: matches!(kind, PageObjectKind::Text).then(|| "Hello".to_string()),
+            font_size: Some(12.0),
+            format: TextFormat::default(),
+        }
+    }
+
+    /// Edit mode turns on when the document's *permissions* allow it, which is
+    /// not the same as the document being unencrypted.
+    ///
+    /// A PDF may carry a security handler purely to restrict permissions, with
+    /// no password needed to open it — common in files from publishers, banks
+    /// and print workflows. Those are perfectly editable, and gating on the
+    /// encryption flag blocked them: the button simply did nothing.
+    #[test]
+    fn edit_mode_follows_the_modify_permission_not_the_encryption_flag() {
+        let (mut s, tab) = opened_store(3);
+        assert!(!s.state.editing_content);
+
+        // Encrypted, but its permissions allow modification.
+        s.state.tabs[0].document.as_mut().unwrap().encrypted = true;
+        s.state.tabs[0].document.as_mut().unwrap().can_edit_content = true;
+
+        s.dispatch(Command::SetTool(crate::annotation::Tool::Highlight));
+        s.dispatch(Command::SetEditingContent { on: true });
+        assert!(
+            s.state.editing_content,
+            "an encrypted document whose permissions allow modification must be editable"
+        );
+        assert_eq!(
+            s.state.tool,
+            crate::annotation::Tool::Select,
+            "editing must disarm the annotate tools"
+        );
+
+        let id = PageObjectId { page: 0, index: 2 };
+        s.dispatch(Command::SelectPageObject(Some(id)));
+        assert_eq!(s.state.tab(tab).unwrap().view.selected_object, Some(id));
+
+        s.dispatch(Command::SetEditingContent { on: false });
+        assert!(!s.state.editing_content);
+        assert_eq!(s.state.tab(tab).unwrap().view.selected_object, None);
+
+        // A document that genuinely forbids modification is refused.
+        s.state.tabs[0].document.as_mut().unwrap().can_edit_content = false;
+        s.dispatch(Command::SetEditingContent { on: true });
+        assert!(
+            !s.state.editing_content,
+            "a document that forbids modification must not enter edit mode"
+        );
+    }
+
+    /// Undoing a retype writes the original words back at the original point
+    /// size. The font object is the one already on the run; the size must not
+    /// come back as something else.
+    #[test]
+    fn undoing_a_text_edit_restores_the_original_words_and_size() {
+        let (mut s, _) = opened_store(1);
+        let id = PageObjectId { page: 0, index: 2 };
+        let bounds = Rect::from_xywh(10.0, 20.0, 80.0, 14.0);
+        let format = TextFormat {
+            size: Some(12.0),
+            ..TextFormat::default()
+        };
+        s.dispatch(Command::SetPageObjectText {
+            id,
+            previous: "Hello".to_string(),
+            text: "Hello there".to_string(),
+            layout_bounds: bounds,
+            base_font_size: 12.0,
+            previous_format: format,
+            format,
+        });
+
+        let effects = s.dispatch(Command::Undo);
+        let restored = effects.iter().find_map(|effect| match effect {
+            Effect::SetPageObjectText {
+                text,
+                base_font_size,
+                format,
+                ..
+            } => Some((text.clone(), *base_font_size, format.size)),
+            _ => None,
+        });
+        assert_eq!(
+            restored,
+            Some(("Hello".to_string(), 12.0, Some(12.0))),
+            "undo must put the original words back at the original size: {effects:?}"
+        );
+
+        let effects = s.dispatch(Command::Redo);
+        let redone = effects.iter().find_map(|effect| match effect {
+            Effect::SetPageObjectText { text, .. } => Some(text.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            redone.as_deref(),
+            Some("Hello there"),
+            "redo must put the edited words back: {effects:?}"
+        );
+    }
+
+    /// Moving an object records exactly one undo step, and both directions put
+    /// the box back where they say they will.
+    #[test]
+    fn a_page_object_geometry_change_round_trips_through_undo() {
+        let (mut s, tab) = opened_store(2);
+        let id = PageObjectId { page: 0, index: 1 };
+        let before = Rect::from_xywh(10.0, 10.0, 40.0, 12.0);
+        let after = Rect::from_xywh(30.0, 25.0, 40.0, 12.0);
+
+        let effects = s.dispatch(Command::SetPageObjectBounds {
+            id,
+            previous: before,
+            rect: after,
+        });
+        assert!(s.state.tab(tab).unwrap().dirty);
+        assert_eq!(
+            effects
+                .iter()
+                .filter(|e| matches!(e, Effect::SetPageObjectBounds { .. }))
+                .count(),
+            1
+        );
+        assert!(
+            effects.iter().any(|e| matches!(e, Effect::InvalidateTiles)),
+            "a content edit must re-render the page"
+        );
+
+        let rect_of = |effects: &[Effect]| {
+            effects.iter().find_map(|e| match e {
+                Effect::SetPageObjectBounds { rect, .. } => Some(*rect),
+                _ => None,
+            })
+        };
+        assert_eq!(
+            rect_of(&s.dispatch(Command::Undo)),
+            Some(before),
+            "undo restores the box it was at"
+        );
+        assert_eq!(
+            rect_of(&s.dispatch(Command::Redo)),
+            Some(after),
+            "redo moves it back"
+        );
+    }
+
+    /// Restyling a text object records exactly one undo step, and both
+    /// directions restore the style they name. Colour cannot be read back from
+    /// the engine, so the reducer carries it explicitly rather than round-tripping
+    /// through the page-object list.
+    #[test]
+    fn a_page_object_format_change_round_trips_through_undo() {
+        let (mut s, tab) = opened_store(1);
+        let id = PageObjectId { page: 0, index: 0 };
+        let layout_bounds = Rect::from_xywh(10.0, 10.0, 40.0, 12.0);
+        let base = TextFormat::default();
+        let bold = TextFormat {
+            bold: true,
+            color: Some([200, 0, 0, 255]),
+            ..Default::default()
+        };
+
+        let effects = s.dispatch(Command::SetPageObjectFormat {
+            id,
+            layout_bounds,
+            base_font_size: 12.0,
+            previous_format: base,
+            format: bold,
+        });
+        assert!(s.state.tab(tab).unwrap().dirty);
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::SetPageObjectFormat { .. })),
+            "the format change must emit its effect"
+        );
+        assert!(
+            effects.iter().any(|e| matches!(e, Effect::InvalidateTiles)),
+            "a content edit must re-render the page"
+        );
+        assert!(
+            matches!(
+                s.state.tab(tab).unwrap().undo_stack.last(),
+                Some(UndoAction::ObjectFormat { format: f, .. }) if *f == bold
+            ),
+            "the undo entry must remember the new style"
+        );
+
+        let format_of = |effects: &[Effect]| {
+            effects.iter().find_map(|e| match e {
+                Effect::SetPageObjectFormat {
+                    format,
+                    previous_format,
+                    ..
+                } => Some((*previous_format, *format)),
+                _ => None,
+            })
+        };
+        // Undo must hand the engine the old style, then redo the new one.
+        assert_eq!(
+            format_of(&s.dispatch(Command::Undo)),
+            Some((bold, base)),
+            "undo restores the original style"
+        );
+        assert_eq!(
+            format_of(&s.dispatch(Command::Redo)),
+            Some((base, bold)),
+            "redo reapplies the bold style"
+        );
+    }
+
+    /// "Bring to front" records one undo step whose undo restores the exact
+    /// index the object occupied, and whose redo re-applies the requested end
+    /// of the paint order.
+    #[test]
+    fn a_page_object_restack_round_trips_through_undo() {
+        let (mut s, tab) = opened_store(1);
+        let text = object_info(PageObjectId { page: 0, index: 4 }, PageObjectKind::Text);
+
+        let effects = s.dispatch(Command::RestackPageObject {
+            info: text.clone(),
+            target: crate::pageobj::RestackTarget::Front,
+        });
+        assert!(s.state.tab(tab).unwrap().dirty);
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::RestackPageObject { .. })),
+            "a restack must emit its effect"
+        );
+
+        let target_of = |effects: &[Effect]| {
+            effects.iter().find_map(|e| match e {
+                Effect::RestackPageObject { target, .. } => Some(*target),
+                _ => None,
+            })
+        };
+        assert_eq!(
+            target_of(&s.dispatch(Command::Undo)),
+            Some(crate::pageobj::RestackTarget::At(4)),
+            "undo restores the object's original paint-order index"
+        );
+        assert_eq!(
+            target_of(&s.dispatch(Command::Redo)),
+            Some(crate::pageobj::RestackTarget::Front),
+            "redo re-applies bring-to-front"
+        );
+    }
+
+    /// Duplicating a text object inserts a copy on the same baseline, stepped
+    /// to the right, at the size the original was set in.
+    #[test]
+    fn duplicating_a_text_object_inserts_a_copy_beside_it() {
+        let (mut s, _) = opened_store(1);
+        let info = object_info(PageObjectId { page: 0, index: 3 }, PageObjectKind::Text);
+        let effects = s.dispatch(Command::DuplicatePageObject { info: info.clone() });
+        let placed = effects.iter().find_map(|effect| match effect {
+            Effect::InsertPageObjectText {
+                point,
+                font_size,
+                text,
+                ..
+            } => Some((*point, *font_size, text.clone())),
+            _ => None,
+        });
+        assert_eq!(
+            placed,
+            Some((
+                (info.bounds.min_x + 12.0, info.bounds.min_y + 0.2 * 12.0),
+                12.0,
+                "Hello".to_string(),
+            )),
+            "a duplicate is the same words, offset so it does not cover the original: {effects:?}"
+        );
+    }
+
+    /// A drag that ends where it started is a click, not an edit: no effect and
+    /// nothing on the undo stack.
+    #[test]
+    fn a_page_object_click_records_nothing() {
+        let (mut s, tab) = opened_store(1);
+        let rect = Rect::from_xywh(10.0, 10.0, 40.0, 12.0);
+        let effects = s.dispatch(Command::SetPageObjectBounds {
+            id: PageObjectId { page: 0, index: 0 },
+            previous: rect,
+            rect,
+        });
+        assert!(effects.is_empty());
+        assert!(!s.state.tab(tab).unwrap().dirty);
+    }
+
+    /// Deleting a text object can be undone, because the whole record is kept.
+    /// Deleting an image cannot — rebuilding it would need its pixels — so no
+    /// step is recorded for it. A step that could not work would be worse than
+    /// no step at all.
+    #[test]
+    fn deleting_a_text_object_is_undoable_and_an_image_is_not() {
+        let (mut s, tab) = opened_store(1);
+        let text = object_info(PageObjectId { page: 0, index: 3 }, PageObjectKind::Text);
+        let image = object_info(PageObjectId { page: 0, index: 4 }, PageObjectKind::Image);
+
+        s.dispatch(Command::SelectPageObject(Some(text.id)));
+        s.dispatch(Command::DeletePageObject { info: text.clone() });
+        assert_eq!(
+            s.state.tab(tab).unwrap().view.selected_object,
+            None,
+            "a deleted object must not stay selected"
+        );
+
+        let effects = s.dispatch(Command::Undo);
+        let point = effects.iter().find_map(|effect| match effect {
+            Effect::InsertPageObjectText { point, .. } => Some(*point),
+            _ => None,
+        });
+        assert_eq!(
+            point,
+            Some((text.bounds.min_x, text.bounds.min_y + 0.2 * 12.0)),
+            "undo places the run on its baseline, not the ink bottom: {effects:?}"
+        );
+
+        // The image pushes no step, and it cleared the redo stack, so undo has
+        // nothing left to act on.
+        s.dispatch(Command::DeletePageObject { info: image });
+        let effects = s.dispatch(Command::Undo);
+        assert!(
+            !effects.iter().any(|e| matches!(
+                e,
+                Effect::DeletePageObject { .. } | Effect::InsertPageObjectText { .. }
+            )),
+            "an image delete is not undoable: {effects:?}"
+        );
+    }
+
+    /// An insert records its step before the object's index exists; the engine's
+    /// answer settles it — the page-object twin of the annotation
+    /// add/`AnnotationsLoaded` pair.
+    #[test]
+    fn an_inserted_object_resolves_its_undo_id_and_is_selected() {
+        let (mut s, tab) = opened_store(1);
+        let doc = s.state.tab(tab).unwrap().document.as_ref().unwrap().id;
+        s.dispatch(Command::InsertPageObjectText {
+            page: 0,
+            point: (20.0, 30.0),
+            text: "Hi".to_string(),
+        });
+
+        let id = PageObjectId { page: 0, index: 7 };
+        s.dispatch(Command::PageObjectInserted {
+            doc,
+            page: 0,
+            id,
+            objects: vec![object_info(id, PageObjectKind::Text)],
+        });
+        assert_eq!(
+            s.state.tab(tab).unwrap().view.selected_object,
+            Some(id),
+            "the new object is selected so its handles appear at once"
+        );
+
+        let effects = s.dispatch(Command::Undo);
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::DeletePageObject { id: got, .. } if *got == id)),
+            "undo of an insert deletes the object it created: {effects:?}"
+        );
+    }
+
+    /// A refreshed list drops a selection whose object is gone, but leaves a
+    /// selection on another page alone — that list says nothing about it.
+    #[test]
+    fn a_refreshed_object_list_drops_a_stale_selection() {
+        let (mut s, tab) = opened_store(2);
+        let doc = s.state.tab(tab).unwrap().document.as_ref().unwrap().id;
+
+        s.dispatch(Command::SelectPageObject(Some(PageObjectId {
+            page: 0,
+            index: 4,
+        })));
+        s.dispatch(Command::PageObjectsLoaded {
+            doc,
+            page: 0,
+            objects: Vec::new(),
+        });
+        assert_eq!(s.state.tab(tab).unwrap().view.selected_object, None);
+
+        let other = PageObjectId { page: 1, index: 0 };
+        s.dispatch(Command::SelectPageObject(Some(other)));
+        s.dispatch(Command::PageObjectsLoaded {
+            doc,
+            page: 0,
+            objects: Vec::new(),
+        });
+        assert_eq!(
+            s.state.tab(tab).unwrap().view.selected_object,
+            Some(other),
+            "a list for page 0 must not clear a selection on page 1"
+        );
+    }
+
+    /// Replacing an image marks the document dirty but records no undo step:
+    /// the previous pixels are not kept, so a step claiming to restore them
+    /// would be a lie the first undo would expose.
+    #[test]
+    fn replacing_an_image_marks_dirty_but_records_no_history() {
+        let (mut s, tab) = opened_store(1);
+        s.dispatch(Command::ReplacePageObjectImage {
+            id: PageObjectId { page: 0, index: 2 },
+            path: PathBuf::from("/pictures/logo.png"),
+        });
+        assert!(s.state.tab(tab).unwrap().dirty);
+
+        let effects = s.dispatch(Command::Undo);
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::ReplacePageObjectImage { .. })),
+            "an image replace is not undoable: {effects:?}"
+        );
+    }
+
+    /// The replacement picker is shell-only. Acting on it here as well would
+    /// run the picker twice — once now and once when it answers.
+    #[test]
+    fn the_replacement_picker_is_left_to_the_shell() {
+        let (mut s, _tab) = opened_store(1);
+        let effects = s.dispatch(Command::PickReplacementImage(PageObjectId {
+            page: 0,
+            index: 0,
+        }));
+        assert!(effects.is_empty());
     }
 }

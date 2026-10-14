@@ -99,6 +99,15 @@ impl AnnotationKind {
         matches!(self, Self::Underline | Self::StrikeOut | Self::Squiggly)
     }
 
+    /// Whether the properties panel can change this kind's stroke weight.
+    ///
+    /// Underline, strikeout and squiggly are drawn as a stroke, and a rectangle
+    /// is an outline. A highlight is a filled band and a note is an icon, so a
+    /// line-weight edit would have nothing to change.
+    pub const fn has_line_weight(self) -> bool {
+        self.is_line_markup() || matches!(self, Self::Square)
+    }
+
     /// Short label for tool buttons and the Comments panel.
     pub const fn label(self) -> &'static str {
         match self {
@@ -291,6 +300,69 @@ pub struct AnnotationInfo {
     /// annotations draw with and what the properties panel edits.
     #[serde(default)]
     pub color: Option<[u8; 4]>,
+    /// Stroke weight in PDF points.
+    ///
+    /// Line markups and rectangles draw at this width. A document saved before
+    /// the field existed omits it and gets the hairline a new mark is born with.
+    #[serde(default = "default_line_weight")]
+    pub thickness: f32,
+}
+
+/// The stroke weight a new line markup or rectangle is born with, in points.
+pub const DEFAULT_LINE_WEIGHT: f32 = 0.45;
+
+/// The thinnest stroke the properties panel will write, in points.
+///
+/// Matches the floor a vertical drag can thin a line markup to, so undo of a
+/// drag and a later weight edit agree on the same range.
+pub const MIN_LINE_WEIGHT: f32 = 0.2;
+
+/// The thickest stroke the properties panel will write, in points.
+pub const MAX_LINE_WEIGHT: f32 = 12.0;
+
+/// Preset stroke weights the properties panel offers, in points.
+pub const LINE_WEIGHT_PRESETS: [f32; 3] = [1.0, 2.0, 5.0];
+
+fn default_line_weight() -> f32 {
+    DEFAULT_LINE_WEIGHT
+}
+
+/// Clamp a requested stroke weight into the range the engine will store.
+pub fn clamp_line_weight(weight: f32) -> f32 {
+    if !weight.is_finite() {
+        return DEFAULT_LINE_WEIGHT;
+    }
+    weight.clamp(MIN_LINE_WEIGHT, MAX_LINE_WEIGHT)
+}
+
+/// The box a line markup needs in order to draw `thickness` without the stroke
+/// being clipped by its own bounds.
+///
+/// Underline and squiggly sit on the bottom edge, so a thicker stroke grows
+/// upward. A strikeout is centred, so the extra height is split both ways. A
+/// rectangle's border is drawn on the box it already has, so its rect is left
+/// alone.
+pub fn fitted_line_rect(kind: AnnotationKind, rect: Rect, thickness: f32) -> Rect {
+    if !kind.is_line_markup() {
+        return rect;
+    }
+    let height = rect.height();
+    if thickness <= height {
+        return rect;
+    }
+    if matches!(kind, AnnotationKind::StrikeOut) {
+        let extra = (thickness - height) / 2.0;
+        Rect {
+            min_y: rect.min_y - extra,
+            max_y: rect.max_y + extra,
+            ..rect
+        }
+    } else {
+        Rect {
+            max_y: rect.min_y + thickness,
+            ..rect
+        }
+    }
 }
 
 impl AnnotationInfo {

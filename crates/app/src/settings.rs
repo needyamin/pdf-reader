@@ -724,7 +724,7 @@ impl App {
             return;
         }
         let mut open = true;
-        pdfreader_ui::dialog_window("Keyboard Shortcuts", palette)
+        pdfreader_ui::dialog_window("Shortcuts", palette)
             .open(&mut open)
             .resizable(true)
             .default_size([880.0, 700.0])
@@ -782,12 +782,7 @@ fn render_shortcut_card(ui: &mut Ui, palette: &Palette, group: &str, rows: &[(&s
         let (bar, _) = ui.allocate_exact_size(Vec2::new(3.0, 13.0), Sense::hover());
         ui.painter().rect_filled(bar, 1.5, palette.accent);
         ui.add_space(7.0);
-        ui.label(
-            RichText::new(group)
-                .strong()
-                .size(13.0)
-                .color(palette.text),
-        );
+        ui.label(RichText::new(group).strong().size(13.0).color(palette.text));
     });
     ui.add_space(2.0);
     divider(ui, palette);
@@ -796,9 +791,7 @@ fn render_shortcut_card(ui: &mut Ui, palette: &Palette, group: &str, rows: &[(&s
     for (keys, action) in rows {
         ui.horizontal(|ui| {
             draw_keycombo(ui, palette, keys);
-            ui.add(
-                egui::Label::new(RichText::new(*action).size(12.0).color(palette.text)).wrap(),
-            );
+            ui.add(egui::Label::new(RichText::new(*action).size(12.0).color(palette.text)).wrap());
         });
         ui.add_space(3.0);
     }
@@ -1125,11 +1118,7 @@ impl App {
                                 {
                                     visit = Some(COMPANY_URL);
                                 }
-                                ui.label(
-                                    RichText::new(".")
-                                        .size(12.5)
-                                        .color(palette.text),
-                                );
+                                ui.label(RichText::new(".").size(12.5).color(palette.text));
                             });
                         });
 

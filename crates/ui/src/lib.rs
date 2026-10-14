@@ -10,11 +10,11 @@ pub mod theme;
 pub mod window;
 
 pub use chrome::{
-    annotation_properties_window,
-    ANNOTATION_BAR_HEIGHT, FORM_FONTS, MENUBAR_HEIGHT, ROW_PAD_X, ROW_PAD_Y, SIDEBAR_GAP,
+    ANNOTATION_BAR_HEIGHT, FORM_FONTS, Icon, MENUBAR_HEIGHT, ROW_PAD_X, ROW_PAD_Y, SIDEBAR_GAP,
     SIDEBAR_PAD_X, SIDEBAR_PAD_Y, SIDEBAR_TABS, STATUSBAR_HEIGHT, SearchFieldOutput, TABBAR_HEIGHT,
-    TOOLBAR_HEIGHT, TOOLS_RAIL_WIDTH, TextStyle, annotation_bar, available_sidebar_tabs,
-    comments_panel, forms_panel, menu_bar, outline_tree, search_field, sidebar_list_margin,
+    TOOLBAR_HEIGHT, TOOLS_RAIL_WIDTH, TextStyle, annotation_bar, annotation_properties_window,
+    available_sidebar_tabs, comments_panel, draw_icon, forms_panel, menu_bar,
+    object_actions_window, outline_tree, page_jump, search_field, sidebar_list_margin,
     sidebar_margin, sidebar_note_margin, sidebar_tabs, status_bar, tab_bar, toolbar, tools_rail,
 };
 pub use theme::{Palette, Theme, apply as apply_theme};

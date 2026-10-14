@@ -11,6 +11,7 @@ pub mod export;
 pub mod form;
 pub mod formmark;
 pub mod geometry;
+mod pageobj;
 pub mod text;
 
 pub use engine::{DocumentHandle, FieldWrite, PdfEngine, TilePixels, TileRequest};
@@ -34,6 +35,15 @@ pub struct DocumentInfo {
     pub outline: Outline,
     /// Whether a password was required to open the file.
     pub encrypted: bool,
+    /// Whether the document's permissions allow its content to be changed.
+    ///
+    /// Deliberately *not* the same as `encrypted`. A PDF may carry a security
+    /// handler purely to restrict permissions, with no password needed to
+    /// open it — which is common in files from publishers, banks and print
+    /// workflows. Those open without a passphrase and allow editing, so
+    /// gating on `encrypted` would block the content editor on documents that
+    /// are perfectly writable.
+    pub can_edit_content: bool,
 }
 
 use pdfreader_core::{Outline, PageGeometry};

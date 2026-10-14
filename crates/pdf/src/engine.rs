@@ -10,11 +10,12 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use pdfium_render::prelude::*;
 use pdfreader_core::{
     AnnotationId, AnnotationInfo, FormInfo, ImageFormat, ImagePageSize, NewAnnotation, Outline,
-    OutlineNode, PageGeometry, PageRange, Rect, Rotation,
+    OutlineNode, PageGeometry, PageRange, Rect, Rotation, TextFormat,
 };
 
 use crate::annot;
@@ -125,6 +126,107 @@ pub trait PdfEngine {
     /// Extract the text geometry of a page.
     fn page_text(&mut self, handle: DocumentHandle, page: u32) -> Result<TextPage>;
 
+    /// List the editable objects — text runs and images — on one page.
+    ///
+    /// Paths, shadings and form XObjects are skipped: the editor cannot change
+    /// them, so reporting them would only produce failures. The index carried
+    /// back is still the object's *true* index in the page's list, so a
+    /// mutation built from one of these addresses the right object.
+    fn page_objects(
+        &mut self,
+        handle: DocumentHandle,
+        page: u32,
+    ) -> Result<Vec<pdfreader_core::PageObjectInfo>>;
+
+    /// Move or resize one page-content object.
+    ///
+    /// Returns `Ok(false)` when the object at that index is gone, or is not a
+    /// kind that can be transformed. That is not an error: ids are positional,
+    /// and the list may have shifted since it was read.
+    fn set_page_object_bounds(
+        &mut self,
+        handle: DocumentHandle,
+        id: pdfreader_core::PageObjectId,
+        rect: Rect,
+    ) -> Result<bool>;
+
+    /// Remove one page-content object.
+    fn delete_page_object(
+        &mut self,
+        handle: DocumentHandle,
+        id: pdfreader_core::PageObjectId,
+    ) -> Result<bool>;
+
+    /// Remove the page-content object matching a record.
+    ///
+    /// Used to redo a delete, where the recorded index cannot be trusted: the
+    /// undo re-created the object, which renumbered the page. The match is on
+    /// the parts of the record a renumbering cannot change.
+    fn delete_page_object_matching(
+        &mut self,
+        handle: DocumentHandle,
+        info: &pdfreader_core::PageObjectInfo,
+    ) -> Result<bool>;
+
+    /// Move a page-content object within the page's paint order — the panel's
+    /// "bring to front" / "send to back", and undo's restore-to-index.
+    fn restack_page_object(
+        &mut self,
+        handle: DocumentHandle,
+        info: &pdfreader_core::PageObjectInfo,
+        target: pdfreader_core::pageobj::RestackTarget,
+    ) -> Result<bool>;
+
+    /// Replace the string a page-content text object holds.
+    fn set_page_object_text(
+        &mut self,
+        handle: DocumentHandle,
+        id: pdfreader_core::PageObjectId,
+        previous: &str,
+        text: &str,
+        layout_bounds: Rect,
+        base_font_size: f32,
+        previous_format: TextFormat,
+        format: TextFormat,
+    ) -> Result<bool>;
+
+    /// Restyle a page-content text object in place, keeping its string.
+    ///
+    /// The requested size is applied exactly as asked — no shrink-to-fit — so
+    /// a deliberate size increase is visible on the page.
+    fn apply_page_object_format(
+        &mut self,
+        handle: DocumentHandle,
+        id: pdfreader_core::PageObjectId,
+        layout_bounds: Rect,
+        base_font_size: f32,
+        previous_format: TextFormat,
+        format: TextFormat,
+    ) -> Result<bool>;
+
+    /// Swap an image object's pixels for a picture on disk.
+    ///
+    /// The object keeps its place on the page; only what it shows changes.
+    fn replace_page_object_image(
+        &mut self,
+        handle: DocumentHandle,
+        id: pdfreader_core::PageObjectId,
+        path: &Path,
+    ) -> Result<bool>;
+
+    /// Add a new text object to a page, returning where it landed.
+    ///
+    /// `x` and `y` are the text's baseline-left corner, in PDF page space.
+    fn insert_text_object(
+        &mut self,
+        handle: DocumentHandle,
+        page: u32,
+        x: f32,
+        y: f32,
+        text: &str,
+        font_size: f32,
+    ) -> Result<pdfreader_core::PageObjectId>;
+
     /// Read the document's interactive form, if it has one.
     ///
     /// Returns an empty [`FormInfo`] for documents with no AcroForm rather than
@@ -197,6 +299,16 @@ pub trait PdfEngine {
         handle: DocumentHandle,
         id: AnnotationId,
         color: [u8; 4],
+    ) -> Result<bool>;
+
+    /// Change one annotation's stroke weight. `rect` is the box the stroke
+    /// should occupy; a line markup's box may have grown so the stroke fits.
+    fn set_annotation_thickness(
+        &mut self,
+        handle: DocumentHandle,
+        id: AnnotationId,
+        thickness: f32,
+        rect: Rect,
     ) -> Result<bool>;
 
     /// Rasterize one page and write it to `path` as an image file.
@@ -306,14 +418,22 @@ impl PdfiumEngine {
     /// # Errors
     /// Returns [`EngineError::Library`] if no PDFium library can be loaded.
     pub fn bind(dir: Option<&Path>) -> Result<Self> {
-        let search_dir = dir.unwrap_or(Path::new("."));
-
-        let bindings =
-            Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path(search_dir))
-                .or_else(|_| Pdfium::bind_to_system_library())
-                .map_err(|e| EngineError::Library(format!("{e:?}")))?;
-
-        let pdfium: &'static Pdfium = Box::leak(Box::new(Pdfium::new(bindings)));
+        // PDFium's bindings can be created once per process. Tests open an
+        // engine per case; the second call must reuse the library rather than
+        // fail with "already initialized".
+        static LIBRARY: OnceLock<&'static Pdfium> = OnceLock::new();
+        let pdfium = if let Some(existing) = LIBRARY.get() {
+            *existing
+        } else {
+            let search_dir = dir.unwrap_or(Path::new("."));
+            let bindings =
+                Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path(search_dir))
+                    .or_else(|_| Pdfium::bind_to_system_library())
+                    .map_err(|e| EngineError::Library(format!("{e:?}")))?;
+            let created: &'static Pdfium = Box::leak(Box::new(Pdfium::new(bindings)));
+            let _ = LIBRARY.set(created);
+            *LIBRARY.get().unwrap_or(&created)
+        };
 
         Ok(Self {
             pdfium,
@@ -516,6 +636,17 @@ impl PdfEngine for PdfiumEngine {
             Ok(PdfSecurityHandlerRevision::Unprotected)
         );
 
+        // What the editor actually needs to know, which is not the same thing:
+        // a document may be encrypted only to restrict permissions, open
+        // without a password, and still permit its content to be changed. A
+        // failed query is treated as permission rather than refusal — blocking
+        // the editor because a permission bit could not be read would be the
+        // wrong way to fail.
+        let can_edit_content = document
+            .permissions()
+            .can_modify_document_content()
+            .unwrap_or(true);
+
         let mut pages = Vec::new();
         for page in document.pages().iter() {
             // The page's visible box (CropBox, falling back to MediaBox) defines the
@@ -543,6 +674,7 @@ impl PdfEngine for PdfiumEngine {
                 root: collect_outline(&document),
             },
             encrypted,
+            can_edit_content,
         };
 
         self.next_handle += 1;
@@ -831,6 +963,21 @@ impl PdfEngine for PdfiumEngine {
             .map_err(|error| EngineError::Pdfium(error.to_string()))
     }
 
+    fn set_annotation_thickness(
+        &mut self,
+        handle: DocumentHandle,
+        id: AnnotationId,
+        thickness: f32,
+        rect: Rect,
+    ) -> Result<bool> {
+        let document = self
+            .documents
+            .get_mut(&handle)
+            .ok_or(EngineError::NotOpen(handle.raw()))?;
+        annot::set_annotation_thickness(document, id, thickness, rect)
+            .map_err(|error| EngineError::Pdfium(error.to_string()))
+    }
+
     fn render_tile(&mut self, handle: DocumentHandle, request: &TileRequest) -> Result<TilePixels> {
         // Destructure so the document map and the scratch bitmap are borrowed
         // as disjoint fields. Borrowing both through `self` in one call is not
@@ -961,6 +1108,147 @@ impl PdfEngine for PdfiumEngine {
         // Words and lines are derived here rather than at selection time so a
         // click can widen to a word without rescanning the page.
         Ok(crate::text::build(chars))
+    }
+
+    fn page_objects(
+        &mut self,
+        handle: DocumentHandle,
+        page: u32,
+    ) -> Result<Vec<pdfreader_core::PageObjectInfo>> {
+        let document = self
+            .documents
+            .get_mut(&handle)
+            .ok_or(EngineError::NotOpen(handle.raw()))?;
+        crate::pageobj::list(document, page)
+    }
+
+    fn set_page_object_bounds(
+        &mut self,
+        handle: DocumentHandle,
+        id: pdfreader_core::PageObjectId,
+        rect: Rect,
+    ) -> Result<bool> {
+        let document = self
+            .documents
+            .get_mut(&handle)
+            .ok_or(EngineError::NotOpen(handle.raw()))?;
+        crate::pageobj::set_bounds(document, id, rect)
+    }
+
+    fn delete_page_object(
+        &mut self,
+        handle: DocumentHandle,
+        id: pdfreader_core::PageObjectId,
+    ) -> Result<bool> {
+        let document = self
+            .documents
+            .get_mut(&handle)
+            .ok_or(EngineError::NotOpen(handle.raw()))?;
+        crate::pageobj::delete(document, id)
+    }
+
+    fn delete_page_object_matching(
+        &mut self,
+        handle: DocumentHandle,
+        info: &pdfreader_core::PageObjectInfo,
+    ) -> Result<bool> {
+        let document = self
+            .documents
+            .get_mut(&handle)
+            .ok_or(EngineError::NotOpen(handle.raw()))?;
+        crate::pageobj::delete_matching(document, info)
+    }
+
+    fn restack_page_object(
+        &mut self,
+        handle: DocumentHandle,
+        info: &pdfreader_core::PageObjectInfo,
+        target: pdfreader_core::pageobj::RestackTarget,
+    ) -> Result<bool> {
+        let document = self
+            .documents
+            .get_mut(&handle)
+            .ok_or(EngineError::NotOpen(handle.raw()))?;
+        crate::pageobj::restack(document, info, target)
+    }
+
+    fn set_page_object_text(
+        &mut self,
+        handle: DocumentHandle,
+        id: pdfreader_core::PageObjectId,
+        previous: &str,
+        text: &str,
+        layout_bounds: Rect,
+        base_font_size: f32,
+        previous_format: TextFormat,
+        format: TextFormat,
+    ) -> Result<bool> {
+        let document = self
+            .documents
+            .get_mut(&handle)
+            .ok_or(EngineError::NotOpen(handle.raw()))?;
+        crate::pageobj::set_text(
+            document,
+            id,
+            previous,
+            text,
+            layout_bounds,
+            base_font_size,
+            previous_format,
+            format,
+        )
+    }
+
+    fn apply_page_object_format(
+        &mut self,
+        handle: DocumentHandle,
+        id: pdfreader_core::PageObjectId,
+        layout_bounds: Rect,
+        base_font_size: f32,
+        previous_format: TextFormat,
+        format: TextFormat,
+    ) -> Result<bool> {
+        let document = self
+            .documents
+            .get_mut(&handle)
+            .ok_or(EngineError::NotOpen(handle.raw()))?;
+        crate::pageobj::apply_format(
+            document,
+            id,
+            layout_bounds,
+            base_font_size,
+            previous_format,
+            format,
+        )
+    }
+
+    fn replace_page_object_image(
+        &mut self,
+        handle: DocumentHandle,
+        id: pdfreader_core::PageObjectId,
+        path: &Path,
+    ) -> Result<bool> {
+        let document = self
+            .documents
+            .get_mut(&handle)
+            .ok_or(EngineError::NotOpen(handle.raw()))?;
+        crate::pageobj::replace_image(document, id, path)
+    }
+
+    fn insert_text_object(
+        &mut self,
+        handle: DocumentHandle,
+        page: u32,
+        x: f32,
+        y: f32,
+        text: &str,
+        font_size: f32,
+    ) -> Result<pdfreader_core::PageObjectId> {
+        let document = self
+            .documents
+            .get_mut(&handle)
+            .ok_or(EngineError::NotOpen(handle.raw()))?;
+        crate::pageobj::insert_text(document, page, x, y, text, font_size)
     }
 
     fn export_page_image(
