@@ -298,10 +298,13 @@ fn fetch_pdfium(triple: &str, force: bool) -> Result<PathBuf> {
     verify_digest(&archive_path, &digest)?;
     extract(&archive_path, &dir)?;
 
-    let extracted = dir.join("bin").join(lib_name);
-    if !extracted.is_file() {
-        bail!("archive did not contain bin/{lib_name}; upstream layout may have changed");
-    }
+    // Windows builds ship the library under `bin/`. The Linux archive puts
+    // `libpdfium.so` under `lib/` instead.
+    let extracted = ["bin", "lib"]
+        .into_iter()
+        .map(|folder| dir.join(folder).join(lib_name))
+        .find(|path| path.is_file())
+        .with_context(|| format!("archive did not contain {lib_name}"))?;
 
     if extracted != lib_path {
         fs::copy(&extracted, &lib_path)?;

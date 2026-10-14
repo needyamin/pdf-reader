@@ -310,7 +310,13 @@ fn stage() -> Result<Stage> {
     cargo(&["build", "--release", "-p", "pdfreader-app"])?;
 
     let version = workspace_version()?;
-    let exe = PathBuf::from("target/release").join(binary_name());
+    // Honour `CARGO_TARGET_DIR` so the package contains the binary this build
+    // just produced, not a leftover under the default `target/` directory.
+    let exe = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("target"))
+        .join("release")
+        .join(binary_name());
     if !exe.is_file() {
         bail!("release build did not produce {}", exe.display());
     }

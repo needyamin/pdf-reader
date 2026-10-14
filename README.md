@@ -5,7 +5,7 @@ A fast native PDF reader for people who actually work in a document: read, mark 
 ![License](https://img.shields.io/github/license/needyamin/pdf-reader)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-blue)
 ![Rust](https://img.shields.io/badge/rust-1.98.1-orange)
-![Version](https://img.shields.io/badge/version-5.0.3-green)
+![Version](https://img.shields.io/badge/version-5.0.5-green)
 
 <img width="800" height="447" alt="Image" src="https://github.com/user-attachments/assets/07aeb57d-aa2b-4cec-8ea4-3c9554d2c5e4" />
 
@@ -147,7 +147,7 @@ cargo xtask dist:msix       # signed .msix
 cargo xtask dist:msix -- --no-sign
 ```
 
-Outputs land in `target/dist/`, named with the version from the root `Cargo.toml` (currently 3.0.0).
+Outputs land in `target/dist/`, named with the version from the root `Cargo.toml` (currently 5.0.5).
 
 | Package | What you get |
 | --- | --- |
